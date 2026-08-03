@@ -1,10 +1,10 @@
-# ApexTrader Task Scheduler launcher
+# ApexTrader TI Capture Task Scheduler launcher
 # Called by Windows Task Scheduler - avoids quoting issues with inline -Command
 $ErrorActionPreference = 'Continue'
 
 $BaseDir = Split-Path -Parent $PSScriptRoot
-$Script  = "$BaseDir\autobot.py"
-$Log     = "$BaseDir\autobot_scheduler.log"
+$Script  = "$BaseDir\engine\ti\capture_tradeideas.py"
+$Log     = "$BaseDir\ti_capture_scheduler.log"
 
 # This folder syncs across multiple machines via OneDrive, so don't hardcode
 # a machine/user-specific python.exe path here (it breaks on every other
@@ -18,6 +18,6 @@ if (-not $Python) {
 
 Set-Location $BaseDir
 
-"$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [TASK] ApexTraderAutoRun triggered by Task Scheduler" | Tee-Object -FilePath $Log -Append
+"$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [TASK] ApexTraderTICapture triggered by Task Scheduler" | Tee-Object -FilePath $Log -Append
 
-& $Python $Script 2>&1 | Tee-Object -FilePath $Log -Append
+& $Python $Script --loop 300 --update-config --chrome-profile "Default" 2>&1 | Tee-Object -FilePath $Log -Append

@@ -152,6 +152,9 @@ def _is_valid_ti_ticker(sym: str) -> bool:
         return False
     if s in _IGNORE or s in _TI_SCRAPE_GARBAGE:
         return False
+    from engine.never_trade import is_never_trade  # noqa: E402
+    if is_never_trade(s):
+        return False
     return True
 
 
@@ -891,7 +894,10 @@ def scrape_tradeideas(
 
     # Persist the latest captured TI universe as the primary scan source.
     all_tickers: list[str] = []
-    for tickers in results.values():
+    for scan_key, tickers in results.items():
+        # Exclude unusual options tickers from the primary equity scan universe
+        if scan_key == "unusualoptionsvolume":
+            continue
         all_tickers.extend(tickers)
     clean_primary = [t for t in dict.fromkeys(all_tickers) if _is_valid_ti_ticker(t)]
     if len(clean_primary) >= _MIN_SCRAPE_TICKERS:
@@ -1000,4 +1006,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

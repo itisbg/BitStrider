@@ -298,14 +298,23 @@ class PreopenIntelligenceScanner:
         max_watchlist: int,
         provider: PreopenSignalProvider,
     ) -> None:
+        # check_sentiment_gate() is a per-symbol network call; fetch all of
+        # them concurrently (same pattern as scan_universe's ThreadPoolExecutor)
+        # instead of one-by-one, which was the dominant cost in this provider.
+        from engine.config import SCAN_WORKERS
+        symbols = list(scores.keys())
         sentiment_cache: dict[str, tuple[bool, float]] = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=SCAN_WORKERS) as pool:
+            future_map = {pool.submit(check_sentiment_gate, s): s for s in symbols}
+            for future in concurrent.futures.as_completed(future_map):
+                s = future_map[future]
+                try:
+                    sentiment_cache[s] = future.result()
+                except Exception:
+                    sentiment_cache[s] = (True, 0.5)
 
-        for symbol in list(scores.keys()):
-            if symbol in sentiment_cache:
-                allow, bullish_pct = sentiment_cache[symbol]
-            else:
-                allow, bullish_pct = check_sentiment_gate(symbol)
-                sentiment_cache[symbol] = (allow, bullish_pct)
+        for symbol in symbols:
+            allow, bullish_pct = sentiment_cache[symbol]
 
             if allow:
                 self._add_candidate(scores, symbol, 0.25 * provider.weight, "news-bullish", provider_name=provider.name)
@@ -332,8 +341,25 @@ class PreopenIntelligenceScanner:
         max_watchlist: int,
         provider: PreopenSignalProvider,
     ) -> None:
+        from engine.config import SCAN_WORKERS
         ranked = sorted(scores.values(), key=lambda d: d["score"], reverse=True)
         premkt_candidates = [item["symbol"] for item in ranked[: max_watchlist * 2]]
+
+        # Pre-warm the bar cache concurrently -- _score_premarket's own
+        # get_premarket_bars()/get_bars() calls then hit cache instead of
+        # each doing its two network calls one-by-one in a serial loop.
+        def _prefetch(symbol: str) -> None:
+            get_premarket_bars(symbol)
+            get_bars(symbol, "2d", "1d")
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=SCAN_WORKERS) as pool:
+            futures = [pool.submit(_prefetch, s) for s in premkt_candidates]
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    future.result()
+                except Exception:
+                    pass  # _score_premarket has its own try/except and handles empty data
+
         for symbol in premkt_candidates:
             self._score_premarket(symbol, scores, provider)
 
