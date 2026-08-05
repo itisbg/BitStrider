@@ -1,23 +1,15 @@
 {
-  "generated_at": "2026-08-03T13:29:25-04:00",
-  "date": "2026-08-03",
+  "generated_at": "2026-08-04T18:18:04-04:00",
+  "date": "2026-08-04",
   "market_regime": "bull",
   "picks": [
     {
-      "symbol": "CRWV",
-      "action": "short",
-      "price": 83.23,
-      "confidence": 0.8777,
-      "strategy": "VWAPFade",
-      "reason": "VWAP fade short: 3.8% above VWAP (z=3.6), volume cooling, turning down"
-    },
-    {
-      "symbol": "ONDS",
-      "action": "short",
-      "price": 8.265,
-      "confidence": 0.8242,
-      "strategy": "VWAPFade",
-      "reason": "VWAP fade short: 3.0% above VWAP (z=2.5), volume cooling, turning down"
+      "symbol": "PLTR",
+      "action": "buy",
+      "price": 162.61,
+      "confidence": 0.84,
+      "strategy": "TrendBreaker",
+      "reason": "Trend break above 20SMA + 10d high | vol x5.5 | RSI 69"
     }
   ]
 }

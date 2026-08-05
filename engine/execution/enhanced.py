@@ -327,6 +327,99 @@ class EnhancedExecutor:
             )
         return self._account_cache
 
+    # -- Swap -----------------------------------------------------------
+    def _attempt_swap(self, signal: Signal, swap_only: bool) -> Tuple[bool, Optional[str]]:
+        """Try to close the stalest (24h+, falling back to weakest P&L) position
+        to make room / free cash for *signal*. Shared by the buying-power gate
+        (cash-starved even below max positions) and the max-positions gate.
+
+        Returns (closed, block_reason):
+          closed=True        a position was closed — caller should refresh
+                              account/position state before re-checking gates.
+          block_reason=str   the close attempt itself failed and entry should
+                              be denied (position may be left unprotected).
+          Otherwise (False, None): no candidate to swap — caller proceeds
+          without a swap (matches the pre-existing "allow entry anyway" path).
+        """
+        label = "SWAP (bear)" if swap_only else "SWAP"
+        stale_candidate = self._find_stalest_position()
+        if stale_candidate:
+            weakest, swap_reason = stale_candidate, "stale 24h+"
+        else:
+            weakest, swap_reason = self._find_weakest_position(), "weakest"
+        if not weakest:
+            log.debug(f"No swappable position found for {signal.symbol}")
+            return False, None
+
+        log.info(
+            f"{label}: closing {weakest} ({swap_reason}) to make room for "
+            f"{signal.symbol} (conf={signal.confidence:.0%})"
+        )
+        # Any resting order for this symbol — the GTC trailing stop, or a
+        # leftover DAY close from a prior NO-GAIN/stale-exit attempt — reserves
+        # qty and makes Alpaca reject close_position() as a wash trade (confirmed
+        # in production: 40310000, "opposite side market/stop order exists").
+        # Cancel ALL of them first, not just the GTC, so the swap-close actually
+        # goes through (GTC-only cancel here previously had a 0% success rate).
+        weakest_gtc_id = None
+        try:
+            for o in (self.client.get_orders() or []):
+                if o.symbol != weakest:
+                    continue
+                if str(getattr(o, "time_in_force", "")).upper() == "GTC":
+                    weakest_gtc_id = o.id
+                self.client.cancel_order_by_id(str(o.id))
+                time.sleep(0.4)
+        except Exception as cancel_err:
+            log.warning(f"SWAP {weakest}: order cancel failed, close may reject: {cancel_err}")
+
+        try:
+            self.client.close_position(weakest)
+            self._swap_cycle_closed.add(weakest)
+            # Closing a prior-day position is NOT a day trade — do not count against PDT
+            return True, None
+        except Exception as e:
+            err_str = str(e)
+            if "40310100" in err_str:
+                # Alpaca PDT protection: position was entered today — can't close same day.
+                # Mark as today's entry so it's never selected as swap candidate again.
+                self._entry_log[weakest] = {
+                    "strategy": "restored",
+                    "date": datetime.date.today(),
+                    "confidence": 0.0,
+                }
+                log.warning(
+                    f"SWAP skip {weakest}: PDT same-day protection (40310100) — "
+                    f"marked as today entry, will not retry this session"
+                )
+                # Don't block the new signal — allow entry without the swap
+                return False, None
+            log.warning(f"SWAP close failed for {weakest}: {e}")
+            if weakest_gtc_id:
+                # We cancelled its GTC stop to attempt the close, and the
+                # close itself failed — re-arm protection immediately
+                # rather than leave the position naked.
+                try:
+                    weakest_pos = next(
+                        (p for p in self.client.get_all_positions() if p.symbol == weakest), None
+                    )
+                    if weakest_pos is not None:
+                        w_qty     = int(float(weakest_pos.qty))
+                        w_current = float(weakest_pos.current_price)
+                        w_trail   = get_dynamic_tier(weakest, w_current)["ts"]
+                        self.client.submit_order(TrailingStopOrderRequest(
+                            symbol        = weakest,
+                            qty           = abs(w_qty),
+                            side          = OrderSide.SELL if w_qty > 0 else OrderSide.BUY,
+                            type          = AlpacaOrderType.TRAILING_STOP,
+                            time_in_force = TimeInForce.GTC,
+                            trail_percent = w_trail,
+                        ))
+                        log.warning(f"SWAP {weakest}: re-armed GTC trailing stop after failed close")
+                except Exception as rearm_err:
+                    log.error(f"SWAP {weakest}: close failed AND GTC re-arm failed — position may be UNPROTECTED: {rearm_err}")
+            return False, f"Swap close failed: {e}"
+
     # -- Validation --------------------------------------------------------
     def _validate_trade(self, signal: Signal, acct: AccountSnapshot, order_type: OrderType, swap_only: bool = False) -> Tuple[bool, Optional[str]]:
         if USE_VIX_ROC_FILTER:
@@ -409,17 +502,29 @@ class EnhancedExecutor:
         # Check if sufficient buying power for this trade (primary constraint).
         # This allows entry even when at max positions if capital is available.
         margin = 2.0 if order_type == OrderType.SHORT else 1.0
-        min_usable = (SMALL_ACCOUNT_MIN_POSITION_DOLLARS 
-                      if acct.equity < SMALL_ACCOUNT_EQUITY_THRESHOLD 
+        min_usable = (SMALL_ACCOUNT_MIN_POSITION_DOLLARS
+                      if acct.equity < SMALL_ACCOUNT_EQUITY_THRESHOLD
                       else MIN_POSITION_DOLLARS)
         min_bp_needed = min_usable * margin
-        
+
         if acct.buying_power < min_bp_needed:
-            return False, (
-                f"Insufficient buying power: ${acct.buying_power:,.0f} "
-                f"(need ${min_bp_needed:,.0f} for minimum position)"
-            )
-        
+            # Cash-starved even below max positions (e.g. margin tied up by
+            # leveraged/inverse ETFs) — a high-confidence signal should still
+            # be able to bump a stale/weak position for the cash rather than
+            # just being skipped every cycle until something exits on its own.
+            if SWAP_ON_FULL and signal.confidence >= SWAP_MIN_CONFIDENCE and positions.total_count > 0:
+                closed, block_reason = self._attempt_swap(signal, swap_only)
+                if block_reason:
+                    return False, block_reason
+                if closed:
+                    acct = self._get_account(force_refresh=True)
+                    positions = self._get_positions(force_refresh=True)
+            if acct.buying_power < min_bp_needed:
+                return False, (
+                    f"Insufficient buying power: ${acct.buying_power:,.0f} "
+                    f"(need ${min_bp_needed:,.0f} for minimum position)"
+                )
+
         # ── Max positions gate (secondary; optional swap if at limit) ─────
         if positions.total_count >= effective_max:
             if not (SWAP_ON_FULL and signal.confidence >= SWAP_MIN_CONFIDENCE):
@@ -430,89 +535,11 @@ class EnhancedExecutor:
                 )
             else:
                 # Strong confidence signal + at max: prefer swap to maintain position count.
-                # Stale (24h+) ideas get bumped first regardless of P&L sign — a fresh
-                # high-conviction signal outranks an idea that's already gone cold.
-                # Falls back to weakest-P&L when nothing qualifies as stale yet.
-                label = "SWAP (bear)" if swap_only else "SWAP"
-                stale_candidate = self._find_stalest_position()
-                if stale_candidate:
-                    weakest, swap_reason = stale_candidate, "stale 24h+"
-                else:
-                    weakest, swap_reason = self._find_weakest_position(), "weakest"
-                if weakest:
-                    log.info(
-                        f"{label}: closing {weakest} ({swap_reason}) to make room for "
-                        f"{signal.symbol} (conf={signal.confidence:.0%})"
-                    )
-                    # Any resting order for this symbol — the GTC trailing stop, or a
-                    # leftover DAY close from a prior NO-GAIN/stale-exit attempt — reserves
-                    # qty and makes Alpaca reject close_position() as a wash trade (confirmed
-                    # in production: 40310000, "opposite side market/stop order exists").
-                    # Cancel ALL of them first, not just the GTC, so the swap-close actually
-                    # goes through (GTC-only cancel here previously had a 0% success rate).
-                    weakest_gtc_id = None
-                    try:
-                        for o in (self.client.get_orders() or []):
-                            if o.symbol != weakest:
-                                continue
-                            if str(getattr(o, "time_in_force", "")).upper() == "GTC":
-                                weakest_gtc_id = o.id
-                            self.client.cancel_order_by_id(str(o.id))
-                            time.sleep(0.4)
-                    except Exception as cancel_err:
-                        log.warning(f"SWAP {weakest}: order cancel failed, close may reject: {cancel_err}")
-
-                    try:
-                        self.client.close_position(weakest)
-                        self._swap_cycle_closed.add(weakest)
-                        # Closing a prior-day position is NOT a day trade — do not count against PDT
-                        positions = self._get_positions(force_refresh=True)
-                    except Exception as e:
-                        err_str = str(e)
-                        if "40310100" in err_str:
-                            # Alpaca PDT protection: position was entered today — can't close same day.
-                            # Mark as today's entry so it's never selected as swap candidate again.
-                            self._entry_log[weakest] = {
-                                "strategy": "restored",
-                                "date": datetime.date.today(),
-                                "confidence": 0.0,
-                            }
-                            log.warning(
-                                f"SWAP skip {weakest}: PDT same-day protection (40310100) — "
-                                f"marked as today entry, will not retry this session"
-                            )
-                            # Don't block the new signal — allow entry without the swap
-                        else:
-                            log.warning(f"SWAP close failed for {weakest}: {e}")
-                            if weakest_gtc_id:
-                                # We cancelled its GTC stop to attempt the close, and the
-                                # close itself failed — re-arm protection immediately
-                                # rather than leave the position naked.
-                                try:
-                                    weakest_pos = next(
-                                        (p for p in self.client.get_all_positions() if p.symbol == weakest), None
-                                    )
-                                    if weakest_pos is not None:
-                                        w_qty     = int(float(weakest_pos.qty))
-                                        w_current = float(weakest_pos.current_price)
-                                        w_trail   = get_dynamic_tier(weakest, w_current)["ts"]
-                                        self.client.submit_order(TrailingStopOrderRequest(
-                                            symbol        = weakest,
-                                            qty           = abs(w_qty),
-                                            side          = OrderSide.SELL if w_qty > 0 else OrderSide.BUY,
-                                            type          = AlpacaOrderType.TRAILING_STOP,
-                                            time_in_force = TimeInForce.GTC,
-                                            trail_percent = w_trail,
-                                        ))
-                                        log.warning(f"SWAP {weakest}: re-armed GTC trailing stop after failed close")
-                                except Exception as rearm_err:
-                                    log.error(f"SWAP {weakest}: close failed AND GTC re-arm failed — position may be UNPROTECTED: {rearm_err}")
-                            return False, f"Swap close failed: {e}"
-                else:
-                    # No position to swap, but BP available — allow entry anyway
-                    log.debug(
-                        f"No swappable position found, but allowing entry due to available BP ${acct.buying_power:,.0f}"
-                    )
+                closed, block_reason = self._attempt_swap(signal, swap_only)
+                if block_reason:
+                    return False, block_reason
+                if closed:
+                    positions = self._get_positions(force_refresh=True)
 
         if positions.has_position(signal.symbol):
             if order_type == OrderType.LONG  and positions.is_long(signal.symbol):
