@@ -57,6 +57,7 @@ from engine.config import (
     RVOL_MIN,
     MAX_GAP_CHASE_PCT,
     GAP_CHASE_CONSOL_BARS,
+    GAP_CHASE_GUARD_ENABLED,
     BEAR_SHORT_UNIVERSE,
     HMM_REGIME_LOOKBACK_DAYS,
     HMM_REGIME_CONFIDENCE_BOOST,
@@ -314,7 +315,7 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
         # already-elevated open.
         gap_vs_open  = ((price - open_px) / open_px) * 100 if open_px > 0 else 0.0
         gap_vs_prev  = ((price - prev_close) / prev_close) * 100 if prev_close > 0 else 0.0
-        if max(gap_vs_open, gap_vs_prev) > adaptive_gap:
+        if GAP_CHASE_GUARD_ENABLED and max(gap_vs_open, gap_vs_prev) > adaptive_gap:
             # Always check for consolidation on gapped-up stocks, even on snapshot path.
             # This is a critical risk-management gate to avoid chasing.
             # If intraday bars weren't fetched before, get them now.

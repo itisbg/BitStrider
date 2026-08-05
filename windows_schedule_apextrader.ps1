@@ -7,7 +7,12 @@ $BaseDir = $PSScriptRoot
 
 $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$BaseDir\scripts\run_autobot_task.ps1`""
 # Run at 08:00 local time on weekdays (Mon-Fri). Ensure the machine local timezone is EST/EDT as desired.
-$trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday,Tuesday,Wednesday,Thursday,Friday -At 08:00
+$dailyTrigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday,Tuesday,Wednesday,Thursday,Friday -At 08:00
+# Also start on log on, so a power cycle / reboot during the trading day brings the bot back up
+# immediately instead of waiting for tomorrow's 08:00 trigger (the daily trigger only fires once
+# per day and doesn't know if that day's launch later died to a reboot).
+$logonTrigger = New-ScheduledTaskTrigger -AtLogOn
+$trigger = @($dailyTrigger, $logonTrigger)
 
 $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:UserName" -LogonType Interactive -RunLevel Highest
 

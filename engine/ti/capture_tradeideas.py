@@ -985,13 +985,22 @@ def main() -> None:
     if args.loop > 0:
         print(f"[INFO ] Loop mode — capturing every {args.loop}s. Ctrl+C to stop.")
         while True:
-            scrape_tradeideas(
-                update_config=args.update_config,
-                chrome_profile=args.chrome_profile,
-                select_minutes=select_minutes,
-                include_toplists=args.include_toplists,
-                remote_debug_port=args.remote_debug_port,
-            )
+            try:
+                scrape_tradeideas(
+                    update_config=args.update_config,
+                    chrome_profile=args.chrome_profile,
+                    select_minutes=select_minutes,
+                    include_toplists=args.include_toplists,
+                    remote_debug_port=args.remote_debug_port,
+                )
+            except Exception as exc:
+                # An uncaught exception here used to kill the whole scheduled task —
+                # e.g. a locked Edge profile crashed the loop for 30+ hours until the
+                # next 08:00/logon trigger (2026-08-03). Log and retry next interval
+                # instead; drop the driver singleton so the retry opens fresh.
+                global _edge_driver
+                print(f"[ERROR] Scrape cycle failed: {exc} — retrying in {args.loop}s")
+                _edge_driver = None
             print(f"[INFO ] Sleeping {args.loop}s …")
             time.sleep(args.loop)
     else:

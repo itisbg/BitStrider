@@ -20,4 +20,7 @@ Set-Location $BaseDir
 
 "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [TASK] ApexTraderTICapture triggered by Task Scheduler" | Tee-Object -FilePath $Log -Append
 
-& $Python $Script --loop 300 --update-config --chrome-profile "Default" 2>&1 | Tee-Object -FilePath $Log -Append
+# Single-shot (no --loop): Task Scheduler's own 15-min repetition trigger owns the
+# cadence now, not an internal Python loop that can silently die and stay dead
+# until the next log on (see 2026-08-03 Edge-profile-lock crash).
+& $Python $Script --update-config --chrome-profile "Default" 2>&1 | Tee-Object -FilePath $Log -Append

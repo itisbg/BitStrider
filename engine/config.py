@@ -699,6 +699,11 @@ MIN_AVG_DAILY_VOLUME     = 1_000_000   # Skip illiquid names: avg daily share vo
 MIN_MARKET_CAP           = 300_000_000 # Skip micro-caps below $300M
 MAX_GAP_CHASE_PCT        = 15.0       # Skip if already up >15% without consolidation
 GAP_CHASE_CONSOL_BARS    = 5          # Number of 1-min bars to check for tight base
+# ponytail: suppressed 2026-08-03 to observe a month of live impact (log data showed
+# it never logged a single block, and the 21 float blocks / 0 mcap blocks this past
+# month suggest it's costing more legit movers than it's protecting). Flip to True
+# to reactivate if the no-guard month looks worse.
+GAP_CHASE_GUARD_ENABLED  = False
 USE_MARKET_REGIME_FILTER = True       # SPY below 200-day MA → cut signals to 1
 MARKET_REGIME_SIGNALS_CAP  = 5        # Max LONG entries per cycle in bear regime (swap-only); tries until one succeeds
 BEAR_SHORT_SIGNALS_CAP     = 3        # Max SHORT entries per cycle in bear regime

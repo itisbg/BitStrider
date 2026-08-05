@@ -934,8 +934,14 @@ def scan_alpaca_movers(*, interval_min: float = 10.0, market_state: MarketState)
 
         with ThreadPoolExecutor(max_workers=1) as _pool:
             try:
+                # top=100 (API max), not 30: market_movers.gainers (top-%-by-day, market-wide)
+                # and most_actives (top-volume, market-wide) are close to disjoint populations —
+                # wild % movers skew thin/small-cap, top raw-volume skews mega-cap/ETF. At
+                # top=30 the AND of both lists almost never has a member (confirmed: zero
+                # matches across 65 cycles on 2026-08-04, including a 20%+ PLTR day). Same
+                # single API call either way — just asking for the widest slice the endpoint allows.
                 actives_resp = _pool.submit(
-                    sc.get_most_actives, MostActivesRequest(by=MostActivesBy.VOLUME, top=30)
+                    sc.get_most_actives, MostActivesRequest(by=MostActivesBy.VOLUME, top=100)
                 ).result(timeout=_SCREENER_TIMEOUT)
             except _FuturesTimeout:
                 log.warning("[ALPACA-MOVERS] most_actives timed out — skipping cycle")
@@ -950,8 +956,9 @@ def scan_alpaca_movers(*, interval_min: float = 10.0, market_state: MarketState)
 
         with ThreadPoolExecutor(max_workers=1) as _pool:
             try:
+                # top=50 (API max), not 20 — same reasoning as most_actives above.
                 movers_resp = _pool.submit(
-                    sc.get_market_movers, MarketMoversRequest(market_type="stocks", top=20)
+                    sc.get_market_movers, MarketMoversRequest(market_type="stocks", top=50)
                 ).result(timeout=_SCREENER_TIMEOUT)
             except _FuturesTimeout:
                 log.warning("[ALPACA-MOVERS] market_movers timed out — skipping cycle")
