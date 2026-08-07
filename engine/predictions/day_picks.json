@@ -1,15 +1,15 @@
 {
-  "generated_at": "2026-08-04T18:18:04-04:00",
-  "date": "2026-08-04",
+  "generated_at": "2026-08-06T09:40:14-04:00",
+  "date": "2026-08-06",
   "market_regime": "bull",
   "picks": [
     {
-      "symbol": "PLTR",
+      "symbol": "IOVA",
       "action": "buy",
-      "price": 162.61,
-      "confidence": 0.84,
-      "strategy": "TrendBreaker",
-      "reason": "Trend break above 20SMA + 10d high | vol x5.5 | RSI 69"
+      "price": 5.81,
+      "confidence": 0.97,
+      "strategy": "GapBreakout",
+      "reason": "Gap up 33.9% from $4.34 | volume x3.2"
     }
   ]
 }

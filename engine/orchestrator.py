@@ -724,6 +724,10 @@ def _start_software_stop_thread(ctx: AppContext) -> None:
                 ctx.executor.check_afterhours_stops()
             except Exception as e:
                 log.error(f"[STOP-THREAD] check_afterhours_stops error: {e}", exc_info=True)
+            try:
+                ctx.executor.detect_stopped_out_positions()
+            except Exception as e:
+                log.error(f"[STOP-THREAD] detect_stopped_out_positions error: {e}", exc_info=True)
             time.sleep(10)
 
     t = threading.Thread(target=_loop, name="SoftwareStopPoller", daemon=True)
@@ -829,6 +833,11 @@ def start() -> None:
                     except Exception as e:
                         log.error(f"protect_positions error: {e}", exc_info=True)
                     # check_software_stops() runs in its dedicated 10s thread — not here
+
+                    try:
+                        ctx.executor.ratchet_confident_winners()
+                    except Exception as e:
+                        log.error(f"ratchet_confident_winners error: {e}", exc_info=True)
 
                     eod_summary = None
                     try:

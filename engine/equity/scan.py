@@ -62,7 +62,7 @@ from engine.config import (
     HMM_REGIME_LOOKBACK_DAYS,
     HMM_REGIME_CONFIDENCE_BOOST,
 )
-from engine.utils import MarketState, clear_bar_cache, get_bars, is_dead_ticker, get_hmm_regime
+from engine.utils import MarketState, clear_bar_cache, get_bars, get_daily_volume_bars, is_dead_ticker, get_hmm_regime
 from engine.utils.bars import get_data_client as _get_data_client
 from alpaca.data import StockSnapshotRequest as _StockSnapshotRequest
 from .universe import get_tier as _get_tier_live, get_latest_batch as _get_latest_batch, get_ti_primary as _get_ti_primary
@@ -172,6 +172,23 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
             open_px = float(intraday["open"].iloc[0])
             prev_close = 0.0  # not available without an extra daily-bars call
 
+        # true_day_vol: day_vol above is Alpaca/IEX-sourced — typically just a
+        # few percent of real market volume (confirmed 2026-08-05, see
+        # get_daily_volume_bars). avg_daily_vol below comes from yfinance's
+        # full consolidated volume, so comparing raw day_vol against it — as
+        # both RVOL gates below used to — compares apples to oranges and
+        # crushes RVOL toward ~0 for everything (confirmed 2026-08-06: AAPL/
+        # MSFT/NVDA all showing 0.01-0.07 RVOL mid-afternoon, blocking nearly
+        # every candidate all day). Use yfinance's own running total for
+        # today when its last bar actually is today; otherwise keep day_vol
+        # rather than risk a stale number.
+        true_day_vol = day_vol
+        _vol_daily = get_daily_volume_bars(symbol)
+        if not _vol_daily.empty and "time" in _vol_daily.columns:
+            _last_bar_date = _vol_daily["time"].iloc[-1].date()
+            if _last_bar_date == datetime.datetime.now(_ET).date():
+                true_day_vol = float(_vol_daily["volume"].iloc[-1])
+
         # Resolve regime and VIX before adaptive gates
         vix = None
         if hasattr(market_state, 'vix') and market_state.vix is not None:
@@ -221,7 +238,7 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
         # Adaptive RVOL_MIN: higher in bull/high VIX, lower in calm or bear conditions
         # Use regular market hours only so extended-hours volume does not distort the pace.
         if market_state.is_regular_hours and bull:
-            daily = get_bars(symbol, "5d", "1d")
+            daily = get_daily_volume_bars(symbol)
             if not daily.empty and len(daily) >= 2:
                 avg_daily_vol = float(daily["volume"].iloc[:-1].mean())
                 if avg_daily_vol > 0:
@@ -229,17 +246,17 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
                     mkt_open     = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
                     elapsed_min  = max((now_et - mkt_open).total_seconds() / 60, 1.0)
                     elapsed_frac = min(elapsed_min / 390.0, 1.0)
-                    rvol = (day_vol / max(elapsed_frac, 0.02)) / avg_daily_vol
+                    rvol = (true_day_vol / max(elapsed_frac, 0.02)) / avg_daily_vol
                     if rvol < adaptive_rvol:
-                        _log.warning(f"[GUARDRAIL] {symbol} blocked: RVOL {rvol:.2f} < adaptive_rvol {adaptive_rvol:.2f} | day_vol={day_vol:.0f} | avg_daily_vol={avg_daily_vol:.0f}")
+                        _log.warning(f"[GUARDRAIL] {symbol} blocked: RVOL {rvol:.2f} < adaptive_rvol {adaptive_rvol:.2f} | day_vol={true_day_vol:.0f} | avg_daily_vol={avg_daily_vol:.0f}")
                         if return_reason:
                             return False, 'rvol'
                         return False
 
         # Adaptive MIN_DOLLAR_VOLUME: more flexible for current market
-        dollar_vol = price * day_vol
+        dollar_vol = price * true_day_vol
         if dollar_vol < adaptive_dollar_vol:
-            _log.warning(f"[GUARDRAIL] {symbol} blocked: dollar volume {dollar_vol:.0f} < adaptive_dollar_vol {adaptive_dollar_vol:.0f} | price={price:.2f} | day_vol={day_vol:.0f}")
+            _log.warning(f"[GUARDRAIL] {symbol} blocked: dollar volume {dollar_vol:.0f} < adaptive_dollar_vol {adaptive_dollar_vol:.0f} | price={price:.2f} | day_vol={true_day_vol:.0f}")
             if return_reason:
                 return False, 'dollar_vol'
             return False
@@ -248,7 +265,7 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
         # violent, illiquid moves after hours (see BIOA 2026-07-31: repeated overnight
         # buy-then-stop cycles on a low-float, thinly traded ticker). Applies at all
         # times, not just regular hours — that's exactly when the risk shows up.
-        daily = get_bars(symbol, "5d", "1d")
+        daily = get_daily_volume_bars(symbol)
         if not daily.empty and len(daily) >= 2:
             avg_daily_vol = float(daily["volume"].iloc[:-1].mean())
             if avg_daily_vol < MIN_AVG_DAILY_VOLUME:
@@ -273,7 +290,7 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
 
         # RVOL gate (adaptive)
         if market_state.is_market_open and bull:
-            daily = get_bars(symbol, "5d", "1d")
+            daily = get_daily_volume_bars(symbol)
             if not daily.empty and len(daily) >= 2:
                 avg_daily_vol = float(daily["volume"].iloc[:-1].mean())
                 if avg_daily_vol > 0:
@@ -281,9 +298,9 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
                     mkt_open     = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
                     elapsed_min  = max((now_et - mkt_open).total_seconds() / 60, 1.0)
                     elapsed_frac = min(elapsed_min / 390.0, 1.0)
-                    rvol = (day_vol / max(elapsed_frac, 0.02)) / avg_daily_vol
+                    rvol = (true_day_vol / max(elapsed_frac, 0.02)) / avg_daily_vol
                     if rvol < adaptive_rvol:
-                        _log.warning(f"[GUARDRAIL] {symbol} blocked: RVOL {rvol:.2f} < adaptive_rvol {adaptive_rvol:.2f} | day_vol={day_vol:.0f} | avg_daily_vol={avg_daily_vol:.0f}")
+                        _log.warning(f"[GUARDRAIL] {symbol} blocked: RVOL {rvol:.2f} < adaptive_rvol {adaptive_rvol:.2f} | day_vol={true_day_vol:.0f} | avg_daily_vol={avg_daily_vol:.0f}")
                         if return_reason:
                             return False, 'rvol'
                         return False

@@ -21,3 +21,9 @@ Set-Location $BaseDir
 "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [TASK] ApexTraderAutoRun triggered by Task Scheduler" | Tee-Object -FilePath $Log -Append
 
 & $Python $Script 2>&1 | Tee-Object -FilePath $Log -Append
+# Without this, the script's own exit code always defaults to 0 regardless of
+# what Python actually did - confirmed 2026-08-05: Task Scheduler kept
+# reporting "return code 0" for a watchdog that died within 1s of starting,
+# making every restart look clean when it wasn't. Propagate the real code.
+"$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [TASK] python exited with code $LASTEXITCODE" | Tee-Object -FilePath $Log -Append
+exit $LASTEXITCODE

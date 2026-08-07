@@ -153,6 +153,34 @@ class AutoBotWatchdog:
         except Exception as exc:
             self.logger.warning("Unable to write PID file: %s", exc)
 
+    def _another_instance_alive(self) -> bool:
+        """Check PID_FILE for a live watchdog before touching anything.
+
+        Task Scheduler's own IgnoreNew policy only tracks instances IT
+        launched — it has no visibility into a watchdog started manually in
+        a foreground terminal (confirmed necessary 2026-08-05, running one
+        of each at once as a reboot/on-demand-trigger workaround). Without
+        this check, a scheduled backstop trigger would kill the foreground
+        session's main.py via kill_existing_project_processes(), the
+        foreground watchdog would then relaunch its own, and both processes
+        would race to trade the same live account.
+        """
+        if not PID_FILE.exists():
+            return False
+        try:
+            pid = int(PID_FILE.read_text(encoding="utf-8").strip())
+        except (ValueError, OSError):
+            return False
+        if pid == os.getpid():
+            return False
+        try:
+            import psutil
+            proc = psutil.Process(pid)
+            cmdline = " ".join(proc.cmdline())
+        except Exception:
+            return False  # stale/unreadable PID file — proceed, we'll take over
+        return "autobot.py" in cmdline or str(Path(__file__)) in cmdline
+
     def kill_existing_project_processes(self) -> None:
         try:
             import psutil
@@ -160,7 +188,21 @@ class AutoBotWatchdog:
             return
 
         me = os.getpid()
-        for proc in psutil.process_iter(["pid", "cmdline"]):
+        try:
+            procs = list(psutil.process_iter(["pid", "cmdline"]))
+        except Exception as e:
+            # Confirmed 2026-08-05: this whole function running at the top of
+            # run(), uncaught, is a plausible cause of the watchdog dying
+            # within ~1s of an on-demand restart with no error ever reaching
+            # the log — a day's worth of stray cross-session Edge/driver
+            # processes (from unrelated browser-automation testing) sitting
+            # around by then made a psutil failure on *some* process far more
+            # likely than at a clean morning boot. Never let this function
+            # take the whole watchdog down.
+            self.logger.warning("kill_existing_project_processes: process_iter failed: %s", e)
+            return
+
+        for proc in procs:
             if proc.info["pid"] == me:
                 continue
             try:
@@ -169,7 +211,12 @@ class AutoBotWatchdog:
                 if str(MAIN_SCRIPT) in joined or str(Path(__file__)) in joined:
                     self.logger.info("Killing duplicate process %s %s", proc.info["pid"], joined)
                     proc.kill()
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
+            except Exception as e:
+                # Was (psutil.NoSuchProcess, psutil.AccessDenied) only — too
+                # narrow. A single unreachable cross-session process (e.g. the
+                # elevated/S4U Edge automation processes from a different
+                # logon session) must never abort the whole scan.
+                self.logger.debug("kill_existing_project_processes: skipping pid %s: %s", proc.info.get("pid"), e)
                 continue
 
     def _drain_subprocess_output(self, process: subprocess.Popen) -> threading.Thread:
@@ -265,13 +312,36 @@ class AutoBotWatchdog:
                 alerted = False
 
     def run(self) -> None:
+        """Thin outer supervisor around _run_loop(): if anything inside ever
+        raises uncaught, log the full traceback (previously nothing did —
+        confirmed 2026-08-05, the watchdog died twice with zero error output
+        anywhere, only Task Scheduler's misleading "return code 0", so this
+        was flying completely blind) and restart the loop from here rather
+        than letting the whole process end. Task Scheduler's own triggers
+        (boot / 8am weekday) are not a reliable safety net on their own —
+        confirmed the same day, two of three on-demand restarts died within
+        seconds even from an elevated session, for reasons never captured
+        anywhere until this wrapper existed."""
         self.logger.info("Starting AutoBot watchdog")
+        if self._another_instance_alive():
+            self.logger.info("Another watchdog instance is already running — exiting without touching it")
+            return
         self._write_pid()
+        while True:
+            try:
+                self._run_loop()
+            except Exception:
+                self.logger.error("Watchdog crashed — restarting supervisor loop in 10s", exc_info=True)
+                time.sleep(10)
+
+    def _run_loop(self) -> None:
         last_env_mtime = ENV_FILE.stat().st_mtime if ENV_FILE.exists() else None
         restart_count = 0
 
         self.kill_existing_project_processes()
-        threading.Thread(target=self._heartbeat_monitor, daemon=True).start()
+        if not getattr(self, "_heartbeat_thread_started", False):
+            threading.Thread(target=self._heartbeat_monitor, daemon=True).start()
+            self._heartbeat_thread_started = True
 
         while True:
             # Re-checked every cycle, not just at startup: this folder syncs

@@ -304,16 +304,29 @@ SMALL_ACCOUNT_RISK_PER_TRADE_PCT = 0.5 # lower risk per trade for small accounts
 SMALL_ACCOUNT_MIN_POSITION_DOLLARS = 5.0  # lowered to allow ~$5 entry for cheap tickers
 
 # Tiered Profit Targets — aggressive: book profits faster
-TAKE_PROFIT_EXTREME  = 35.0   # was 50
-TAKE_PROFIT_HIGH     = 25.0   # was 40
-TAKE_PROFIT_MEDIUM   = 18.0   # was 35
-TAKE_PROFIT_NORMAL   = 12.0   # was 25
+TAKE_PROFIT_EXTREME  = 50.0   # was 35 (+15pp, 2026-08-06)
+TAKE_PROFIT_HIGH     = 40.0   # was 25 (+15pp, 2026-08-06)
+TAKE_PROFIT_MEDIUM   = 33.0   # was 18 (+15pp, 2026-08-06)
+TAKE_PROFIT_NORMAL   = 27.0   # was 12 (+15pp, 2026-08-06)
 
 # Tiered Trailing Stops — tighter: lock in gains quickly
 TRAILING_STOP_EXTREME = 12.0  # more room for extreme movers
 TRAILING_STOP_HIGH    = 10.0  # high momentum
 TRAILING_STOP_MEDIUM  =  8.0  # medium momentum
 TRAILING_STOP_NORMAL  =  8.0  # default trailing stop
+
+# Confidence ratchet: once a position is up CONF_RATCHET_TRIGGER_GAIN_PCT or
+# more, tighten its trailing stop to lock in the gain sooner — scaled by how
+# confident the original entry signal was, so a trade we were more sure about
+# protects its profit faster. Never tightens a position still underwater, and
+# never applies below SWAP_MIN_CONFIDENCE (0.75) — same "high confidence" bar
+# used for swaps elsewhere. Full scale (2x tighter) at confidence 1.0.
+# Positions restored after a bot restart carry no real recorded confidence
+# (placeholder 0.0) and are naturally excluded — the formula only kicks in
+# above 0.75, so an unknown/restored entry is correctly never ratcheted.
+CONF_RATCHET_ENABLED          = True
+CONF_RATCHET_TRIGGER_GAIN_PCT = 4.0   # unrealized gain % required before tightening kicks in
+CONF_RATCHET_MAX_TIGHTEN      = 0.5   # at confidence=1.0, tightened stop = tier stop * this
 
 # Legacy (backward compat)
 STOP_LOSS_PCT   = 3.0
@@ -500,7 +513,12 @@ NO_GAIN_EXIT_MIN_PCT = 0.0   # must exceed this unrealized gain % to survive
 # ─────────────────────────────────────────────────────────────────
 AFTERHOURS_STOP_CHECK_ENABLED = True
 AFTERHOURS_CHASE_STALE_SECONDS = 45  # re-chase (cancel + resubmit at fresh price) if the close sits unfilled this long
-AFTERHOURS_STOP_COOLDOWN_MIN = 720  # Block re-entry into a symbol for 12h after an after-hours stop-loss exit.
+AFTERHOURS_STOP_COOLDOWN_MIN = 60  # Block re-entry into a symbol for 1h after ANY stop-loss exit
+                                    # (after-hours software backstop or a normal GTC fill — see
+                                    # detect_stopped_out_positions in enhanced.py). Short on purpose:
+                                    # long enough to break an immediate whipsaw off frozen/stale data
+                                    # (now separately guarded — see get_bars' yfinance staleness check),
+                                    # short enough that a genuinely new signal an hour later still gets through.
                                      # After-hours momentum signals are often computed off a frozen daily bar (see
                                      # BIOA 2026-07-31: same stale "buy" signal re-fired every cycle overnight,
                                      # re-entering right after each stop-out into the next leg down).
@@ -696,7 +714,7 @@ ALPACA_MOVER_SCAN_INTERVAL_MIN = 10   # Re-poll Alpaca screener every 10 min (re
 MIN_DOLLAR_VOLUME        = 1_000_000   # Skip illiquid setups: price × day_vol < $1M
 MIN_FLOAT_SHARES         = 200_000_000 # Skip low-float names — prone to violent, illiquid after-hours moves
 MIN_AVG_DAILY_VOLUME     = 1_000_000   # Skip illiquid names: avg daily share volume < 1M
-MIN_MARKET_CAP           = 300_000_000 # Skip micro-caps below $300M
+MIN_MARKET_CAP           = 100_000_000 # Skip micro-caps below $100M
 MAX_GAP_CHASE_PCT        = 15.0       # Skip if already up >15% without consolidation
 GAP_CHASE_CONSOL_BARS    = 5          # Number of 1-min bars to check for tight base
 # ponytail: suppressed 2026-08-03 to observe a month of live impact (log data showed

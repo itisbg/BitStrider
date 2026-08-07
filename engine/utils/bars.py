@@ -38,6 +38,16 @@ except ImportError:
 _bar_cache: Dict[Tuple[str, str, str], pd.DataFrame] = {}
 _bar_cache_lock = threading.Lock()
 
+# get_daily_volume_bars() keeps its own cache rather than sharing _bar_cache:
+# it's a symbol-only key (no period/interval), and more importantly it must
+# never accidentally read back an Alpaca/IEX-sourced entry that some other
+# caller left in _bar_cache under the same (symbol, "5d", "1d") key — that
+# would silently reintroduce the undercounted-volume bug this function exists
+# to avoid. Kept simple: yfinance data is good enough for all callers, so
+# there's no equivalent risk in the other direction.
+_volume_bar_cache: Dict[str, pd.DataFrame] = {}
+_volume_bar_cache_lock = threading.Lock()
+
 _ALPACA_MIN_INTERVAL = 0.35   # per-symbol throttle to reduce 429s
 _last_alpaca_bar_ts: float = 0.0
 
@@ -85,7 +95,9 @@ def is_dead_ticker(symbol: str) -> bool:
 
 def clear_bar_cache() -> None:
     """Flush the per-cycle bar cache. Call once at the start of each scan cycle."""
-    global _bar_cache
+    global _bar_cache, _volume_bar_cache
+    with _volume_bar_cache_lock:
+        _volume_bar_cache = {}
     with _bar_cache_lock:
         _bar_cache = {}
 
@@ -250,6 +262,24 @@ def get_bars(symbol: str, period: str = "5d", interval: str = "15m") -> pd.DataF
     try:
         data = _get_bars_yfinance(symbol, period, interval, log)
         if not data.empty:
+            # _get_bars_alpaca applies a staleness check before returning —
+            # this fallback path never did, so when Alpaca's feed went stale
+            # (routine overnight/thin-liquidity) and fell through to here,
+            # whatever yfinance had — even hours old — was returned as if it
+            # were live, with no warning. Confirmed 2026-08-05: this let
+            # VWAPFade compute an identical signal off frozen SOXS bars for
+            # hours, driving repeated same-symbol re-entries. Same guard,
+            # same threshold, same behavior as the Alpaca path now.
+            if "time" in data.columns:
+                latest = pd.to_datetime(data["time"].iloc[-1])
+                if latest.tzinfo is None:
+                    latest = ET.localize(latest)
+                staleness = (datetime.datetime.now(ET) - latest).total_seconds()
+                threshold = _staleness_threshold(interval)
+                if staleness > threshold:
+                    log.warning(f"{symbol}: yfinance data stale ({staleness:.0f}s > {threshold:.0f}s for {interval}) — skipping")
+                    _record_empty_bars(symbol)
+                    return pd.DataFrame()
             return data
     except ImportError:
         log.warning("yfinance not installed — cannot use fallback")
@@ -257,6 +287,39 @@ def get_bars(symbol: str, period: str = "5d", interval: str = "15m") -> pd.DataF
         log.warning(f"{symbol}: yfinance fetch failed: {e}")
 
     _record_empty_bars(symbol)
+    return pd.DataFrame()
+
+
+def get_daily_volume_bars(symbol: str) -> pd.DataFrame:
+    """5-day daily bars via yfinance specifically, for volume-based liquidity
+    checks (avg daily volume / dollar volume guardrails).
+
+    Confirmed 2026-08-05: this account's Alpaca market data subscription is
+    IEX-only ("subscription does not permit querying recent SIP data") — IEX
+    is a real exchange but typically only a few percent of a liquid stock's
+    true total volume (SHOP showed ~700K/day on IEX vs its real tens of
+    millions), so Alpaca's volume is unusable against thresholds calibrated
+    for real market volume. yfinance reports full consolidated volume for
+    free. Price/OHLC elsewhere (ATR tiers, execution) still uses Alpaca/IEX
+    fine — it's specifically volume that's this skewed, not price.
+    """
+    symbol = symbol.strip().upper().lstrip("$")
+    log = logging.getLogger("ApexTrader")
+
+    with _volume_bar_cache_lock:
+        if symbol in _volume_bar_cache:
+            return _volume_bar_cache[symbol]
+
+    try:
+        data = _get_bars_yfinance(symbol, "5d", "1d", log)
+        if not data.empty:
+            with _volume_bar_cache_lock:
+                _volume_bar_cache[symbol] = data
+            return data
+    except ImportError:
+        log.warning("yfinance not installed — volume guardrail checks unavailable")
+    except Exception as e:
+        log.warning(f"{symbol}: yfinance volume fetch failed: {e}")
     return pd.DataFrame()
 
 

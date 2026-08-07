@@ -41,7 +41,14 @@ _REPO_ROOT   = Path(__file__).resolve().parents[2]
 DATA_DIR     = _REPO_ROOT / "data"
 UNIVERSE_FILE = DATA_DIR / "universe.json"
 TI_PRIMARY_FILE = DATA_DIR / "ti_primary.json"
-TI_PRIMARY_TTL_MINUTES = int(os.getenv("TI_PRIMARY_TTL_MINUTES", "25"))  # scraper now runs every 20 min — leave a 5 min buffer
+TI_PRIMARY_TTL_MINUTES = int(os.getenv("TI_PRIMARY_TTL_MINUTES", "125"))
+# ApexTraderTICapture runs every 20 min during 03:00-20:00 CT but only every
+# 2h overnight (added 2026-08-06, see add_overnight_ti_capture.ps1) — this TTL
+# has to cover the *slower* cadence or ti_primary.json gets judged "stale" for
+# ~95 min of every overnight cycle even though it's the current data, silently
+# falling back to the static universe instead. 125 = 2h overnight cadence + 5
+# min buffer, same convention as the old comment; still comfortably covers the
+# 20-min daytime cadence too.
 
 # ── TTL per tier (minutes) ────────────────────────────────────────────────────
 # The primary dynamic universe should refresh frequently; default TTL is 15 min.

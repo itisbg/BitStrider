@@ -67,6 +67,13 @@ except ImportError:
 # ── Paths ────────────────────────────────────────────────────────
 SCRIPT_DIR = Path(__file__).parent
 REPO_ROOT   = SCRIPT_DIR.parent.parent
+# Running this file directly (`python engine/ti/capture_tradeideas.py`) only
+# puts SCRIPT_DIR on sys.path, not REPO_ROOT, so the `engine.*` imports used
+# below (_is_valid_ti_ticker, _patch_config, ...) fail with "No module named
+# 'engine'" even though the scrape itself succeeds. Fix at the source instead
+# of re-inserting REPO_ROOT before every import site.
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 OUTPUT_DIR  = REPO_ROOT / "screenshots"
 CONFIG_FILE = REPO_ROOT / "engine" / "config.py"
 TI_UNUSUAL_OPTIONS_FILE = REPO_ROOT / "data" / "ti_unusual_options.json"
@@ -180,16 +187,24 @@ def _find_existing_edgedriver() -> Optional[str]:
     if repo_driver.is_file():
         return str(repo_driver)
 
-    # 2) webdriver_manager cache
-    wdm_root = os.path.expandvars(r"%USERPROFILE%\.wdm\drivers\msedgedriver")
-    patterns = [
-        os.path.join(wdm_root, "**", "msedgedriver.exe"),
-        os.path.join(wdm_root, "**", "win64", "msedgedriver.exe"),
-        os.path.join(wdm_root, "**", "win32", "msedgedriver.exe"),
-    ]
+    # 2) webdriver_manager cache. The installed folder is "edgedriver" (confirmed
+    # 2026-08-06: 5 valid cached versions sitting there, up to 151.0.4129.59) —
+    # this used to look under "msedgedriver" instead, a name that has never
+    # existed, so this cache-hit path never fired even once. Every call fell
+    # through to EdgeChromiumDriverManager().install(), which hits the network
+    # to re-verify/re-fetch the driver on every single cycle and every retry —
+    # exactly the kind of thing that's fine when the network cooperates and
+    # hangs or fails when it doesn't. Check both names in case a different
+    # webdriver_manager version ever reverts to the old one.
     candidates = []
-    for pattern in patterns:
-        candidates.extend(glob.glob(pattern, recursive=True))
+    for folder in ("edgedriver", "msedgedriver"):
+        wdm_root = os.path.expandvars(rf"%USERPROFILE%\.wdm\drivers\{folder}")
+        for pattern in (
+            os.path.join(wdm_root, "**", "msedgedriver.exe"),
+            os.path.join(wdm_root, "**", "win64", "msedgedriver.exe"),
+            os.path.join(wdm_root, "**", "win32", "msedgedriver.exe"),
+        ):
+            candidates.extend(glob.glob(pattern, recursive=True))
     candidates = [c for c in candidates if os.path.isfile(c)]
     if candidates:
         return max(candidates, key=lambda p: os.path.getmtime(p))
@@ -236,6 +251,115 @@ def _try_attach_edge(port: int) -> Optional["webdriver.Edge"]:
         return None
 
 
+def _iter_own_automation_edge(chrome_profile: Optional[str]):
+    """Yield psutil.Process objects for our own automation's main msedge.exe
+    (never its renderer/GPU/utility children, never a window the user opened
+    by hand). Identified by Selenium's own '--test-type=webdriver' marker
+    plus the *absence* of '--type=' — shared by _kill_orphaned_automation_edge()
+    and _automation_edge_present() so both scan the same way.
+    """
+    try:
+        import psutil
+    except ImportError:
+        return
+    # Every automation launch now uses --profile-directory=Default under the
+    # dedicated _automation_user_data_dir() (2026-08-06 fix for Chromium's
+    # "non-default data directory" DevTools restriction) — matching on
+    # --profile-directory={chrome_profile} here stopped working the moment
+    # that landed, since the real cmdline never contains "TIAutomation"
+    # anymore. That silently broke zombie detection: _get_driver()'s retry
+    # loop saw nothing "of ours" to kill and gave up after one attempt,
+    # leaving every failed window stuck forever colliding with the next
+    # attempt (confirmed 2026-08-06: exactly this). Match on the dedicated
+    # user-data-dir instead — unique to our own automation regardless of the
+    # chrome_profile label.
+    # psutil's cmdline() is argv-parsed (quotes stripped), unlike the raw
+    # WMI/CreateProcess string — match the bare path, not a quoted one.
+    marker = f"--user-data-dir={_automation_user_data_dir(chrome_profile)}" if chrome_profile else None
+    for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+        try:
+            if proc.info["name"] != "msedge.exe":
+                continue
+            cmdline = proc.info["cmdline"] or []
+            joined = " ".join(cmdline)
+            if "--test-type=webdriver" not in joined or "--type=" in joined:
+                continue  # not our automation's main process
+            if marker and marker not in joined:
+                continue
+            yield proc
+        except Exception:
+            continue
+
+
+def _automation_edge_present(chrome_profile: Optional[str]) -> bool:
+    """True if our own automation Edge is currently running for this profile.
+
+    _get_driver()'s CDP-reattach step used to run unconditionally on every
+    cycle "in case a browser is still alive" — but every normal cycle ends
+    with the browser fully quit(), so 100% of the time there is nothing to
+    attach to, and the attempt still pays the cost of spawning its own
+    msedgedriver.exe service process to find that out. Whether Selenium
+    cleanly tears that down on a failed connection isn't guaranteed, making
+    this a plausible slow leak across many cycles (2026-08-06). Check first
+    with a cheap local process scan — no service spawn, no network/CDP call —
+    so reattach is only ever attempted when there's real reason to.
+    """
+    return next(_iter_own_automation_edge(chrome_profile), None) is not None
+
+
+def _kill_orphaned_automation_edge(chrome_profile: Optional[str]) -> bool:
+    """Kill our own previously-launched Edge if it's still holding the profile
+    lock but no longer answering on the CDP port (e.g. wedged after the
+    machine slept). See _iter_own_automation_edge() for how "ours" is
+    identified — this can never touch a window the user opened by hand,
+    only our own zombie.
+    """
+    killed = False
+    for proc in _iter_own_automation_edge(chrome_profile):
+        try:
+            print(f"[WARN ] Killing unresponsive automation Edge (pid {proc.pid}) that's holding the profile lock")
+            for child in proc.children(recursive=True):
+                try:
+                    child.kill()
+                except Exception:
+                    pass
+            proc.kill()
+            killed = True
+        except Exception:
+            continue
+    return killed
+
+
+def _automation_user_data_dir(chrome_profile: str) -> str:
+    """Return a dedicated, non-default --user-data-dir for the automation Edge.
+
+    Chromium now refuses to enable remote debugging (which Selenium/msedgedriver
+    requires) when --user-data-dir is the browser's real default profile
+    location — confirmed 2026-08-06 via msedgedriver's own verbose log:
+    "DevTools remote debugging requires a non-default data directory." The
+    browser launches and even loads pages, but no DevTools port ever opens,
+    so msedgedriver times out and reports "session not created"/"Chrome
+    instance exited" — this was the actual root cause of every scrape failure
+    today, not a profile lock or slow extensions (those were red herrings).
+
+    One-time migration: if this dedicated dir doesn't exist yet, seed it by
+    copying the old default-location profile folder (chrome_profile) so the
+    existing Trade Ideas login/cookies carry over — no re-login needed.
+    """
+    import os, shutil
+
+    new_root = Path(os.path.expandvars(r"%LOCALAPPDATA%\TI_Automation\EdgeUserData"))
+    new_profile = new_root / "Default"
+    if not new_profile.is_dir():
+        old_profile = Path(os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\Edge\User Data")) / chrome_profile
+        if old_profile.is_dir():
+            print(f"[INFO ] Seeding dedicated automation profile from '{chrome_profile}' (one-time, preserves TI login)")
+            shutil.copytree(old_profile, new_profile)
+        else:
+            new_profile.mkdir(parents=True, exist_ok=True)
+    return str(new_root)
+
+
 def _create_edge_driver(chrome_profile: Optional[str] = None, remote_debug_port: int = 0) -> "webdriver.Edge":
     """Spawn a new visible Edge window and return the driver (never headless)."""
     import os, subprocess as _sp, sys as _sys
@@ -250,24 +374,46 @@ def _create_edge_driver(chrome_profile: Optional[str] = None, remote_debug_port:
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-blink-features=AutomationControlled")
+    # Chromium 111+ added an origin check on DevTools connections that
+    # silently refuses the driver's handshake without this — a well-known
+    # cause of exactly "session not created"/"chrome not reachable" even
+    # though the browser itself launches and runs fine (2026-08-06).
+    opts.add_argument("--remote-allow-origins=*")
     opts.add_argument("--log-level=3")
     opts.add_argument("--disable-logging")
     opts.add_argument("--silent")
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
     opts.add_experimental_option("useAutomationExtension", False)
-    # Keep the browser open after Python exits (prevents Selenium __del__ / quit()
-    # from closing Edge — essential for the re-attach-on-next-run feature).
-    opts.add_experimental_option("detach", True)
+    # Start on a blank page, not this profile's default New Tab Page. A
+    # fresh profile's NTP is the full MSN/Bing-powered one — several
+    # external image/widget fetches, some still loading many seconds in
+    # (confirmed via msedgedriver's own verbose log, 2026-08-06). That's
+    # slower to "settle" than msedgedriver's internal session-ready wait
+    # tolerates: the browser was still visibly alive and rendering when
+    # msedgedriver gave up, killed it, and reported the result as "Chrome
+    # instance exited" — the real first scan page navigation happens moments
+    # later via driver.get() anyway, so nothing here needs the NTP at all.
+    opts.add_argument("about:blank")
+    # No "detach" option: scrape_tradeideas() explicitly quits this window at
+    # the end of every cycle now, so nothing should be left dangling for
+    # Selenium to detach from in the first place.
 
-    # Enable remote debugging so a subsequent script run can re-attach to this
-    # same window (preserving the Trade Ideas login session).
-    if remote_debug_port > 0:
-        opts.add_argument(f"--remote-debugging-port={remote_debug_port}")
+    # Do NOT pass --remote-debugging-port as a raw Chromium argument here.
+    # msedgedriver manages its own internal debug port automatically when it
+    # launches a fresh browser, and manually forcing this flag on top of that
+    # conflicts with its own handshake — confirmed 2026-08-06 via
+    # msedgedriver's own verbose log: the browser launches and runs fine, but
+    # nothing ever ends up listening on the forced port, so msedgedriver
+    # polls "http://localhost:{port}/json/version" every ~2s forever and
+    # eventually gives up with "chrome not reachable". This was the actual
+    # root cause of nearly every scrape failure today, not a profile lock —
+    # this flag is only correct for _try_attach_edge()'s attach-to-an-
+    # externally-launched-browser case, which uses Selenium's debuggerAddress
+    # option instead, a different (and correct) mechanism.
 
     if chrome_profile:
-        user_data = os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\Edge\User Data")
-        opts.add_argument(f"--user-data-dir={user_data}")
-        opts.add_argument(f"--profile-directory={chrome_profile}")
+        opts.add_argument(f"--user-data-dir={_automation_user_data_dir(chrome_profile)}")
+        opts.add_argument("--profile-directory=Default")
 
     existing = _find_existing_edgedriver()
     if existing:
@@ -283,16 +429,89 @@ def _create_edge_driver(chrome_profile: Optional[str] = None, remote_debug_port:
         driver = webdriver.Edge(service=service, options=opts)
     except SessionNotCreatedException as e:
         if chrome_profile:
+            # The generic "locked/busy" framing was accurate for the original
+            # profile-lock bug, but this except branch fires for *any*
+            # SessionNotCreatedException — masking the real reason if the
+            # cause has since changed (2026-08-06: verified true even after
+            # the driver-cache and retry fixes, still failing consistently
+            # with this same message, and the actual exception text was
+            # never being surfaced anywhere to check). Always show it.
+            _first_line = str(e).splitlines()[0] if str(e) else repr(e)
             raise RuntimeError(
-                f"Edge profile '{chrome_profile}' is locked/busy — close Edge first."
+                f"Edge profile '{chrome_profile}' is locked/busy — close Edge first. "
+                f"[{_first_line}]"
             ) from e
         raise e
 
     driver.set_page_load_timeout(45)
     driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-    debug_hint = f" (remote-debug port {remote_debug_port})" if remote_debug_port > 0 else ""
-    print(f"[INFO ] Edge browser opened{debug_hint}. Stays open across scrape cycles; re-attachable on restart.")
+    print("[INFO ] Edge browser opened. Stays open across scrape cycles within this process.")
     return driver
+
+
+_DRIVER_CREATE_TIMEOUT_SEC = 30
+
+
+def _create_edge_driver_with_timeout(
+    chrome_profile: Optional[str] = None, remote_debug_port: int = 0
+) -> "webdriver.Edge":
+    """Run _create_edge_driver() with a hard timeout.
+
+    The underlying webdriver.Edge(...) constructor has no timeout of its own
+    and can hang indefinitely if the msedgedriver<->Edge handshake stalls
+    (confirmed 2026-08-06: near-zero CPU for 3+ minutes, needed a human to
+    close the browser). Nothing in the normal retry path can rescue that
+    hang — it happens before scrape_tradeideas()'s own try/finally cleanup
+    even starts, so the browser never gets closed for the next run. Treat a
+    timeout the same as "locked/busy": kill whatever got spawned and raise,
+    so _get_driver()'s existing kill-and-retry-once path also covers this.
+    """
+    import threading as _th
+
+    result: dict = {}
+
+    def _run() -> None:
+        try:
+            result["driver"] = _create_edge_driver(
+                chrome_profile=chrome_profile, remote_debug_port=remote_debug_port
+            )
+        except Exception as exc:
+            result["error"] = exc
+
+    t = _th.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(_DRIVER_CREATE_TIMEOUT_SEC)
+
+    if t.is_alive():
+        print(f"[WARN ] Edge driver creation hard-timeout ({_DRIVER_CREATE_TIMEOUT_SEC}s) — clearing and retrying")
+        # _kill_orphaned_automation_edge() only targets msedge.exe — it has to
+        # stay that narrow since a real msedge.exe could be the user's own
+        # window. msedgedriver.exe is different: it's never anything but our
+        # own automation, so it's always safe to clear here. This matters
+        # because it's msedgedriver — not the browser — that the still-live
+        # background thread above is actually blocked waiting on; killing
+        # only the browser leaves that thread hung forever, piling up one
+        # more leaked, still-running thread on every retry (confirmed
+        # 2026-08-06: exactly this, needed a human to end the process).
+        try:
+            import psutil
+            for proc in psutil.process_iter(["pid", "name"]):
+                if proc.info.get("name") == "msedgedriver.exe":
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+        except ImportError:
+            pass
+        _kill_orphaned_automation_edge(chrome_profile)
+        raise RuntimeError(
+            f"Edge profile '{chrome_profile}' is locked/busy — close Edge first."
+            if chrome_profile else "Edge driver creation timed out"
+        )
+
+    if "error" in result:
+        raise result["error"]
+    return result["driver"]
 
 
 def _get_driver(
@@ -313,16 +532,55 @@ def _get_driver(
     if _edge_driver is not None:
         print("[WARN ] Edge session lost — attempting re-attach before reopening.")
 
-    # Step 2: try CDP re-attach
-    if remote_debug_port > 0:
-        _edge_driver = _try_attach_edge(remote_debug_port)
+    # Step 2: try CDP re-attach, with a couple of retries — but only if a
+    # matching automation Edge is actually running. Every normal cycle ends
+    # with the browser fully quit(), so unconditionally attempting this
+    # every cycle (as before) mostly just spawns and abandons a throwaway
+    # msedgedriver.exe service process to learn there's nothing to attach to.
+    # Right after the machine wakes from sleep, though, the old window can
+    # genuinely still be alive — worth waiting for in that real case, rather
+    # than racing it into Step 3's fresh-launch and colliding over the
+    # profile lock.
+    if remote_debug_port > 0 and _automation_edge_present(chrome_profile):
+        for attempt in range(3):
+            _edge_driver = _try_attach_edge(remote_debug_port)
+            if _edge_driver is not None:
+                break
+            if attempt < 2:
+                time.sleep(5)
 
-    # Step 3: open a fresh Edge window
+    # Step 3: open a fresh Edge window. If a previous automation window is
+    # wedged (dead on CDP but still holding the --profile-directory lock),
+    # clear it out first — it can never be the user's own Edge, see
+    # _kill_orphaned_automation_edge's docstring — then retry.
+    #
+    # A single 3s-wait retry (the old behavior) wasn't enough: confirmed
+    # 2026-08-06 that a killed process's own just-spawned browser can become
+    # the *next* attempt's blocker in a fast, tight loop — proc.kill() doesn't
+    # guarantee Windows finishes releasing the profile's lock file within 3s,
+    # especially under heavy load. A few attempts with a growing wait gives
+    # the OS more room to actually finish tearing the old process down.
     if _edge_driver is None:
-        _edge_driver = _create_edge_driver(
-            chrome_profile=chrome_profile,
-            remote_debug_port=remote_debug_port,
-        )
+        _KILL_RETRY_WAITS = (3, 6, 10)
+        last_exc: Optional[Exception] = None
+        for wait_sec in _KILL_RETRY_WAITS:
+            try:
+                _edge_driver = _create_edge_driver_with_timeout(
+                    chrome_profile=chrome_profile,
+                    remote_debug_port=remote_debug_port,
+                )
+                last_exc = None
+                break
+            except RuntimeError as exc:
+                if "locked/busy" not in str(exc):
+                    raise
+                last_exc = exc
+                print(f"[WARN ] {exc} — checking for a wedged automation Edge to clear.")
+                if not _kill_orphaned_automation_edge(chrome_profile):
+                    break  # nothing of ours to clear — no point retrying
+                time.sleep(wait_sec)
+        if _edge_driver is None and last_exc is not None:
+            raise last_exc
 
     return _edge_driver
 
@@ -926,7 +1184,26 @@ def scrape_tradeideas(
     else:
         print(f"[WARN ] ti_primary.json not updated: only {len(clean_primary)} valid tickers")
 
-    print("[OK   ] Scrape done. Edge window stays open.")
+    # Close the browser now that the scrape is done — no more staying open
+    # between cycles. Each cycle logs into 'Default' fresh from the profile's
+    # own saved cookies, so nothing about the TI login is lost by closing.
+    #
+    # driver.quit() alone is not enough: when this session came from
+    # _try_attach_edge() (CDP reattach to an already-running window) rather
+    # than _create_edge_driver(), Selenium never "owned" that browser's
+    # process and quit() just drops the CDP connection — the window stays
+    # open. Always follow up by killing our own marked process directly so
+    # "closed" is actually true either way.
+    global _edge_driver
+    try:
+        driver.quit()
+    except Exception as exc:
+        print(f"[WARN ] Edge quit() failed (may already be closed): {exc}")
+    _edge_driver = None
+    if _kill_orphaned_automation_edge(chrome_profile):
+        print("[OK   ] Scrape done. Edge closed.")
+    else:
+        print("[OK   ] Scrape done. Edge closed (quit() already handled it).")
 
     return results
 
@@ -1004,13 +1281,21 @@ def main() -> None:
             print(f"[INFO ] Sleeping {args.loop}s …")
             time.sleep(args.loop)
     else:
-        scrape_tradeideas(
-            update_config=args.update_config,
-            chrome_profile=args.chrome_profile,
-            select_minutes=select_minutes,
-            include_toplists=args.include_toplists,
-            remote_debug_port=args.remote_debug_port,
-        )
+        try:
+            scrape_tradeideas(
+                update_config=args.update_config,
+                chrome_profile=args.chrome_profile,
+                select_minutes=select_minutes,
+                include_toplists=args.include_toplists,
+                remote_debug_port=args.remote_debug_port,
+            )
+        except Exception as exc:
+            # Single-shot runs are owned by Task Scheduler's own 20-min
+            # trigger (see run_ti_capture_task.ps1) — log cleanly and exit
+            # non-zero instead of dumping a raw traceback; the next trigger
+            # retries on its own.
+            print(f"[ERROR] Scrape cycle failed: {exc}")
+            raise SystemExit(1)
 
 
 if __name__ == "__main__":

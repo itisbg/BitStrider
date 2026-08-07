@@ -52,6 +52,7 @@ from engine.config import (
     SMALL_ACCOUNT_MIN_POSITION_DOLLARS,
     POSITION_SIZE_PCT, SMALL_ACCOUNT_POSITION_SIZE_PCT,
     CONF_SCALE_MIN_MULT, CONF_SCALE_FULL_CONF,
+    CONF_RATCHET_ENABLED, CONF_RATCHET_TRIGGER_GAIN_PCT, CONF_RATCHET_MAX_TIGHTEN,
     LIVE,
 )
 from engine.equity.strategies import Signal
@@ -65,6 +66,36 @@ log = logging.getLogger("ApexTrader")
 # ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 # Helpers
 # ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+def ratchet_scale(confidence: float) -> float:
+    """Pure math for the confidence-ratchet trailing-stop multiplier.
+    confidence <= SWAP_MIN_CONFIDENCE (0.75) -> 1.0 (no tightening).
+    confidence == 1.0                        -> CONF_RATCHET_MAX_TIGHTEN (max tightening).
+    Linear in between. See ratchet_confident_winners() for where this is used
+    and CONFIG.md / config.py for the constants' rationale."""
+    if confidence <= SWAP_MIN_CONFIDENCE:
+        return 1.0
+    span = max(1e-6, 1.0 - SWAP_MIN_CONFIDENCE)
+    frac = min(1.0, (confidence - SWAP_MIN_CONFIDENCE) / span)
+    return 1.0 - frac * (1.0 - CONF_RATCHET_MAX_TIGHTEN)
+
+
+def _demo() -> None:
+    """python -m engine.execution.enhanced — asserts the ratchet math holds
+    at its key points before it's trusted against a live account."""
+    assert ratchet_scale(0.0) == 1.0, "below floor -> no tightening"
+    assert ratchet_scale(0.75) == 1.0, "at floor -> no tightening"
+    assert abs(ratchet_scale(1.0) - CONF_RATCHET_MAX_TIGHTEN) < 1e-9, "at 1.0 -> max tightening"
+    mid = ratchet_scale(0.875)  # halfway between 0.75 and 1.0
+    expected_mid = 1.0 - 0.5 * (1.0 - CONF_RATCHET_MAX_TIGHTEN)
+    assert abs(mid - expected_mid) < 1e-9, f"halfway point off: {mid} != {expected_mid}"
+    assert ratchet_scale(0.90) < ratchet_scale(0.80), "higher confidence must tighten more"
+    print("ratchet_scale: all checks passed")
+
+
+if __name__ == "__main__":
+    _demo()
+
+
 class OrderType(Enum):
     LONG  = "long"
     SHORT = "short"
@@ -136,10 +167,12 @@ class EnhancedExecutor:
         self._htb_cache:      set   = set()   # hard-to-borrow symbols — skip shorts this session
         self._entry_log:   Dict[str, dict] = {}  # {symbol: {"strategy": str, "date": date}}
         self._swap_cycle_closed: set = set()     # positions already swapped this scan cycle
+        self._ratchet_done: set = set()          # symbols whose stop was already confidence-tightened
         self._tp_targets: Dict[str, float] = {} # {symbol: take-profit price} for ATR-based TP tracking
         self.shorting_blocked: bool = False  # set true when broker rejects all short attempts for account
         self._pdt_stop_blocked: Dict[str, float] = {}  # {symbol: stop_price} — broker-rejected stops; monitored in software
-        self._afterhours_stop_cooldown: Dict[str, float] = {}  # {symbol: monotonic expiry} — blocks re-entry after an after-hours stop-loss exit
+        self._afterhours_stop_cooldown: Dict[str, float] = {}  # {symbol: monotonic expiry} — blocks re-entry after a stop-loss exit (despite the name, populated by ANY stop-loss close now, not just the after-hours software path — see detect_stopped_out_positions)
+        self._last_known_positions: Dict[str, dict] = {}  # {symbol: {entry_price, last_price, is_long}} — snapshot used to notice a position disappearing between polls
         self._afterhours_chase_count: Dict[str, int] = {}  # {symbol: consecutive re-chase attempts} — widens slip each retry so a fast-falling after-hours book actually fills
         self._no_gain_chase_count: Dict[str, int] = {}  # same, for close_no_gain_positions's re-chase
         self._pdt_overnight_forced: set = set()  # symbols where PDT also blocks close — forced overnight, no retries
@@ -203,11 +236,39 @@ class EnhancedExecutor:
         raise RuntimeError("EnhancedExecutor requires market_state to be set before execution")
 
     # -- Position Cache ----------------------------------------------------
+    def _has_pending_close(self, symbol: str) -> bool:
+        """True if *symbol* already has a resting non-GTC order (i.e. something
+        other than its routine protective trailing stop) — meaning a swap-close
+        was already submitted for it on an earlier cycle and just hasn't filled
+        yet (routine in pre/after-hours illiquidity). Candidate-finders use this
+        to avoid re-selecting the same position for a second close order before
+        the first one clears — confirmed in production 2026-08-05: without this,
+        RRC and GCT each got a duplicate close submitted 10 minutes apart, and
+        both swaps were for nothing since the intended new entry (PLTR/ONDS)
+        still got skipped on insufficient buying power either time (freed cash
+        from an unfilled close doesn't settle same-cycle)."""
+        try:
+            for o in (self.client.get_orders() or []):
+                if o.symbol != symbol:
+                    continue
+                if getattr(o, "time_in_force", None) != TimeInForce.GTC:
+                    return True
+            return False
+        except Exception:
+            return False
+
     def _find_weakest_position(self) -> Optional[str]:
         """Return the symbol of the open long position with the worst unrealized P&L %.
-        Only considers longs with no shares held for pending orders (closable immediately).
-        Skips positions entered today (protected for full day) and those already closed this cycle.
-        Returns None if no closable position found."""
+        Skips positions entered today (protected for full day), those already
+        closed this cycle, and those already mid-close from a prior cycle.
+        Returns None if no closable position found.
+
+        Does NOT require qty_available > 0: every position here normally carries
+        a full-size GTC trailing stop (qty_available is always 0 as a result),
+        and _attempt_swap already cancels that resting order before closing —
+        requiring qty_available > 0 here meant this never found a candidate in
+        practice, silently defeating the whole swap-on-high-confidence feature.
+        """
         try:
             today = datetime.date.today()
             entered_today = {
@@ -218,10 +279,10 @@ class EnhancedExecutor:
             longs = [
                 p for p in positions
                 if float(p.qty) > 0
-                and float(getattr(p, "qty_available", p.qty)) > 0
                 and p.symbol not in self._swap_cycle_closed
                 and p.symbol not in entered_today
                 and not re.match(r'^[A-Z]+\d{6}[CP]\d{8}$', p.symbol)  # skip OCC option symbols
+                and not self._has_pending_close(p.symbol)
             ]
             if not longs:
                 return None
@@ -247,9 +308,11 @@ class EnhancedExecutor:
                 sym = p.symbol
                 if re.match(r'^[A-Z]+\d{6}[CP]\d{8}$', sym):
                     continue  # options legs — managed separately
-                if float(p.qty) <= 0 or float(getattr(p, "qty_available", p.qty)) <= 0:
+                if float(p.qty) <= 0:
                     continue
                 if sym in self._swap_cycle_closed:
+                    continue
+                if self._has_pending_close(sym):
                     continue
                 entry_dt = self._get_entry_datetime(sym)
                 if entry_dt is None:
@@ -281,10 +344,10 @@ class EnhancedExecutor:
             candidates = [
                 p for p in positions
                 if float(p.qty) > 0
-                and float(getattr(p, "qty_available", p.qty)) > 0
                 and p.symbol not in self._swap_cycle_closed
                 and p.symbol not in entered_today
                 and not re.match(r'^[A-Z]+\d{6}[CP]\d{8}$', p.symbol)  # skip OCC option symbols
+                and not self._has_pending_close(p.symbol)
             ]
             if not candidates:
                 return None, 1.0
@@ -366,7 +429,7 @@ class EnhancedExecutor:
             for o in (self.client.get_orders() or []):
                 if o.symbol != weakest:
                     continue
-                if str(getattr(o, "time_in_force", "")).upper() == "GTC":
+                if getattr(o, "time_in_force", None) == TimeInForce.GTC:
                     weakest_gtc_id = o.id
                 self.client.cancel_order_by_id(str(o.id))
                 time.sleep(0.4)
@@ -800,6 +863,18 @@ class EnhancedExecutor:
                         f"to make room for {signal.symbol} (conf={signal.confidence:.0%})"
                     )
                     try:
+                        # Same as _attempt_swap: victim's full qty is normally
+                        # reserved by its own GTC trailing stop, so close_position()
+                        # rejects with "insufficient qty available" unless that
+                        # resting order is cancelled first (confirmed failing on
+                        # every cycle in production before this — AMLX, 40310000).
+                        try:
+                            for o in (self.client.get_orders() or []):
+                                if o.symbol == victim:
+                                    self.client.cancel_order_by_id(str(o.id))
+                                    time.sleep(0.4)
+                        except Exception as cancel_err:
+                            log.warning(f"CONF-SWAP {victim}: order cancel failed, close may reject: {cancel_err}")
                         self.client.close_position(victim)
                         self._swap_cycle_closed.add(victim)
                         # Do not count the close as a day trade (exits are always allowed)
@@ -1042,6 +1117,78 @@ class EnhancedExecutor:
                 else:
                     log.error(f"protect_positions {sym}: {e}")
 
+    def ratchet_confident_winners(self) -> None:
+        """Tighten the trailing stop on a position once it's up
+        CONF_RATCHET_TRIGGER_GAIN_PCT or more, scaled by how confident the
+        original entry signal was — a trade we were more sure about locks in
+        its gain sooner instead of riding the full tier-width stop like every
+        other trade. Runs once per position for its whole life (tracked via
+        _ratchet_done); protect_positions() never revisits a symbol once it
+        has a resting order, so this is the only place a stop gets replaced
+        after the fact.
+
+        Skips: positions still at/under their entry price, confidence at or
+        below SWAP_MIN_CONFIDENCE (includes the 0.0 placeholder that
+        _rebuild_entry_log_from_orders uses for positions restored after a
+        bot restart — we don't actually know those were high-confidence, so
+        never tighten them), and anything already ratcheted.
+        """
+        if not CONF_RATCHET_ENABLED:
+            return
+        try:
+            positions = self.client.get_all_positions()
+        except Exception as e:
+            log.warning(f"ratchet_confident_winners: fetch failed: {e}")
+            return
+
+        for pos in positions:
+            sym = pos.symbol
+            if sym in self._ratchet_done:
+                continue
+            if re.match(r'^[A-Z]+\d{6}[CP]\d{8}$', sym):
+                continue  # options legs — managed separately
+            confidence = self._entry_log.get(sym, {}).get("confidence", 0.0)
+            if confidence <= SWAP_MIN_CONFIDENCE:
+                continue
+            try:
+                qty      = int(float(pos.qty))
+                gain_pct = float(pos.unrealized_plpc) * 100.0
+            except (TypeError, ValueError):
+                continue
+            if qty == 0 or gain_pct < CONF_RATCHET_TRIGGER_GAIN_PCT:
+                continue
+
+            try:
+                current   = float(pos.current_price)
+                tier_info = get_dynamic_tier(sym, current)
+                base_pct  = tier_info["ts"]
+                tightened_pct = round(base_pct * ratchet_scale(confidence), 2)
+                if tightened_pct >= base_pct:
+                    self._ratchet_done.add(sym)  # nothing to tighten to; don't recheck every cycle
+                    continue
+
+                for o in (self.client.get_orders() or []):
+                    if o.symbol == sym:
+                        self.client.cancel_order_by_id(str(o.id))
+                        time.sleep(0.4)
+
+                stop_side = OrderSide.SELL if qty > 0 else OrderSide.BUY
+                self.client.submit_order(TrailingStopOrderRequest(
+                    symbol        = sym,
+                    qty           = abs(qty),
+                    side          = stop_side,
+                    type          = AlpacaOrderType.TRAILING_STOP,
+                    time_in_force = TimeInForce.GTC,
+                    trail_percent = tightened_pct,
+                ))
+                self._ratchet_done.add(sym)
+                log.info(
+                    f"RATCHET {sym}: +{gain_pct:.1f}% unrealized, entry conf={confidence:.0%} — "
+                    f"trailing stop {base_pct:.1f}% -> {tightened_pct:.1f}%"
+                )
+            except Exception as e:
+                log.warning(f"ratchet_confident_winners {sym}: {e}")
+
     def _submit_closing_order(self, symbol: str, qty: int, side: OrderSide, current_price: float, slip_pct: float = 0.5) -> None:
         """Submit a position-closing order. During regular hours this is a plain
         market order; outside regular hours (Alpaca rejects market orders then)
@@ -1116,6 +1263,58 @@ class EnhancedExecutor:
             self._afterhours_stop_cooldown.pop(s, None)
         return set(self._afterhours_stop_cooldown.keys())
 
+    def detect_stopped_out_positions(self) -> None:
+        """Catch a position closing via ANY route — most commonly a normal
+        broker-side GTC trailing stop filling on its own — and apply the same
+        re-entry cooldown that check_afterhours_stops() already sets for its
+        own software-triggered closes.
+
+        Confirmed necessary 2026-08-05: SOXS was stopped out and immediately
+        re-bought the identical VWAPFade signal repeatedly (22 trades, -$605
+        net) because the cooldown only ever fired from
+        check_afterhours_stops()'s own close path — a normal GTC fill, the
+        far more common way a stop actually triggers, never touched it.
+
+        Approximate on purpose: compares against the last-seen mark price
+        rather than looking up the exact closing fill via the orders API —
+        good enough to tell "this was heading toward/at a loss," which is all
+        a re-entry cooldown needs; not meant to be an exact realized-P&L
+        figure (see the trade-history report for that).
+        """
+        try:
+            positions = self.client.get_all_positions()
+        except Exception as e:
+            log.warning(f"detect_stopped_out_positions: fetch failed: {e}")
+            return
+
+        current: Dict[str, dict] = {}
+        for p in positions:
+            sym = p.symbol
+            if re.match(r'^[A-Z]+\d{6}[CP]\d{8}$', sym):
+                continue  # options legs — managed separately
+            try:
+                current[sym] = {
+                    "entry_price": float(p.avg_entry_price),
+                    "last_price": float(p.current_price),
+                    "is_long": float(p.qty) > 0,
+                }
+            except (TypeError, ValueError):
+                continue
+
+        for sym, info in self._last_known_positions.items():
+            if sym in current or sym in self._afterhours_stop_cooldown:
+                continue  # still open, or already cooling down from elsewhere
+            entry, last, is_long = info["entry_price"], info["last_price"], info["is_long"]
+            was_loss = (last < entry) if is_long else (last > entry)
+            if was_loss:
+                self._afterhours_stop_cooldown[sym] = time.monotonic() + AFTERHOURS_STOP_COOLDOWN_MIN * 60
+                log.info(
+                    f"STOP-COOLDOWN {sym}: closed near a loss (last ${last:.2f} vs entry ${entry:.2f}) "
+                    f"— blocking re-entry for {AFTERHOURS_STOP_COOLDOWN_MIN} min"
+                )
+
+        self._last_known_positions = current
+
     def check_afterhours_stops(self) -> None:
         """Actively watch every open position's loss while the market is NOT in
         regular hours — the broker-side GTC trailing stop from protect_positions()
@@ -1159,7 +1358,7 @@ class EnhancedExecutor:
         pending_by_sym: Dict[str, object] = {}  # symbol -> resting non-GTC order (a close already in flight)
         gtc_orders: Dict[str, str] = {}          # symbol -> GTC trailing-stop order id
         for o in open_orders:
-            if str(getattr(o, "time_in_force", "")).upper() == "GTC":
+            if getattr(o, "time_in_force", None) == TimeInForce.GTC:
                 gtc_orders[o.symbol] = o.id
             else:
                 pending_by_sym[o.symbol] = o
@@ -1390,7 +1589,7 @@ class EnhancedExecutor:
                     sym_orders = [
                         o for o in (self.client.get_orders() or [])
                         if o.symbol == sym
-                        and str(getattr(o, "time_in_force", "")).upper() != "GTC"
+                        and getattr(o, "time_in_force", None) != TimeInForce.GTC
                     ]
                     for _o in sym_orders:
                         try:
@@ -1671,7 +1870,7 @@ class EnhancedExecutor:
                 log.warning(f"close_no_gain_positions {sym}: order fetch failed, will retry next cycle: {e}")
                 continue
 
-            pending = next((o for o in sym_orders if str(getattr(o, "time_in_force", "")).upper() != "GTC"), None)
+            pending = next((o for o in sym_orders if getattr(o, "time_in_force", None) != TimeInForce.GTC), None)
             if pending is not None:
                 submitted_at = getattr(pending, "submitted_at", None) or getattr(pending, "created_at", None)
                 age_s = (now_utc - submitted_at).total_seconds() if submitted_at else 0.0
@@ -1687,7 +1886,7 @@ class EnhancedExecutor:
             # The resting GTC trailing stop reserves this position's qty and can cause
             # the close to be rejected as a wash trade — cancel it first, same fix as
             # check_afterhours_stops. Re-armed below as a fallback if the close fails.
-            gtc_order = next((o for o in sym_orders if str(getattr(o, "time_in_force", "")).upper() == "GTC"), None)
+            gtc_order = next((o for o in sym_orders if getattr(o, "time_in_force", None) == TimeInForce.GTC), None)
             if gtc_order:
                 try:
                     self.client.cancel_order_by_id(str(gtc_order.id))
