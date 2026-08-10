@@ -270,19 +270,29 @@ def _filter_eligible(
     if ctx.executor.shorting_blocked and not cfg.LONG_ONLY_MODE:
         log.warning("Shorting blocked by broker (40310000) — effective long-only this session")
 
+    # Same-underlying guard: don't buy two leveraged siblings of the same
+    # commodity/index/stock in one cycle (e.g. BOIL+KOLD, or AAPU alongside
+    # held AAPL) — see leveraged_underlying() in config.py.
+    picked_underlyings = {cfg.leveraged_underlying(sym) for sym in fresh_held}
+
     eligible = []
     for s in signals:
         if s.symbol in fresh_held:
             continue
+        underlying = cfg.leveraged_underlying(s.symbol)
+        if underlying in picked_underlyings:
+            continue
         conf = round(float(s.confidence), 2)
         if s.action == "buy" and conf >= cfg.MIN_SIGNAL_CONFIDENCE:
             eligible.append(s)
+            picked_underlyings.add(underlying)
         elif (
             s.action in ("sell", "short")
             and not long_only
             and conf >= short_min_conf
         ):
             eligible.append(s)
+            picked_underlyings.add(underlying)
 
     # Strip shorts when effectively long-only
     if long_only:
@@ -294,6 +304,7 @@ def _filter_eligible(
             (s for s in signals
              if s.action == "buy"
              and s.symbol not in fresh_held
+             and cfg.leveraged_underlying(s.symbol) not in picked_underlyings
              and round(float(s.confidence), 2) >= cfg.MIN_SIGNAL_CONFIDENCE),
             None,
         )
@@ -315,6 +326,8 @@ def _log_skipped(signals: list, eligible: list, fresh_held: set, regime: str, ex
     """Log skip reason for each top-10 raw signal that did not make it to eligible."""
     short_min_conf = cfg.MIN_SHORT_CONFIDENCE_BEAR if regime == "bear" else cfg.MIN_SIGNAL_CONFIDENCE
     eligible_syms  = {s.symbol for s in eligible}
+    eligible_underlyings = {cfg.leveraged_underlying(sym) for sym in fresh_held} | \
+                            {cfg.leveraged_underlying(s.symbol) for s in eligible}
     top10          = sorted(signals, key=lambda s: s.confidence, reverse=True)[:10]
     for s in top10:
         if s.symbol in eligible_syms:
@@ -322,6 +335,8 @@ def _log_skipped(signals: list, eligible: list, fresh_held: set, regime: str, ex
         conf = round(float(s.confidence), 2)
         if s.symbol in fresh_held:
             reason = "already held/ordered"
+        elif cfg.leveraged_underlying(s.symbol) in eligible_underlyings:
+            reason = f"same underlying ({cfg.leveraged_underlying(s.symbol)}) already held/picked"
         elif s.action == "buy" and conf < cfg.MIN_SIGNAL_CONFIDENCE:
             reason = f"conf {conf:.0%} < long min {cfg.MIN_SIGNAL_CONFIDENCE:.0%}"
         elif s.action in ("sell", "short") and conf < short_min_conf:

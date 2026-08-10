@@ -289,6 +289,67 @@ CORRELATION_GROUPS = {
         "max_pct": 25.0,   # combined cap — above the single-symbol 20%, since it's a basket
     },
 }
+
+# Same-underlying leveraged-ETF pairs (bull+bear on one commodity/index, e.g.
+# BOIL/KOLD both on nat gas — arbitrary product names, no ticker pattern to
+# exploit, must be hand-maintained) — confirmed in production 2026-08-10:
+# BOIL+KOLD and UCO+SCO both held simultaneously via the TI-scraped universe.
+# Unlike CORRELATION_GROUPS (a %-of-equity trim), this is a same-cycle/
+# same-symbol entry block: _filter_eligible() skips a signal whose underlying
+# key is already held or already picked earlier in the same cycle.
+LEVERAGED_UNDERLYING_GROUPS = {
+    "OIL":         {"UCO", "SCO"},
+    "NATGAS":      {"BOIL", "KOLD"},
+    "GOLD_MINERS": {"NUGT", "DUST", "JNUG", "JDST", "GDXU", "GDXD"},
+    "SILVER":      {"AGQ", "ZSL"},
+    "ETH":         {"ETHU", "ETHD", "ETHT"},
+    "SPX":         {"SPXL", "SPXS", "SPXU", "UPRO"},
+    "NDX":         {"TQQQ", "SQQQ"},
+    "RUSSELL2000": {"TNA", "TZA", "URTY", "SRTY"},
+    "SEMIS":       {"SOXL", "SOXS"},
+    "FINANCIALS":  {"FAS", "FAZ"},
+    "BIOTECH":     {"LABU", "LABD"},
+    "DOW":         {"UDOW", "SDOW"},
+    "20Y_TREASURY": {"TMF", "TMV"},
+}
+LEVERAGED_UNDERLYING = {
+    sym: key for key, syms in LEVERAGED_UNDERLYING_GROUPS.items() for sym in syms
+}
+
+# Single-stock leveraged ETFs (AAPU on AAPL, NVDL on NVDA, SMCL/SMCX/SMCZ on
+# SMCI, ...) follow a ticker pattern instead: root + one suffix letter from a
+# small fixed set. Rather than hand-list every provider's product for every
+# hot mega/large-cap (new ones list constantly), leveraged_underlying() below
+# pattern-matches any candidate against this whitelist of tickers popular
+# enough to attract 3rd-party leveraged products. Whitelisted (not applied to
+# the whole universe) so two unrelated small-caps sharing a prefix are never
+# coincidentally blocked — e.g. "AAP" (Advance Auto Parts) and "METC" (Ramaco
+# Resources) are real, unrelated tickers that must NOT collide with AAPL/META.
+SINGLE_STOCK_LEVERAGE_TARGETS = {
+    "AAPL", "MSFT", "NVDA", "GOOGL", "GOOG", "META", "TSLA", "AMZN",
+    "AVGO", "NFLX", "ORCL", "MSTR", "COIN", "SMCI", "PLTR", "IONQ", "RKLB", "MARA",
+    "SPCX",  # SpaceX — confirmed live in scan universe alongside SPCF (2026-07-06 log)
+}
+_LEVERAGE_SUFFIXES = set("LSUDXZQBTF")  # F added for SPCF (SpaceX leveraged sibling)
+
+
+def leveraged_underlying(symbol: str) -> str:
+    """Best-effort underlying key for the same-underlying entry guard.
+
+    Exact group lookup first (LEVERAGED_UNDERLYING); then a same-length,
+    same-root, known-suffix match against SINGLE_STOCK_LEVERAGE_TARGETS
+    (catches new single-stock products before anyone remembers to add them
+    to a list). Anything else maps to itself.
+    """
+    if symbol in LEVERAGED_UNDERLYING:
+        return LEVERAGED_UNDERLYING[symbol]
+    if len(symbol) >= 4 and symbol.isalpha():
+        for base in SINGLE_STOCK_LEVERAGE_TARGETS:
+            if (len(symbol) == len(base) and symbol != base
+                    and symbol[:-1] == base[:-1]
+                    and symbol[-1] in _LEVERAGE_SUFFIXES):
+                return base
+    return symbol
 USE_RISK_EQUALIZED_SIZING = False  # use fixed position sizing instead of risk-scaled
 RISK_PER_TRADE_PCT   = 0.8    # Risk 0.8% of account per trade (unused with fixed sizing)
 
@@ -533,6 +594,14 @@ STALE_ORDER_MINUTES_INTRADAY =  30  # intraday strategies (ORB, surge, etc.) —
 PDT_ACCOUNT_MIN = 25000.0
 PDT_MAX_TRADES  = 3
 PDT_OPTIONS_DAY_TRADE_RESERVE = int(os.getenv("PDT_OPTIONS_DAY_TRADE_RESERVE", "1"))  # keep at least N day trades free for stock exits
+
+# Alpaca (Reg T) hard minimum equity to short at all — confirmed 2026-08-07:
+# every short order was rejected with "account is not allowed to short"
+# (code 40310000) regardless of symbol, despite the account's Shorting
+# Enabled toggle being on; the account's equity (~$1,000, per the quarterly
+# baseline) is simply under this floor. Not configurable per-account by us —
+# it's the broker's own regulatory minimum.
+MIN_EQUITY_FOR_SHORT = 2000.0
 
 # ─────────────────────────────────────────────────────────────────
 # Email Notifications
