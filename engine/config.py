@@ -268,11 +268,11 @@ STOCKS = {
 # ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 # Trading Parameters ΓÇö Swing Trading Optimized
 # ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
-MAX_POSITIONS        = 12     # 7.5% × 12 = 90% of usable equity (within 10% BP reserve)
+MAX_POSITIONS        = 9      # 10% × 9 = 90% of usable equity (within 10% BP reserve) — was 12 @ 7.5%
 # When full, close the weakest position to make room if new signal conf > this threshold
 SWAP_ON_FULL         = True   # enabled — close weakest position for a better signal when full
 SWAP_MIN_CONFIDENCE  = 0.75   # Swap out weakest when new signal >= this confidence (was 0.85)
-POSITION_SIZE_PCT    = 7.5    # 7.5% per position → up to 12 positions within 90% BP utilization
+POSITION_SIZE_PCT    = 10.0   # 10% per position → up to 9 positions within 90% BP utilization — was 7.5%/12
 MAX_POSITION_CONCENTRATION_PCT = 20.0  # Hard cap: no single symbol's market value may exceed this % of equity,
                                         # enforced both at entry sizing and by trimming winners that ran past it
 
@@ -360,7 +360,7 @@ CONF_SCALE_MIN_MULT  = 0.50   # 50% of normal size at the confidence floor (0.72
 CONF_SCALE_FULL_CONF = 0.85   # 100% of normal size at this confidence and above
 
 # Small account reduction caps (sub-$5k equity)
-SMALL_ACCOUNT_POSITION_SIZE_PCT = 7.5   # same 7.5% allocation for small accounts
+SMALL_ACCOUNT_POSITION_SIZE_PCT = 10.0  # same allocation as POSITION_SIZE_PCT for small accounts — was 7.5%
 SMALL_ACCOUNT_RISK_PER_TRADE_PCT = 0.5 # lower risk per trade for small accounts
 SMALL_ACCOUNT_MIN_POSITION_DOLLARS = 5.0  # lowered to allow ~$5 entry for cheap tickers
 
