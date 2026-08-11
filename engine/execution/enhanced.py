@@ -42,7 +42,7 @@ from engine.config import (
     ATR_TP_RATIO, MAX_SHORT_FLOAT_PCT, HIGH_SHORT_FLOAT_STOCKS, is_high_short_float,
     EOD_CLOSE_ENABLED, EOD_CLOSE_TIME, EOD_CLOSE_STRATEGIES,
     SWING_STALE_EXIT_ENABLED, SWING_STALE_DAYS, SWING_STALE_MIN_GAIN_PCT,
-    NO_GAIN_EXIT_ENABLED, NO_GAIN_EXIT_HOURS, NO_GAIN_EXIT_MIN_PCT,
+    NO_GAIN_EXIT_ENABLED, NO_GAIN_EXIT_HOURS, NO_GAIN_EXIT_MIN_PCT, NO_GAIN_EXIT_MAX_LOSS_PCT,
     AFTERHOURS_STOP_CHECK_ENABLED, AFTERHOURS_CHASE_STALE_SECONDS, AFTERHOURS_STOP_COOLDOWN_MIN,
     MAX_POSITION_CONCENTRATION_PCT, CORRELATION_GROUPS,
     LONG_ONLY_MODE,
@@ -1834,10 +1834,14 @@ class EnhancedExecutor:
         }
 
     def close_no_gain_positions(self) -> Optional[dict]:
-        """Close any long position that has shown zero positive unrealized gain
-        within NO_GAIN_EXIT_HOURS of entry. Checked every scan cycle (unlike
-        close_stale_swing_positions, which only runs once/day) since the
-        24h mark can land mid-session, not just at EOD."""
+        """Close any long position that hasn't settled into a clear positive
+        trend within NO_GAIN_EXIT_HOURS of entry: exit on ANY positive gain
+        (stop waiting once it's decided), or on a NO_GAIN_EXIT_MAX_LOSS_PCT
+        drop (cut it early rather than riding the full trailing stop down).
+        Only a narrow flat/small-loss band survives the check and keeps
+        holding. Checked every scan cycle (unlike close_stale_swing_positions,
+        which only runs once/day) since the N-hour mark can land mid-session,
+        not just at EOD."""
         if not NO_GAIN_EXIT_ENABLED:
             return None
 
@@ -1883,8 +1887,11 @@ class EnhancedExecutor:
             except (AttributeError, TypeError, ValueError):
                 continue
 
-            if gain_pct > NO_GAIN_EXIT_MIN_PCT:
-                continue  # showed a positive gain — leave it to the trailing stop
+            if NO_GAIN_EXIT_MAX_LOSS_PCT < gain_pct <= NO_GAIN_EXIT_MIN_PCT:
+                continue  # still flat / a small loss — give it more time
+            # Otherwise exit: either gain_pct > NO_GAIN_EXIT_MIN_PCT (positive —
+            # stop waiting once it's decided) or gain_pct <= NO_GAIN_EXIT_MAX_LOSS_PCT
+            # (dropped enough to cut early rather than ride the full trailing stop).
 
             # A close already in flight for this symbol? Don't blindly cancel-and-resubmit
             # every cycle (that's what spammed FRMI 186x and NG 38x — the old version
@@ -1939,9 +1946,10 @@ class EnhancedExecutor:
                     "symbol": sym, "qty": abs(qty),
                     "held_hours": round(held_hours, 1), "gain_pct": round(gain_pct, 2),
                 })
+                _why = "positive gain" if gain_pct > NO_GAIN_EXIT_MIN_PCT else f"<= {NO_GAIN_EXIT_MAX_LOSS_PCT:.1f}% loss"
                 log.info(
                     f"NO-GAIN EXIT {sym} [{_strategy}]: {qty} shares | held {held_hours:.1f}h | "
-                    f"gain {gain_pct:+.1f}% <= {NO_GAIN_EXIT_MIN_PCT:.1f}% threshold | P&L ${_pnl:+,.2f} "
+                    f"gain {gain_pct:+.1f}% ({_why}) | P&L ${_pnl:+,.2f} "
                     f"@ {slip_pct:.1f}% slip (attempt {chase_n + 1})"
                 )
             except Exception as e:

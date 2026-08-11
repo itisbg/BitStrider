@@ -555,13 +555,18 @@ SWING_STALE_MIN_GAIN_PCT  = 3.0   # required unrealized gain % by SWING_STALE_DA
 
 # ─────────────────────────────────────────────────────────────────
 # No-Gain 24h Exit
-# If a position hasn't shown ANY positive unrealized gain within N hours of
-# entry, cut it loose rather than waiting on SWING_STALE_DAYS. Checked every
-# scan cycle (not once/day) since the 24h mark can fall mid-session.
+# If a position hasn't decided which way it's going within N hours of entry,
+# stop waiting: exit on ANY positive gain (don't hold out for more once it's
+# 8h+ old), or on a NO_GAIN_EXIT_MAX_LOSS_PCT drop (cut it before the full
+# trailing stop would). Only a narrow flat band survives the check. Checked
+# every scan cycle (not once/day) since the N-hour mark can fall mid-session.
+# Was 24h / no downside cutoff (positive-only exit) until 2026-08-11, tightened
+# to 8h with a -1.5% loss cutoff at the user's request.
 # ─────────────────────────────────────────────────────────────────
-NO_GAIN_EXIT_ENABLED = True
-NO_GAIN_EXIT_HOURS   = 24    # hours held before the check applies
-NO_GAIN_EXIT_MIN_PCT = 0.0   # must exceed this unrealized gain % to survive
+NO_GAIN_EXIT_ENABLED     = True
+NO_GAIN_EXIT_HOURS       = 8      # hours held before the check applies (was 24)
+NO_GAIN_EXIT_MIN_PCT     = 0.0    # gain above this exits (must be <= this, and > max-loss, to survive)
+NO_GAIN_EXIT_MAX_LOSS_PCT = -1.5  # loss at or below this also exits (new — was no downside cutoff)
 
 # ─────────────────────────────────────────────────────────────────
 # After-Hours Software Stop-Loss
