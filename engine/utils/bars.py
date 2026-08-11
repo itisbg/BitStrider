@@ -104,6 +104,28 @@ def clear_bar_cache() -> None:
 
 # ── Alpaca client singletons ──────────────────────────────────────────────────
 
+def mount_wide_pool(client) -> None:
+    """alpaca-py builds its internal requests.Session with the urllib3
+    default pool_maxsize=10, no constructor param to raise it. Concurrent
+    scan workers (equity scan: 8; options scan: its own pool) share one
+    client, so simultaneous requests routinely exceed 10 and urllib3 tears
+    down + rebuilds connections instead of reusing them (confirmed
+    2026-08-07 on the stock data client: "Connection pool is full,
+    discarding connection: data.alpaca.markets" every cycle; confirmed
+    2026-08-11 the same default also applies unpatched on the two option
+    data clients — the options scan hit it moments after a restart) — pure
+    wasted latency, not a correctness bug. Call once right after
+    constructing any StockHistoricalDataClient/OptionHistoricalDataClient.
+    """
+    try:
+        from requests.adapters import HTTPAdapter
+        adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20)
+        client._session.mount("https://", adapter)
+        client._session.mount("http://", adapter)
+    except Exception:
+        pass  # cosmetic perf fix — never block client creation over it
+
+
 def get_data_client() -> "StockHistoricalDataClient":
     global _data_client
     if _data_client is None:
@@ -111,21 +133,7 @@ def get_data_client() -> "StockHistoricalDataClient":
         if not API_KEY or not API_SECRET:
             raise ValueError("Alpaca API credentials not found in environment")
         _data_client = StockHistoricalDataClient(API_KEY, API_SECRET)
-        # alpaca-py builds its internal requests.Session with the urllib3
-        # default pool_maxsize=10, no constructor param to raise it. The
-        # equity scan's 8 concurrent workers all share this one client, so
-        # 8+ simultaneous requests routinely exceed 10 and urllib3 tears down
-        # + rebuilds connections instead of reusing them (confirmed
-        # 2026-08-07: "Connection pool is full, discarding connection:
-        # data.alpaca.markets" every cycle) — pure wasted latency on every
-        # fetch, not a correctness bug, but it doesn't help data staleness.
-        try:
-            from requests.adapters import HTTPAdapter
-            _adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20)
-            _data_client._session.mount("https://", _adapter)
-            _data_client._session.mount("http://", _adapter)
-        except Exception:
-            pass  # cosmetic perf fix — never block client creation over it
+        mount_wide_pool(_data_client)
     return _data_client
 
 
@@ -136,6 +144,7 @@ def get_option_data_client() -> "OptionHistoricalDataClient":
         if not API_KEY or not API_SECRET:
             raise ValueError("Alpaca API credentials not found in environment")
         _option_data_client = OptionHistoricalDataClient(API_KEY, API_SECRET)
+        mount_wide_pool(_option_data_client)
     return _option_data_client
 
 

@@ -50,6 +50,7 @@ from engine.config import (
     API_KEY, API_SECRET, PAPER,
 )
 from engine.utils import MarketState
+from engine.utils.bars import mount_wide_pool
 from engine.never_trade import is_never_trade
 from .strategies import OptionSignal, CONTRACT_SIZE, record_stop_cooldown
 
@@ -207,6 +208,7 @@ class OptionsExecutor:
     def __init__(self, client: TradingClient):
         self.client = client
         self.data_client = OptionHistoricalDataClient(API_KEY, API_SECRET)
+        mount_wide_pool(self.data_client)  # same fixed pool_maxsize=10 default as the bars.py clients
         self._positions: Dict[str, OptionsPosition] = {}   # occ_symbol -> OptionsPosition
         self._last_monitor_ts: float = 0.0
         self._MONITOR_INTERVAL = 20   # seconds between P&L checks (fast enough to catch intraday moves)
