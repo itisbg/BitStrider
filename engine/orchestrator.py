@@ -120,7 +120,10 @@ def _run_discovery(ctx: AppContext, market_state: MarketState) -> None:
     )
     _timed("tradeideas_universe", _discovery.scan_tradeideas_universe,
         enabled=cfg.USE_TRADEIDEAS_DISCOVERY,
-        scan_interval_min=cfg.TRADEIDEAS_SCAN_INTERVAL_MIN,
+        scan_interval_min=(
+            cfg.TRADEIDEAS_SCAN_INTERVAL_MIN if market_state.is_regular_hours
+            else cfg.TRADEIDEAS_SCAN_INTERVAL_MIN_AFTER_HOURS
+        ),
         headless=cfg.TRADEIDEAS_HEADLESS,
         chrome_profile=cfg.TRADEIDEAS_CHROME_PROFILE,
         update_config=cfg.TRADEIDEAS_UPDATE_CONFIG_FILE,

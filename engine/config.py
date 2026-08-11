@@ -473,7 +473,8 @@ SENTIMENT_BULLISH_THRESHOLD = 0.6
 USE_TRADEIDEAS_DISCOVERY                          = __import__('os').getenv('USE_TRADEIDEAS_DISCOVERY', 'false').lower() == 'true'
 USE_TRADEIDEAS_UNUSUAL_OPTIONS_DISCOVERY         = __import__('os').getenv('USE_TRADEIDEAS_UNUSUAL_OPTIONS_DISCOVERY', 'true').lower() == 'true'
 USE_TRADEIDEAS_TOPLISTS_DISCOVERY                = __import__('os').getenv('USE_TRADEIDEAS_TOPLISTS_DISCOVERY', 'false').lower() == 'true'
-TRADEIDEAS_SCAN_INTERVAL_MIN                     = 15
+TRADEIDEAS_SCAN_INTERVAL_MIN                     = 10   # regular market hours (9:30-16:00 ET)
+TRADEIDEAS_SCAN_INTERVAL_MIN_AFTER_HOURS         = 60   # pre/post-market, weekends
 TRADEIDEAS_UNUSUAL_OPTIONS_SCAN_INTERVAL_MIN     = 30
 TRADEIDEAS_TOPLISTS_SCAN_INTERVAL_MIN            = 180
 TRADEIDEAS_HEADLESS                              = __import__('os').getenv('TRADEIDEAS_HEADLESS', 'false').lower() == 'true'
