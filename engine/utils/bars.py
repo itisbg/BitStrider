@@ -111,6 +111,21 @@ def get_data_client() -> "StockHistoricalDataClient":
         if not API_KEY or not API_SECRET:
             raise ValueError("Alpaca API credentials not found in environment")
         _data_client = StockHistoricalDataClient(API_KEY, API_SECRET)
+        # alpaca-py builds its internal requests.Session with the urllib3
+        # default pool_maxsize=10, no constructor param to raise it. The
+        # equity scan's 8 concurrent workers all share this one client, so
+        # 8+ simultaneous requests routinely exceed 10 and urllib3 tears down
+        # + rebuilds connections instead of reusing them (confirmed
+        # 2026-08-07: "Connection pool is full, discarding connection:
+        # data.alpaca.markets" every cycle) — pure wasted latency on every
+        # fetch, not a correctness bug, but it doesn't help data staleness.
+        try:
+            from requests.adapters import HTTPAdapter
+            _adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20)
+            _data_client._session.mount("https://", _adapter)
+            _data_client._session.mount("http://", _adapter)
+        except Exception:
+            pass  # cosmetic perf fix — never block client creation over it
     return _data_client
 
 
@@ -291,8 +306,15 @@ def get_bars(symbol: str, period: str = "5d", interval: str = "15m") -> pd.DataF
 
 
 def get_daily_volume_bars(symbol: str) -> pd.DataFrame:
-    """5-day daily bars via yfinance specifically, for volume-based liquidity
+    """3-month daily bars via yfinance specifically, for volume-based liquidity
     checks (avg daily volume / dollar volume guardrails).
+
+    Was 5d (2026-08-06: widened per trader request) — a 4-day trailing window
+    (today's still-in-progress bar is dropped by the caller) meant a handful
+    of unusually quiet days could block a symbol that normally trades well
+    above the threshold, even though nothing about its real liquidity
+    changed. 3mo reflects "does this stock normally trade above the
+    threshold" rather than "was it quiet this specific week."
 
     Confirmed 2026-08-05: this account's Alpaca market data subscription is
     IEX-only ("subscription does not permit querying recent SIP data") — IEX
@@ -311,7 +333,7 @@ def get_daily_volume_bars(symbol: str) -> pd.DataFrame:
             return _volume_bar_cache[symbol]
 
     try:
-        data = _get_bars_yfinance(symbol, "5d", "1d", log)
+        data = _get_bars_yfinance(symbol, "3mo", "1d", log)
         if not data.empty:
             with _volume_bar_cache_lock:
                 _volume_bar_cache[symbol] = data
