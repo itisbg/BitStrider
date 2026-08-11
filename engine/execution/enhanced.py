@@ -29,7 +29,7 @@ from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
 from alpaca.trading.enums import OrderType as AlpacaOrderType
 
 from engine.config import (
-    PDT_ACCOUNT_MIN, PDT_MAX_TRADES,
+    PDT_ACCOUNT_MIN, PDT_MAX_TRADES, MIN_EQUITY_FOR_SHORT,
     MAX_POSITIONS,
     SWAP_ON_FULL,
     SWAP_MIN_CONFIDENCE,
@@ -169,7 +169,6 @@ class EnhancedExecutor:
         self._swap_cycle_closed: set = set()     # positions already swapped this scan cycle
         self._ratchet_done: set = set()          # symbols whose stop was already confidence-tightened
         self._tp_targets: Dict[str, float] = {} # {symbol: take-profit price} for ATR-based TP tracking
-        self.shorting_blocked: bool = False  # set true when broker rejects all short attempts for account
         self._pdt_stop_blocked: Dict[str, float] = {}  # {symbol: stop_price} — broker-rejected stops; monitored in software
         self._afterhours_stop_cooldown: Dict[str, float] = {}  # {symbol: monotonic expiry} — blocks re-entry after a stop-loss exit (despite the name, populated by ANY stop-loss close now, not just the after-hours software path — see detect_stopped_out_positions)
         self._last_known_positions: Dict[str, dict] = {}  # {symbol: {entry_price, last_price, is_long}} — snapshot used to notice a position disappearing between polls
@@ -390,6 +389,19 @@ class EnhancedExecutor:
             )
         return self._account_cache
 
+    @property
+    def shorting_blocked(self) -> bool:
+        """Live account-wide short-selling gate — Alpaca's own Reg T equity
+        minimum (MIN_EQUITY_FOR_SHORT), read fresh off the 2s-TTL account
+        cache every time so it self-corrects the moment equity crosses back
+        above the floor. Replaces an old sticky `self.shorting_blocked = True`
+        flag that a single misclassified broker rejection could leave stuck
+        for the rest of the session with no way back — confirmed 2026-08-07:
+        one INDI no-borrow rejection, misread as account-wide, disabled every
+        short for hours despite the account's Shorting Enabled setting being
+        on the whole time."""
+        return self._get_account().equity < MIN_EQUITY_FOR_SHORT
+
     # -- Swap -----------------------------------------------------------
     def _attempt_swap(self, signal: Signal, swap_only: bool) -> Tuple[bool, Optional[str]]:
         """Try to close the stalest (24h+, falling back to weakest P&L) position
@@ -508,6 +520,12 @@ class EnhancedExecutor:
         dt_left = self.pdt.remaining(acct.equity, acct.daytrade_count, acct.pattern_day_trader)
         if acct.pattern_day_trader and dt_left <= PDT_WARN_AT_REMAINING and acct.equity < PDT_ACCOUNT_MIN:
             log.warning(f"PDT WARNING: only {dt_left} day trade(s) remaining (equity ${acct.equity:,.0f})")
+
+        # Alpaca's own Reg T minimum to short at all — checked live every time
+        # (not cached/session-flag) so shorting resumes automatically the
+        # moment equity crosses back above the floor, no restart needed.
+        if order_type == OrderType.SHORT and acct.equity < MIN_EQUITY_FOR_SHORT:
+            return False, f"equity ${acct.equity:,.0f} < ${MIN_EQUITY_FOR_SHORT:,.0f} minimum required to short"
 
         # Skip hard-to-borrow shorts cached from previous failures this session
         if order_type == OrderType.SHORT and signal.symbol in self._htb_cache:
@@ -675,6 +693,28 @@ class EnhancedExecutor:
         return sl, tp
 
     # ── Entry + Trailing Stop Order ──────────────────────────────────────────
+    def _handle_short_rejection(self, signal: Signal, e: Exception) -> None:
+        """Broker rejected a short with "cannot be sold short" / 40310000 /
+        "account is not allowed to short". Alpaca reuses that same wording for
+        two different causes that need different handling: a genuine
+        per-symbol no-borrow-available condition (should stick for the
+        session) versus the account-wide Reg T equity minimum,
+        MIN_EQUITY_FOR_SHORT (transient — must NOT poison one ticker's cache).
+        Confirmed 2026-08-10: FIG and RIG both got cached as hard-to-borrow
+        from rejections that fired while equity was under $2,000, then stayed
+        stuck "not shortable" for the rest of the session even after equity
+        recovered — checking equity here first is what `shorting_blocked`
+        already does live, so re-check it rather than caching the symbol."""
+        if self.shorting_blocked:
+            log.warning(
+                f"Short blocked {signal.symbol}: account equity below "
+                f"${MIN_EQUITY_FOR_SHORT:,.0f} minimum — not caching as HTB, "
+                "will retry once equity recovers"
+            )
+            return
+        self._htb_cache.add(signal.symbol)
+        log.warning(f"Short blocked {signal.symbol} (not shortable/insufficient BP): {e}")
+
     def _create_bracket_order(self, signal: Signal, shares: int, risk_info: Dict, order_type: OrderType) -> bool:
         """Submit market entry then a GTC trailing stop at risk_info['stop_loss_pct']%.
         TP bracket leg is intentionally dropped — the trailing stop locks in gains
@@ -704,17 +744,7 @@ class EnhancedExecutor:
         except Exception as e:
             err = str(e).lower()
             if order_type == OrderType.SHORT and ("cannot be sold short" in err or "40310000" in err or "account is not allowed to short" in err):
-                # Symbol-level HTB: block only this ticker for the session
-                self._htb_cache.add(signal.symbol)
-                if "account is not allowed to short" in err:
-                    # Account-level: no short permission at all — disable all shorts
-                    self.shorting_blocked = True
-                    log.warning(
-                        f"Short entry blocked for {signal.symbol} (account permission). "
-                        "Disabling shorts for this session."
-                    )
-                else:
-                    log.warning(f"Short blocked {signal.symbol} (HTB/insufficient BP): {e}")
+                self._handle_short_rejection(signal, e)
             elif order_type != OrderType.SHORT and ("cannot be sold short" in err or "40310000" in err):
                 # Inverse ETF or other buy rejected by broker — do not poison short flag
                 log.warning(f"Buy rejected for {signal.symbol} (broker): {e}")
@@ -808,17 +838,7 @@ class EnhancedExecutor:
         except Exception as e:
             err = str(e).lower()
             if order_type == OrderType.SHORT and ("cannot be sold short" in err or "40310000" in err or "account is not allowed to short" in err):
-                # Symbol-level HTB: block only this ticker for the session
-                self._htb_cache.add(signal.symbol)
-                if "account is not allowed to short" in err:
-                    # Account-level: no short permission at all — disable all shorts
-                    self.shorting_blocked = True
-                    log.warning(
-                        f"Short entry blocked for {signal.symbol} (account permission). "
-                        "Disabling shorts for this session."
-                    )
-                else:
-                    log.warning(f"Short blocked {signal.symbol} (HTB/insufficient BP): {e}")
+                self._handle_short_rejection(signal, e)
             elif order_type != OrderType.SHORT and ("cannot be sold short" in err or "40310000" in err):
                 # Inverse ETF or other buy rejected by broker — do not poison short flag
                 log.warning(f"Buy rejected for {signal.symbol} (broker): {e}")
@@ -1302,8 +1322,16 @@ class EnhancedExecutor:
                 continue
 
         for sym, info in self._last_known_positions.items():
-            if sym in current or sym in self._afterhours_stop_cooldown:
-                continue  # still open, or already cooling down from elsewhere
+            if sym in current:
+                continue  # still open
+            # Closed via any route — eligible for confidence-ratchet protection
+            # again next time it's re-entered (was symbol-keyed and add-only,
+            # so a re-entry after an earlier ratcheted win got none — 2026-08-10:
+            # ABCL ran +6.3% unrealized on a fresh entry after an earlier lot had
+            # already ratcheted, and never got tightened).
+            self._ratchet_done.discard(sym)
+            if sym in self._afterhours_stop_cooldown:
+                continue  # already cooling down from elsewhere
             entry, last, is_long = info["entry_price"], info["last_price"], info["is_long"]
             was_loss = (last < entry) if is_long else (last > entry)
             if was_loss:
