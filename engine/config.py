@@ -580,7 +580,7 @@ NO_GAIN_EXIT_MAX_LOSS_PCT = -1.5  # loss at or below this also exits (new — wa
 # ─────────────────────────────────────────────────────────────────
 AFTERHOURS_STOP_CHECK_ENABLED = True
 AFTERHOURS_CHASE_STALE_SECONDS = 45  # re-chase (cancel + resubmit at fresh price) if the close sits unfilled this long
-AFTERHOURS_STOP_COOLDOWN_MIN = 60  # Block re-entry into a symbol for 1h after ANY stop-loss exit
+AFTERHOURS_STOP_COOLDOWN_MIN = 1440  # Block re-entry (long or short) for 24h after ANY loss exit (was 60 = 1h)
                                     # (after-hours software backstop or a normal GTC fill — see
                                     # detect_stopped_out_positions in enhanced.py). Short on purpose:
                                     # long enough to break an immediate whipsaw off frozen/stale data

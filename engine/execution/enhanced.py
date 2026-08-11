@@ -531,6 +531,19 @@ class EnhancedExecutor:
         if order_type == OrderType.SHORT and signal.symbol in self._htb_cache:
             return False, f"{signal.symbol} hard-to-borrow (cached)"
 
+        # Post-loss re-entry cooldown (long or short) — checked live here, not just
+        # at scan-target build time (_build_scan_targets), which only excludes a
+        # cooling-down symbol from that cycle's scan universe as a one-time snapshot.
+        # The cooldown itself is set by a background thread polling every 10s
+        # (detect_stopped_out_positions), so a symbol that closes at a loss and gets
+        # rescanned within that ~10s window was slipping through — confirmed
+        # 2026-08-11: PLUG closed at a loss, STOP-COOLDOWN logged, then EXECUTE: BUY
+        # PLUG fired 6 seconds later anyway, on into a second, bigger loss. This is
+        # the actual backstop; the scan-target filter is just an optimization to
+        # avoid wastefully re-scanning a symbol we already know is blocked.
+        if signal.symbol in self.get_afterhours_cooldown_symbols():
+            return False, f"{signal.symbol} in post-loss re-entry cooldown"
+
         # Asset tradability check: skip halted or suspended symbols
         try:
             asset = self.client.get_asset(signal.symbol)
