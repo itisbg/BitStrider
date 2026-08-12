@@ -882,6 +882,11 @@ def start() -> None:
                         log.error(f"close_no_gain_positions error: {e}", exc_info=True)
 
                     try:
+                        ctx.executor.close_guardrail_fail_positions()
+                    except Exception as e:
+                        log.error(f"close_guardrail_fail_positions error: {e}", exc_info=True)
+
+                    try:
                         scan_and_trade(ctx)
                     except Exception as e:
                         log.error(f"Scan cycle error: {e}", exc_info=True)

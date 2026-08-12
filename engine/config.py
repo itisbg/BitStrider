@@ -543,6 +543,18 @@ EOD_CLOSE_STRATEGIES = {         # Strategy names that must be closed same day
 }
 
 # ─────────────────────────────────────────────────────────────────
+# Guardrail-Fail Overnight Exit
+# 2026-08-12, user request: 5 min before close, force-close ANY open position
+# (any strategy, not just EOD_CLOSE_STRATEGIES) that currently fails the
+# standard liquidity/quality guardrails — avg daily volume, float shares,
+# market cap (same thresholds the live scanner uses: MIN_AVG_DAILY_VOLUME_
+# REGULAR_HOURS, MIN_FLOAT_SHARES, MIN_MARKET_CAP). Only names that still
+# pass those guardrails get held after-hours/overnight.
+# ─────────────────────────────────────────────────────────────────
+GUARDRAIL_EOD_CLOSE_ENABLED = True
+GUARDRAIL_EOD_CLOSE_TIME    = "15:55"   # 5 min before the 16:00 ET close
+
+# ─────────────────────────────────────────────────────────────────
 # Swing Position Staleness Exit
 # Positions held by strategies NOT in EOD_CLOSE_STRATEGIES (Momentum,
 # Technical, etc.) are meant to ride a trend via the GTC trailing stop rather

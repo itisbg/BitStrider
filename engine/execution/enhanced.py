@@ -41,6 +41,8 @@ from engine.config import (
     TAKE_PROFIT_NORMAL, TAKE_PROFIT_HIGH, STOP_LOSS_PCT,
     ATR_TP_RATIO, MAX_SHORT_FLOAT_PCT, HIGH_SHORT_FLOAT_STOCKS, is_high_short_float,
     EOD_CLOSE_ENABLED, EOD_CLOSE_TIME, EOD_CLOSE_STRATEGIES,
+    GUARDRAIL_EOD_CLOSE_ENABLED, GUARDRAIL_EOD_CLOSE_TIME,
+    MIN_AVG_DAILY_VOLUME_REGULAR_HOURS, MIN_FLOAT_SHARES, MIN_MARKET_CAP,
     SWING_STALE_EXIT_ENABLED, SWING_STALE_DAYS, SWING_STALE_MIN_GAIN_PCT,
     NO_GAIN_EXIT_ENABLED, NO_GAIN_EXIT_HOURS, NO_GAIN_EXIT_MIN_PCT, NO_GAIN_EXIT_MAX_LOSS_PCT,
     AFTERHOURS_STOP_CHECK_ENABLED, AFTERHOURS_CHASE_STALE_SECONDS, AFTERHOURS_STOP_COOLDOWN_MIN,
@@ -60,9 +62,9 @@ from engine.config import (
     MARKETABLE_LIMIT_BUFFER_PCT,
     LIVE,
 )
-from engine.equity.strategies import Signal
+from engine.equity.strategies import Signal, _get_float_shares, _get_market_cap
 from engine.utils import MarketState, calculate_risk_adjusted_size, check_vix_roc_filter, get_dynamic_tier
-from engine.utils.bars import get_bars
+from engine.utils.bars import get_bars, get_daily_volume_bars
 from engine.never_trade import is_never_trade
 from engine.notifications.notifications import send_email
 
@@ -1711,6 +1713,23 @@ class EnhancedExecutor:
                     log.error(f"enforce_correlation_concentration {sym}: trim failed: {e}")
 
     # ── EOD Close ─────────────────────────────────────────────────────────────
+    @staticmethod
+    def _guardrail_fail_reason(
+        avg_daily_vol: Optional[float], shares_float: Optional[float], market_cap: Optional[float]
+    ) -> Optional[str]:
+        """Pure decision logic for close_guardrail_fail_positions: return the
+        reason string if any known metric is below its guardrail, else None
+        (passes, or all three are unavailable — missing data never forces a
+        close). Split out from the method below so it's unit-testable without
+        a broker connection."""
+        if avg_daily_vol is not None and avg_daily_vol < MIN_AVG_DAILY_VOLUME_REGULAR_HOURS:
+            return f"avg_volume {avg_daily_vol:.0f} < {MIN_AVG_DAILY_VOLUME_REGULAR_HOURS:.0f}"
+        if shares_float is not None and shares_float < MIN_FLOAT_SHARES:
+            return f"float {shares_float/1e6:.1f}M < {MIN_FLOAT_SHARES/1e6:.0f}M"
+        if market_cap is not None and market_cap < MIN_MARKET_CAP:
+            return f"mcap ${market_cap/1e6:.0f}M < ${MIN_MARKET_CAP/1e6:.0f}M"
+        return None
+
     def close_eod_positions(self) -> Optional[dict]:
         """Close all intraday-strategy positions at EOD_CLOSE_TIME.
         Targets FloatRotation, GapBreakout, ORB, VWAPReclaim opened today."""
@@ -1798,6 +1817,97 @@ class EnhancedExecutor:
                 log.error(f"EOD close failed {sym}: {e}")
 
         self._eod_close_done = today
+
+        summary = {
+            "date": today.isoformat(),
+            "closed_count": len(closed_items),
+            "failed_count": len(failed_items),
+            "closed_items": closed_items,
+            "failed_items": failed_items,
+            "asof": now_et.isoformat(),
+        }
+        return summary
+
+    def close_guardrail_fail_positions(self) -> Optional[dict]:
+        """5 min before close, force-close any open position (any strategy —
+        unlike close_eod_positions, not limited to EOD_CLOSE_STRATEGIES) that
+        currently fails the standard liquidity/quality guardrails: avg daily
+        volume, float shares, or market cap. Only guardrail-passing names get
+        held after-hours/overnight. Runs once/day, gated the same way as
+        close_eod_positions."""
+        if not GUARDRAIL_EOD_CLOSE_ENABLED:
+            return None
+
+        import pytz
+        now_et = datetime.datetime.now(pytz.timezone("America/New_York"))
+        close_h, close_m = map(int, GUARDRAIL_EOD_CLOSE_TIME.split(":"))
+        if now_et.hour < close_h or (now_et.hour == close_h and now_et.minute < close_m):
+            return None  # Not yet the guardrail close time
+        if now_et.hour >= 16:
+            return None  # Market already closed
+
+        today = datetime.date.today()
+        if getattr(self, "_guardrail_eod_close_done", None) == today:
+            return None  # Already processed today
+
+        try:
+            positions = self.client.get_all_positions()
+        except Exception as e:
+            log.error(f"close_guardrail_fail_positions: fetch failed: {e}")
+            return None
+
+        closed_items = []
+        failed_items = []
+
+        for pos in positions:
+            sym = pos.symbol
+            if re.match(r'^[A-Z]+\d{6}[CP]\d{8}$', sym):
+                continue  # options legs — managed separately
+
+            qty = int(float(pos.qty))
+            if qty == 0:
+                continue
+
+            try:
+                daily = get_daily_volume_bars(sym)
+                avg_daily_vol = (
+                    float(daily["volume"].iloc[:-1].mean())
+                    if not daily.empty and len(daily) >= 2 else None
+                )
+            except Exception as e:
+                log.warning(f"close_guardrail_fail_positions {sym}: volume lookup failed: {e}")
+                avg_daily_vol = None
+            shares_float = _get_float_shares(sym)
+            market_cap   = _get_market_cap(sym)
+
+            fail_reason = self._guardrail_fail_reason(avg_daily_vol, shares_float, market_cap)
+            if fail_reason is None:
+                continue  # passes guardrails (or data unavailable) — fine to hold overnight
+
+            try:
+                sym_orders = [o for o in (self.client.get_orders() or []) if o.symbol == sym]
+                for _o in sym_orders:
+                    try:
+                        self.client.cancel_order_by_id(str(_o.id))
+                    except Exception:
+                        pass
+                if sym_orders:
+                    time.sleep(0.4)
+            except Exception as e:
+                log.warning(f"close_guardrail_fail_positions {sym}: order fetch/cancel failed, will retry next cycle: {e}")
+                continue
+
+            close_side = OrderSide.SELL if qty > 0 else OrderSide.BUY
+            try:
+                self._submit_closing_order(sym, abs(qty), close_side, float(pos.current_price))
+                pnl = float(pos.unrealized_pl)
+                closed_items.append({"symbol": sym, "qty": abs(qty), "reason": fail_reason, "pnl": pnl})
+                log.info(f"GUARDRAIL EOD CLOSE {sym}: {abs(qty)} shares | {fail_reason} | P&L ${pnl:.2f}")
+            except Exception as e:
+                failed_items.append({"symbol": sym, "error": str(e)})
+                log.error(f"GUARDRAIL EOD CLOSE failed {sym}: {e}")
+
+        self._guardrail_eod_close_done = today
 
         summary = {
             "date": today.isoformat(),
