@@ -47,8 +47,8 @@ from engine.config import (
     SCAN_WORKERS,
     SCAN_SYMBOL_TIMEOUT,
     MIN_DOLLAR_VOLUME,
-    MIN_FLOAT_SHARES,
-    MIN_AVG_DAILY_VOLUME,
+    MIN_FLOAT_SHARES, MIN_FLOAT_SHARES_REGULAR_HOURS,
+    MIN_AVG_DAILY_VOLUME, MIN_AVG_DAILY_VOLUME_REGULAR_HOURS,
     MIN_MARKET_CAP,
     MIN_STOCK_PRICE,
     LONG_ONLY_MODE,
@@ -117,6 +117,21 @@ def _prefetch_snapshots(symbols: List[str]) -> None:
             _snapshot_cache = snaps
     except Exception:
         pass  # fall back to per-symbol get_bars in _passes_guardrails
+
+
+def _effective_liquidity_floors(market_state: Optional[MarketState]) -> tuple:
+    """Return (min_float_shares, min_avg_daily_volume) for the current session.
+
+    Regular hours use the loosened MIN_FLOAT_SHARES_REGULAR_HOURS /
+    MIN_AVG_DAILY_VOLUME_REGULAR_HOURS; pre/after-market keep the original,
+    BIOA-driven floors (MIN_FLOAT_SHARES / MIN_AVG_DAILY_VOLUME) unchanged.
+    See engine/config.py for the full reasoning. Split out as its own function
+    so this one decision is unit-testable without driving the rest of
+    _passes_guardrails's snapshot/bar-fetch machinery.
+    """
+    if market_state is not None and market_state.is_regular_hours:
+        return MIN_FLOAT_SHARES_REGULAR_HOURS, MIN_AVG_DAILY_VOLUME_REGULAR_HOURS
+    return MIN_FLOAT_SHARES, MIN_AVG_DAILY_VOLUME
 
 
 def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Optional[MarketState] = None, return_reason: bool = False) -> bool:
@@ -263,20 +278,27 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
 
         # Liquidity / quality floor — skip thin, low-float, micro-cap names prone to
         # violent, illiquid moves after hours (see BIOA 2026-07-31: repeated overnight
-        # buy-then-stop cycles on a low-float, thinly traded ticker). Applies at all
-        # times, not just regular hours — that's exactly when the risk shows up.
+        # buy-then-stop cycles on a low-float, thinly traded ticker). Loosened for
+        # regular hours 2026-08-11 — the BIOA risk this was built for is specifically
+        # an overnight/pre-market one (thin book, no market-maker presence); during
+        # the regular session the same float/volume floor was also blocking real,
+        # liquid names (HTZ, BTDR, IHRT) and most of what a mover-scanner like TI
+        # flags in the first place, since low float is exactly what makes a name
+        # move hard on modest volume. Pre/after-market keep the original floors.
+        effective_min_float, effective_min_avg_vol = _effective_liquidity_floors(market_state)
+
         daily = get_daily_volume_bars(symbol)
         if not daily.empty and len(daily) >= 2:
             avg_daily_vol = float(daily["volume"].iloc[:-1].mean())
-            if avg_daily_vol < MIN_AVG_DAILY_VOLUME:
-                _log.warning(f"[GUARDRAIL] {symbol} blocked: avg daily volume {avg_daily_vol:.0f} < {MIN_AVG_DAILY_VOLUME:.0f}")
+            if avg_daily_vol < effective_min_avg_vol:
+                _log.warning(f"[GUARDRAIL] {symbol} blocked: avg daily volume {avg_daily_vol:.0f} < {effective_min_avg_vol:.0f}")
                 if return_reason:
                     return False, 'avg_volume'
                 return False
 
         shares_float = _get_float_shares(symbol)
-        if shares_float is not None and shares_float < MIN_FLOAT_SHARES:
-            _log.warning(f"[GUARDRAIL] {symbol} blocked: float {shares_float/1e6:.1f}M < {MIN_FLOAT_SHARES/1e6:.0f}M")
+        if shares_float is not None and shares_float < effective_min_float:
+            _log.warning(f"[GUARDRAIL] {symbol} blocked: float {shares_float/1e6:.1f}M < {effective_min_float/1e6:.0f}M")
             if return_reason:
                 return False, 'low_float'
             return False

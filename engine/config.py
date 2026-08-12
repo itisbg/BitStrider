@@ -268,11 +268,11 @@ STOCKS = {
 # ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 # Trading Parameters ΓÇö Swing Trading Optimized
 # ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
-MAX_POSITIONS        = 9      # 10% × 9 = 90% of usable equity (within 10% BP reserve) — was 12 @ 7.5%
+MAX_POSITIONS        = 12     # 7.5% × 12 = 90% of usable equity (within 10% BP reserve) — reverted 2026-08-11 (was briefly 9 @ 10%)
 # When full, close the weakest position to make room if new signal conf > this threshold
 SWAP_ON_FULL         = True   # enabled — close weakest position for a better signal when full
 SWAP_MIN_CONFIDENCE  = 0.75   # Swap out weakest when new signal >= this confidence (was 0.85)
-POSITION_SIZE_PCT    = 10.0   # 10% per position → up to 9 positions within 90% BP utilization — was 7.5%/12
+POSITION_SIZE_PCT    = 7.5    # 7.5% per position → up to 12 positions within 90% BP utilization — reverted 2026-08-11: smaller per-name risk to offset the same-day guardrail loosening (more, lower-quality-float names now admitted)
 MAX_POSITION_CONCENTRATION_PCT = 20.0  # Hard cap: no single symbol's market value may exceed this % of equity,
                                         # enforced both at entry sizing and by trimming winners that ran past it
 
@@ -360,7 +360,7 @@ CONF_SCALE_MIN_MULT  = 0.50   # 50% of normal size at the confidence floor (0.72
 CONF_SCALE_FULL_CONF = 0.85   # 100% of normal size at this confidence and above
 
 # Small account reduction caps (sub-$5k equity)
-SMALL_ACCOUNT_POSITION_SIZE_PCT = 10.0  # same allocation as POSITION_SIZE_PCT for small accounts — was 7.5%
+SMALL_ACCOUNT_POSITION_SIZE_PCT = 7.5   # same allocation as POSITION_SIZE_PCT for small accounts — reverted 2026-08-11
 SMALL_ACCOUNT_RISK_PER_TRADE_PCT = 0.5 # lower risk per trade for small accounts
 SMALL_ACCOUNT_MIN_POSITION_DOLLARS = 5.0  # lowered to allow ~$5 entry for cheap tickers
 
@@ -787,8 +787,21 @@ RVOL_MIN                 = 1.5         # Require relative volume ≥ 1.5x before
 MIN_STOCK_PRICE          = 2.0         # Skip penny stocks below $2 (poor fill quality, high spread)
 ALPACA_MOVER_SCAN_INTERVAL_MIN = 10   # Re-poll Alpaca screener every 10 min (resets at market open)
 MIN_DOLLAR_VOLUME        = 1_000_000   # Skip illiquid setups: price × day_vol < $1M
-MIN_FLOAT_SHARES         = 200_000_000 # Skip low-float names — prone to violent, illiquid after-hours moves
-MIN_AVG_DAILY_VOLUME     = 1_000_000   # Skip illiquid names: avg daily share volume < 1M
+# Low-float / thin-volume floors — split by session 2026-08-11 at the user's request.
+# The original values were justified entirely by an AFTER-HOURS incident (BIOA
+# 2026-07-31: repeated overnight buy-then-stop cycles on a low-float, thinly
+# traded ticker) but were applied around the clock, which was also silently
+# excluding real, liquid, actively-traded names during regular hours — HTZ
+# (161.9M float), BTDR (145.6M), IHRT (136.4M) all got rejected today despite
+# not being remotely BIOA-like. The daytime session has exchange-wide
+# liquidity and market-maker presence the overnight/pre-market session
+# doesn't, so the same float/volume floor doesn't carry the same risk at both
+# times. Regular hours use the loosened *_REGULAR_HOURS values below;
+# pre/after-market keep the original, BIOA-driven floors unchanged.
+MIN_FLOAT_SHARES         = 200_000_000 # pre/after-hours — unchanged, this is what BIOA actually needed
+MIN_FLOAT_SHARES_REGULAR_HOURS = 20_000_000  # regular hours only — loosened 10x to actually admit TI's low-float movers
+MIN_AVG_DAILY_VOLUME     = 1_000_000   # pre/after-hours — unchanged
+MIN_AVG_DAILY_VOLUME_REGULAR_HOURS = 700_000  # regular hours only — rescues near-misses (BCAX 721K, SEZL 692K were both rejected today just under 1M)
 MIN_MARKET_CAP           = 100_000_000 # Skip micro-caps below $100M
 MAX_GAP_CHASE_PCT        = 15.0       # Skip if already up >15% without consolidation
 GAP_CHASE_CONSOL_BARS    = 5          # Number of 1-min bars to check for tight base
