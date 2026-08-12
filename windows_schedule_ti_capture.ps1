@@ -2,7 +2,7 @@
 # Run in PowerShell as Administrator.
 
 $taskName = 'ApexTraderTICapture'
-$taskDescription = 'Refresh data/ti_primary.json every 20 min, Mon-Fri 06:00-20:00 — single-shot runs owned by Task Scheduler'
+$taskDescription = 'Refresh data/ti_primary.json every 10 min, Mon-Fri 06:00-20:00 — single-shot runs owned by Task Scheduler'
 $BaseDir = $PSScriptRoot
 
 $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$BaseDir\scripts\run_ti_capture_task.ps1`""
@@ -10,16 +10,20 @@ $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfil
 # Starts immediately at log on (needs your real, already-logged-in Edge/TI session)...
 $logonTrigger = New-ScheduledTaskTrigger -AtLogOn
 
-# ...then re-fires every 20 min, Mon-Fri, independent of whether the previous run
+# ...then re-fires every 10 min, Mon-Fri, independent of whether the previous run
 # crashed. Task Scheduler owns the cadence instead of an internal Python loop —
 # that loop crashed once (2026-08-03, locked Edge profile) and stayed dead for
 # 30+ hours because AtLogOn was the only trigger and nothing re-armed it.
+# 20 min -> 10 min 2026-08-12 at the user's request, to match
+# TRADEIDEAS_SCAN_INTERVAL_MIN (config.py) which this task's cadence had
+# silently drifted away from since the Task-Scheduler-owned cadence was
+# introduced 2026-08-06.
 $weekdayTrigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday,Tuesday,Wednesday,Thursday,Friday -At 06:00
 # .Repetition isn't settable in place (returns a fresh, disconnected CIM instance
 # each access) — build the repetition pattern separately and assign it whole.
 $repetitionClass = Get-CimClass -ClassName MSFT_TaskRepetitionPattern -Namespace Root/Microsoft/Windows/TaskScheduler
 $repetition = New-CimInstance -CimClass $repetitionClass -ClientOnly
-$repetition.Interval = 'PT20M'
+$repetition.Interval = 'PT10M'
 $repetition.Duration = 'PT14H'   # 06:00 -> 20:00, covers pre-market through after-hours
 $repetition.StopAtDurationEnd = $false
 $weekdayTrigger.Repetition = $repetition
