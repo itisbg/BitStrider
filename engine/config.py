@@ -655,7 +655,19 @@ SCAN_WORKERS        = 16   # Threads scanning symbols concurrently. Was capped a
                             # us actually checking it — pure throughput, doesn't change what gets
                             # traded, so it's not another variable in reading tomorrow's results.
 SCAN_SYMBOL_TIMEOUT = 15   # Max seconds per symbol before it is skipped
-SCAN_MAX_SYMBOLS    = 75   # Max symbols to scan per cycle (increased for better bear regime coverage)
+SCAN_MAX_SYMBOLS    = 150  # Max symbols to scan per cycle. Was 75 — doubled 2026-08-11 to pair with
+                            # the SCAN_WORKERS 8->16 change above. get_scan_targets() only guarantees
+                            # TI_PRIMARY_SCAN_BATCH_LIMIT (50) of ti_primary.json's tickers into every
+                            # cycle; with the file regularly holding 90-200+ (checked live: 92 right
+                            # now), the other 40-150+ only get scanned via rotation sharing whatever's
+                            # left of this budget after the guaranteed batch — at the old 75, that was
+                            # ~20-25 rotation slots per cycle, so a given overflow ticker could sit
+                            # several cycles before its next check. Doubling this alongside the worker
+                            # count keeps per-worker load the same (75/8 ~= 150/16 ~= 9.4 symbols each)
+                            # instead of just finishing the old-size scan faster — this is the fix for
+                            # the actual bottleneck, not a priority queue for TI (it already IS the
+                            # primary driver of get_scan_targets() whenever ti_primary.json has 5+
+                            # tickers; there was nothing to prioritize it against).
 BEAR_SHORT_TARGET_RESERVE = 30  # In bear regime, reserve more scan slots for short universe backups
 
 # ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
