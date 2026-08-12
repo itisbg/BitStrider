@@ -798,10 +798,26 @@ MIN_DOLLAR_VOLUME        = 1_000_000   # Skip illiquid setups: price × day_vol 
 # doesn't, so the same float/volume floor doesn't carry the same risk at both
 # times. Regular hours use the loosened *_REGULAR_HOURS values below;
 # pre/after-market keep the original, BIOA-driven floors unchanged.
-MIN_FLOAT_SHARES         = 200_000_000 # pre/after-hours — unchanged, this is what BIOA actually needed
-MIN_FLOAT_SHARES_REGULAR_HOURS = 20_000_000  # regular hours only — loosened 10x to actually admit TI's low-float movers
-MIN_AVG_DAILY_VOLUME     = 1_000_000   # pre/after-hours — unchanged
-MIN_AVG_DAILY_VOLUME_REGULAR_HOURS = 700_000  # regular hours only — rescues near-misses (BCAX 721K, SEZL 692K were both rejected today just under 1M)
+#
+# 7-trading-day backtest (2026-08-03..11, 1,644 blocked symbol-days) validated
+# both loosened numbers as-is — checked specific candidate floats (20M/50M/
+# 200M) and volumes (400K..1M) directly rather than trusting a greedy
+# threshold sweep (which is biased toward "admit everything" on a
+# net-positive population): tighter floats actually had the BEST average
+# return (<20M: +25.9% avg vs <200M: +4.2%), and avg-volume was flat across
+# the whole 400K-1M range either way. Neither number moved.
+#
+# What the same backtest DID find: the first hour of regular trading behaves
+# like off-hours regardless of which guardrail would catch a symbol —
+# avg_volume/low_float/min_price all went from solidly positive to flat-or-
+# negative when restricted to before 09:30 CDT (still within is_regular_hours,
+# which starts at 08:30 CDT). REGULAR_HOURS_LOOSE_FLOOR_DELAY_MIN gates the
+# loosened floors on elapsed time since the open, not just is_regular_hours.
+REGULAR_HOURS_LOOSE_FLOOR_DELAY_MIN = 60  # minutes after the 9:30 ET open before loosened floors apply
+MIN_FLOAT_SHARES         = 200_000_000 # pre-open / first hour / after-hours — unchanged, this is what BIOA actually needed
+MIN_FLOAT_SHARES_REGULAR_HOURS = 20_000_000  # 60+ min into regular hours — loosened 10x to actually admit TI's low-float movers
+MIN_AVG_DAILY_VOLUME     = 1_000_000   # pre-open / first hour / after-hours — unchanged
+MIN_AVG_DAILY_VOLUME_REGULAR_HOURS = 700_000  # 60+ min into regular hours — rescues near-misses (BCAX 721K, SEZL 692K)
 MIN_MARKET_CAP           = 100_000_000 # Skip micro-caps below $100M
 MAX_GAP_CHASE_PCT        = 15.0       # Skip if already up >15% without consolidation
 GAP_CHASE_CONSOL_BARS    = 5          # Number of 1-min bars to check for tight base

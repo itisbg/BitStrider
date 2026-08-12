@@ -49,6 +49,7 @@ from engine.config import (
     MIN_DOLLAR_VOLUME,
     MIN_FLOAT_SHARES, MIN_FLOAT_SHARES_REGULAR_HOURS,
     MIN_AVG_DAILY_VOLUME, MIN_AVG_DAILY_VOLUME_REGULAR_HOURS,
+    REGULAR_HOURS_LOOSE_FLOOR_DELAY_MIN,
     MIN_MARKET_CAP,
     MIN_STOCK_PRICE,
     LONG_ONLY_MODE,
@@ -119,18 +120,31 @@ def _prefetch_snapshots(symbols: List[str]) -> None:
         pass  # fall back to per-symbol get_bars in _passes_guardrails
 
 
-def _effective_liquidity_floors(market_state: Optional[MarketState]) -> tuple:
+def _effective_liquidity_floors(market_state: Optional[MarketState], now_et: Optional[datetime.datetime] = None) -> tuple:
     """Return (min_float_shares, min_avg_daily_volume) for the current session.
 
-    Regular hours use the loosened MIN_FLOAT_SHARES_REGULAR_HOURS /
-    MIN_AVG_DAILY_VOLUME_REGULAR_HOURS; pre/after-market keep the original,
-    BIOA-driven floors (MIN_FLOAT_SHARES / MIN_AVG_DAILY_VOLUME) unchanged.
-    See engine/config.py for the full reasoning. Split out as its own function
-    so this one decision is unit-testable without driving the rest of
+    The loosened MIN_FLOAT_SHARES_REGULAR_HOURS / MIN_AVG_DAILY_VOLUME_REGULAR_HOURS
+    apply only once REGULAR_HOURS_LOOSE_FLOOR_DELAY_MIN minutes have elapsed
+    since the open — a 7-trading-day backtest (2026-08-03..11) found the first
+    hour of regular trading performs like off-hours across every guardrail
+    reason (avg_volume/low_float/min_price all went from solidly positive to
+    flat-or-negative when restricted to before 09:30 CDT, still within
+    is_regular_hours which starts at 08:30 CDT) — being open isn't enough,
+    the session needs to actually settle in first. Pre-open, the first hour,
+    and after-hours all keep the original, BIOA-driven floors
+    (MIN_FLOAT_SHARES / MIN_AVG_DAILY_VOLUME) unchanged. See engine/config.py
+    for the full reasoning. Split out as its own function so this one
+    decision is unit-testable without driving the rest of
     _passes_guardrails's snapshot/bar-fetch machinery.
+
+    now_et: inject a specific ET timestamp for testing; defaults to live time.
     """
     if market_state is not None and market_state.is_regular_hours:
-        return MIN_FLOAT_SHARES_REGULAR_HOURS, MIN_AVG_DAILY_VOLUME_REGULAR_HOURS
+        now_et = now_et or datetime.datetime.now(_ET)
+        mkt_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+        minutes_since_open = (now_et - mkt_open).total_seconds() / 60
+        if minutes_since_open >= REGULAR_HOURS_LOOSE_FLOOR_DELAY_MIN:
+            return MIN_FLOAT_SHARES_REGULAR_HOURS, MIN_AVG_DAILY_VOLUME_REGULAR_HOURS
     return MIN_FLOAT_SHARES, MIN_AVG_DAILY_VOLUME
 
 
