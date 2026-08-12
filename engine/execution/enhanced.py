@@ -56,6 +56,8 @@ from engine.config import (
     MOMENTUM_FRESHNESS_ENABLED, MOMENTUM_FRESHNESS_STRATEGIES,
     MOMENTUM_FRESHNESS_LOOKBACK_MIN, MOMENTUM_FRESHNESS_MAX_PULLBACK_PCT,
     THIN_LIQUIDITY_POSITION_SIZE_PCT,
+    THIN_LIQUIDITY_TRAILING_STOP_MULT,
+    MARKETABLE_LIMIT_BUFFER_PCT,
     LIVE,
 )
 from engine.equity.strategies import Signal
@@ -115,6 +117,36 @@ def _check_momentum_freshness(signal: Signal) -> Tuple[bool, Optional[str]]:
     return True, None
 
 
+def _marketable_limit_price(price: float, is_long: bool, buffer_pct: float = MARKETABLE_LIMIT_BUFFER_PCT) -> float:
+    """A limit price just past the reference price -- fills like a market
+    order under normal conditions, but caps the worst case at buffer_pct
+    instead of a plain market order absorbing an unbounded bid-ask spread.
+    is_long=True (buying, or covering a short) rounds UP by buffer_pct;
+    False (selling, or opening a short) rounds DOWN."""
+    adj = 1 + buffer_pct / 100 if is_long else 1 - buffer_pct / 100
+    return round(price * adj, 2)
+
+
+def _live_quote_mid(client, symbol: str, fallback: float) -> float:
+    """Live bid/ask midpoint -- the reference _marketable_limit_price should
+    bound against, instead of the scan-time signal.price or a possibly-stale
+    pos.current_price. By the time an order reaches the broker, the scan
+    that produced the reference price can be seconds to minutes old (scan
+    cadence, MAX_SIGNALS_PER_CYCLE throttling); bounding "within 1%" of a
+    stale number defeats the point. Falls back to `fallback` if the quote
+    call fails or either side is missing/non-positive -- same defensive
+    pattern as the stale-order requote path in detect_stopped_out_positions."""
+    try:
+        q = client.get_latest_quote(symbol)
+        bid = float(getattr(q, "bid_price", 0) or 0)
+        ask = float(getattr(q, "ask_price", 0) or 0)
+        if bid > 0 and ask > 0:
+            return (bid + ask) / 2
+    except Exception:
+        pass
+    return fallback
+
+
 def _apply_thin_liquidity_override(risk_info: Dict, signal: Signal, equity: float) -> Dict:
     """If signal.thin_liquidity is set (rejected-list symbol admitted anyway —
     see TRADE_THIN_LIQUIDITY_REJECTS, engine/equity/scan.py _scan_one), replace
@@ -127,12 +159,39 @@ def _apply_thin_liquidity_override(risk_info: Dict, signal: Signal, equity: floa
     if not getattr(signal, "thin_liquidity", False):
         return risk_info
     thin_dollars = round(equity * THIN_LIQUIDITY_POSITION_SIZE_PCT / 100, 2)
+    out = dict(risk_info, dollar_amount=thin_dollars, allocation_pct=THIN_LIQUIDITY_POSITION_SIZE_PCT)
+    log_extra = ""
+    # stop_loss_pct only exists on the non-LIVE bracket path (_create_bracket_order's
+    # inline trailing stop) -- the live path's protect_positions()/etc. don't read
+    # risk_info at all, they get the same halving from _trail_pct_for() instead.
+    if "stop_loss_pct" in risk_info:
+        halved = round(risk_info["stop_loss_pct"] * THIN_LIQUIDITY_TRAILING_STOP_MULT, 2)
+        out["stop_loss_pct"] = halved
+        log_extra = f" | stop {risk_info['stop_loss_pct']:.1f}% -> {halved:.1f}%"
     log.info(
         f"[SIZE] {signal.symbol}: thin-liquidity admit — "
         f"${risk_info['dollar_amount']:,.0f} -> ${thin_dollars:,.0f} "
-        f"({THIN_LIQUIDITY_POSITION_SIZE_PCT:.0f}% flat)"
+        f"({THIN_LIQUIDITY_POSITION_SIZE_PCT:.0f}% flat){log_extra}"
     )
-    return dict(risk_info, dollar_amount=thin_dollars, allocation_pct=THIN_LIQUIDITY_POSITION_SIZE_PCT)
+    return out
+
+
+def _trail_pct_for(symbol: str, price: float, entry_log: Dict) -> Tuple[float, str]:
+    """Trailing-stop % + tier label for `symbol`, with the thin-liquidity
+    override applied: a symbol admitted only via TRADE_THIN_LIQUIDITY_REJECTS
+    (entry_log[symbol]['thin_liquidity'] -- set at entry, see _execute_entry)
+    always gets HALF the normal dynamic-tier trail% (THIN_LIQUIDITY_
+    TRAILING_STOP_MULT) instead of the tier's own value -- these names
+    already failed a liquidity guardrail, so they're held on a shorter leash
+    for their whole life. Single source of truth for every trailing-stop
+    placement/re-place/tighten in this file (protect_positions, ratchet,
+    after-hours virtual-stop, all re-arm fallbacks) instead of 6 separate
+    get_dynamic_tier() call sites drifting out of sync with each other."""
+    tier_info = get_dynamic_tier(symbol, price)
+    trail_pct, tier_label = tier_info["ts"], tier_info["tier"]
+    if entry_log.get(symbol, {}).get("thin_liquidity"):
+        return round(trail_pct * THIN_LIQUIDITY_TRAILING_STOP_MULT, 2), f"{tier_label}/THIN"
+    return trail_pct, tier_label
 
 
 def _demo() -> None:
@@ -537,7 +596,7 @@ class EnhancedExecutor:
                     if weakest_pos is not None:
                         w_qty     = int(float(weakest_pos.qty))
                         w_current = float(weakest_pos.current_price)
-                        w_trail   = get_dynamic_tier(weakest, w_current)["ts"]
+                        w_trail   = _trail_pct_for(weakest, w_current, self._entry_log)[0]
                         self.client.submit_order(TrailingStopOrderRequest(
                             symbol        = weakest,
                             qty           = abs(w_qty),
@@ -794,8 +853,9 @@ class EnhancedExecutor:
         log.warning(f"Short blocked {signal.symbol} (not shortable/insufficient BP): {e}")
 
     def _create_bracket_order(self, signal: Signal, shares: int, risk_info: Dict, order_type: OrderType) -> bool:
-        """Submit market entry then a GTC trailing stop at risk_info['stop_loss_pct']%.
-        TP bracket leg is intentionally dropped — the trailing stop locks in gains
+        """Submit a bounded-limit entry (see _marketable_limit_price) then a
+        GTC trailing stop at risk_info['stop_loss_pct']%. TP bracket leg is
+        intentionally dropped — the trailing stop locks in gains
         automatically; swap logic and EOD close handle opportunity exits."""
         side      = OrderSide.BUY  if order_type == OrderType.LONG else OrderSide.SELL
         stop_side = OrderSide.SELL if order_type == OrderType.LONG else OrderSide.BUY
@@ -803,11 +863,14 @@ class EnhancedExecutor:
 
         # ── Step 1: Entry order (failure aborts the whole bracket) ──────────
         try:
-            entry_req = MarketOrderRequest(
+            mid = _live_quote_mid(self.client, signal.symbol, signal.price)
+            entry_limit = _marketable_limit_price(mid, is_long=(order_type == OrderType.LONG))
+            entry_req = LimitOrderRequest(
                 symbol          = signal.symbol,
                 qty             = shares,
                 side            = side,
                 time_in_force   = TimeInForce.DAY,
+                limit_price     = entry_limit,
                 client_order_id = f"apex-{signal.strategy}-{signal.symbol}-{int(time.time())}",
             )
             order = self.client.submit_order(entry_req)
@@ -879,39 +942,36 @@ class EnhancedExecutor:
 
     # ΓöÇΓöÇ Simple Order ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
     def _create_simple_order(self, signal: Signal, shares: int, order_type: OrderType) -> bool:
+        """Non-bracket entry path. Always a bounded limit off the live bid/ask
+        mid (see _marketable_limit_price/_live_quote_mid) -- extended hours
+        needs extended_hours=True to be eligible to fill at all; regular
+        hours used to be a plain MarketOrderRequest with no price bound,
+        same NBIL-class risk _create_bracket_order had (see
+        MARKETABLE_LIMIT_BUFFER_PCT in config.py)."""
         side   = OrderSide.BUY if order_type == OrderType.LONG else OrderSide.SELL
         action = "BUY"         if order_type == OrderType.LONG else "SHORT"
 
         try:
-            coid = f"apex-{signal.strategy}-{signal.symbol}-{int(time.time())}"
-            if EXTENDED_HOURS and not self._current_market_state().is_regular_hours:
-                adj   = 1.002 if order_type == OrderType.LONG else 0.998
-                limit = round(signal.price * adj, 2)
-                req   = LimitOrderRequest(
-                    symbol          = signal.symbol,
-                    qty             = shares,
-                    side            = side,
-                    time_in_force   = TimeInForce.DAY,
-                    limit_price     = limit,
-                    extended_hours  = True,
-                    client_order_id = coid,
-                )
-                order = self.client.submit_order(req)
-                self.order_cache[signal.symbol] = order.id
-                log.info(f"{action} LIMIT {signal.symbol}: {shares} @ ${limit:.2f} (ext-hours) | {signal.strategy}")
-                return True
-            else:
-                req = MarketOrderRequest(
-                    symbol          = signal.symbol,
-                    qty             = shares,
-                    side            = side,
-                    time_in_force   = TimeInForce.DAY,
-                    client_order_id = coid,
-                )
-                order = self.client.submit_order(req)
-                self.order_cache[signal.symbol] = order.id
-                log.info(f"{action} {signal.symbol}: {shares} @ ${signal.price:.2f} | {signal.strategy}")
-                return True
+            coid     = f"apex-{signal.strategy}-{signal.symbol}-{int(time.time())}"
+            extended = EXTENDED_HOURS and not self._current_market_state().is_regular_hours
+            mid      = _live_quote_mid(self.client, signal.symbol, signal.price)
+            limit    = _marketable_limit_price(mid, is_long=(order_type == OrderType.LONG))
+            req = LimitOrderRequest(
+                symbol          = signal.symbol,
+                qty             = shares,
+                side            = side,
+                time_in_force   = TimeInForce.DAY,
+                limit_price     = limit,
+                extended_hours  = extended,
+                client_order_id = coid,
+            )
+            order = self.client.submit_order(req)
+            self.order_cache[signal.symbol] = order.id
+            log.info(
+                f"{action} {signal.symbol}: {shares} @ ${limit:.2f}"
+                f"{' (ext-hours)' if extended else ''} | {signal.strategy}"
+            )
+            return True
 
         except Exception as e:
             err = str(e).lower()
@@ -1006,7 +1066,7 @@ class EnhancedExecutor:
         if self.use_bracket_orders and self._current_market_state().is_regular_hours:
             if self._create_bracket_order(signal, shares, risk_info, order_type):
                 self.pdt.add(datetime.date.today())
-                self._entry_log[signal.symbol] = {"strategy": signal.strategy, "date": datetime.date.today(), "filled_at": datetime.datetime.now(datetime.timezone.utc), "confidence": signal.confidence}
+                self._entry_log[signal.symbol] = {"strategy": signal.strategy, "date": datetime.date.today(), "filled_at": datetime.datetime.now(datetime.timezone.utc), "confidence": signal.confidence, "thin_liquidity": signal.thin_liquidity}
                 self._swap_cycle_closed.add(signal.symbol)  # protect from same-cycle swap-out
                 self._get_positions(force_refresh=True)
                 self._get_account(force_refresh=True)
@@ -1014,7 +1074,7 @@ class EnhancedExecutor:
 
         if self._create_simple_order(signal, shares, order_type):
             self.pdt.add(datetime.date.today())
-            self._entry_log[signal.symbol] = {"strategy": signal.strategy, "date": datetime.date.today(), "confidence": signal.confidence}
+            self._entry_log[signal.symbol] = {"strategy": signal.strategy, "date": datetime.date.today(), "confidence": signal.confidence, "thin_liquidity": signal.thin_liquidity}
             self._swap_cycle_closed.add(signal.symbol)  # protect from same-cycle swap-out
             self._get_positions(force_refresh=True)
             self._get_account(force_refresh=True)
@@ -1183,9 +1243,7 @@ class EnhancedExecutor:
                 current     = float(pos.current_price)
                 is_long_pos = qty > 0
 
-                tier_info  = get_dynamic_tier(sym, current)
-                trail_pct  = tier_info["ts"]
-                tier_label = tier_info["tier"]
+                trail_pct, tier_label = _trail_pct_for(sym, current, self._entry_log)
 
                 stop_side = OrderSide.SELL if is_long_pos else OrderSide.BUY
                 self.client.submit_order(TrailingStopOrderRequest(
@@ -1206,8 +1264,7 @@ class EnhancedExecutor:
                     if sym not in self._pdt_stop_blocked:
                         try:
                             entry_price = float(pos.avg_entry_price or pos.current_price)
-                            tier_info   = get_dynamic_tier(sym, float(pos.current_price))
-                            stop_pct    = tier_info["ts"]
+                            stop_pct    = _trail_pct_for(sym, float(pos.current_price), self._entry_log)[0]
                             stop_price  = round(
                                 entry_price * (1 - stop_pct / 100) if qty > 0
                                 else entry_price * (1 + stop_pct / 100),
@@ -1267,9 +1324,8 @@ class EnhancedExecutor:
                 continue
 
             try:
-                current   = float(pos.current_price)
-                tier_info = get_dynamic_tier(sym, current)
-                base_pct  = tier_info["ts"]
+                current  = float(pos.current_price)
+                base_pct = _trail_pct_for(sym, current, self._entry_log)[0]
                 tightened_pct = round(base_pct * ratchet_scale(confidence), 2)
                 if tightened_pct >= base_pct:
                     self._ratchet_done.add(sym)  # nothing to tighten to; don't recheck every cycle
@@ -1298,22 +1354,22 @@ class EnhancedExecutor:
                 log.warning(f"ratchet_confident_winners {sym}: {e}")
 
     def _submit_closing_order(self, symbol: str, qty: int, side: OrderSide, current_price: float, slip_pct: float = 0.5) -> None:
-        """Submit a position-closing order. During regular hours this is a plain
-        market order; outside regular hours (Alpaca rejects market orders then)
-        it's a marketable extended-hours limit instead, crossing the spread by
-        slip_pct so a thin pre/post-market book still fills promptly. Callers
-        that keep missing the fill (fast-moving after-hours book) should widen
+        """Submit a position-closing order as a marketable limit crossing the
+        spread by slip_pct off the LIVE bid/ask mid (see _live_quote_mid) --
+        never a naked MarketOrderRequest during regular hours either
+        anymore: same unbounded-spread risk as the entry side (NBIL,
+        MARKETABLE_LIMIT_BUFFER_PCT), just on the way out instead of in.
+        extended_hours is set whenever we're actually outside regular hours,
+        since Alpaca rejects market orders (and non-extended limits) then.
+        Callers that keep missing the fill (fast-moving book) should widen
         slip_pct on retry rather than resubmitting at the same price forever."""
-        if MarketState.from_now().is_regular_hours:
-            req = MarketOrderRequest(
-                symbol=symbol, qty=qty, side=side, time_in_force=TimeInForce.DAY,
-            )
-        else:
-            slip = (1.0 - slip_pct / 100.0) if side == OrderSide.SELL else (1.0 + slip_pct / 100.0)
-            req = LimitOrderRequest(
-                symbol=symbol, qty=qty, side=side, time_in_force=TimeInForce.DAY,
-                limit_price=round(current_price * slip, 2), extended_hours=True,
-            )
+        mid  = _live_quote_mid(self.client, symbol, current_price)
+        slip = (1.0 - slip_pct / 100.0) if side == OrderSide.SELL else (1.0 + slip_pct / 100.0)
+        req = LimitOrderRequest(
+            symbol=symbol, qty=qty, side=side, time_in_force=TimeInForce.DAY,
+            limit_price=round(mid * slip, 2),
+            extended_hours=not MarketState.from_now().is_regular_hours,
+        )
         self.client.submit_order(req)
 
     def check_software_stops(self) -> None:
@@ -1492,7 +1548,7 @@ class EnhancedExecutor:
                 is_long = qty > 0
                 current = float(pos.current_price)
                 entry   = float(pos.avg_entry_price)
-                trail_pct  = get_dynamic_tier(sym, current)["ts"]
+                trail_pct  = _trail_pct_for(sym, current, self._entry_log)[0]
                 stop_price = entry * (1 - trail_pct / 100) if is_long else entry * (1 + trail_pct / 100)
                 hit = (is_long and current <= stop_price) or (not is_long and current >= stop_price)
                 if not hit:
@@ -2059,7 +2115,7 @@ class EnhancedExecutor:
                     # GTC is gone and the replacement didn't go through — re-arm one now
                     # rather than leave the position unprotected until the next cycle.
                     try:
-                        trail_pct = get_dynamic_tier(sym, float(pos.current_price))["ts"]
+                        trail_pct = _trail_pct_for(sym, float(pos.current_price), self._entry_log)[0]
                         self.client.submit_order(TrailingStopOrderRequest(
                             symbol=sym, qty=abs(qty), side=close_side,
                             type=AlpacaOrderType.TRAILING_STOP,

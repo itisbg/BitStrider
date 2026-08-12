@@ -850,7 +850,38 @@ MIN_AVG_DAILY_VOLUME_REGULAR_HOURS = 700_000  # 60+ min into regular hours — r
 # at the highs) -- a flat 3% caps the downside on the latter either way.
 TRADE_THIN_LIQUIDITY_REJECTS     = True   # master switch for this path — enabled 2026-08-12 at the user's request
 THIN_LIQUIDITY_POSITION_SIZE_PCT = 3.0
+
+# 2026-08-12, user request: these names already failed a liquidity guardrail,
+# so hold them on a shorter leash for their whole life too, not just a
+# smaller size at entry -- every trailing-stop placement/re-place/tighten for
+# a thin_liquidity=True symbol (entry bracket, protect_positions, ratchet
+# tightening, after-hours virtual-stop, all re-arm fallbacks) uses HALF the
+# normal dynamic-tier trail% instead of the tier's own value. See
+# _trail_pct_for() in enhanced.py -- one shared helper, not 6 special cases.
+# NOTE: still scoped to float/avg_volume admits only, same as
+# TRADE_THIN_LIQUIDITY_REJECTS above -- market cap and other guardrail
+# rejections are still hard-blocked at entry, not merely given a tighter
+# stop. Widening the admit scope itself is a separate ask.
+THIN_LIQUIDITY_TRAILING_STOP_MULT = 0.5
 MIN_MARKET_CAP           = 100_000_000 # Skip micro-caps below $100M
+
+# 2026-08-12, user request: entries during regular hours were plain
+# MarketOrderRequest -- no price bound at all, so a wide bid-ask spread (thin
+# name, fast-moving book) gets absorbed in full at whatever the ask happens
+# to be (see NBIL 2026-08-12: bought $28.76, the exact high tick of that
+# 5-min bar). Applies to entries (_create_bracket_order, _create_simple_order)
+# and every software-triggered exit (_submit_closing_order) alike -- all
+# three now price off a LIVE bid/ask quote fetched at submit time (see
+# _live_quote_mid in enhanced.py), not the scan-time signal.price/
+# pos.current_price, which can be seconds to minutes stale by the time the
+# order actually reaches the broker (scan cadence, MAX_SIGNALS_PER_CYCLE
+# throttling) -- bounding against a stale reference defeats the point.
+# User's spec: stay within 1% of that live bid/ask midpoint. Still fills like
+# a market order in normal conditions; caps the worst case instead of
+# absorbing an unbounded spread. If it doesn't fill same-day (DAY
+# time-in-force), that itself is a signal the spread was genuinely too wide
+# to trade safely -- no active re-chase added here, that's a separate ask.
+MARKETABLE_LIMIT_BUFFER_PCT = 1.0
 MAX_GAP_CHASE_PCT        = 15.0       # Skip if already up >15% without consolidation
 GAP_CHASE_CONSOL_BARS    = 5          # Number of 1-min bars to check for tight base
 # ponytail: suppressed 2026-08-03 to observe a month of live impact (log data showed
@@ -875,7 +906,28 @@ GAP_CHASE_GUARD_ENABLED  = False
 # sharp reversal, not a gradual one. Revisit with real win/loss data once
 # it's run for a while, same experiment shape as GAP_CHASE_GUARD_ENABLED.
 MOMENTUM_FRESHNESS_ENABLED          = True
-MOMENTUM_FRESHNESS_STRATEGIES       = {"PreMarketMomentum", "GapBreakout"}
+# 2026-08-12, user request ("delayed entries... every signal picked
+# yesterday"): was just the 2 strategies above -- NBIL (ORB) faded before
+# fill same as PLUG/ACHR/CLSK/SOUN did, and the check itself
+# (_check_momentum_freshness) has no strategy-specific logic, it only ever
+# looks at bars + the strategies set, so widening this set is the entire
+# fix. Added every other LONG strategy whose own signal reasoning is
+# "breaking out / continuing a move" (vulnerable to buying after it's
+# already rolled over): ORB, Momentum, TrendBreaker, VWAPReclaim,
+# FloatRotation, OpeningBellSurge, PMHighBreakout, EarlySqueeze.
+# Deliberately NOT added: VWAPFade and LiquiditySweep enter LONG *because*
+# price already pulled back off a recent high (that pullback is the signal,
+# not staleness) -- this check would false-reject most of their real
+# signals. PowerOf3 is the same shape (enters after its own "sweep" leg).
+# Sentiment/Technical are composite/ambiguous, left alone rather than
+# guessed at. BearBreakdown is short-only, moot either way (freshness only
+# gates OrderType.LONG). Revisit if PowerOf3/VWAPFade/LiquiditySweep show
+# the same late-entry pattern in the data.
+MOMENTUM_FRESHNESS_STRATEGIES       = {
+    "PreMarketMomentum", "GapBreakout", "ORB", "Momentum", "TrendBreaker",
+    "VWAPReclaim", "FloatRotation", "OpeningBellSurge", "PMHighBreakout",
+    "EarlySqueeze",
+}
 MOMENTUM_FRESHNESS_LOOKBACK_MIN     = 30   # minutes of recent bars to find the high against
 MOMENTUM_FRESHNESS_MAX_PULLBACK_PCT = 5.0  # reject if price has faded more than this % off that high
 

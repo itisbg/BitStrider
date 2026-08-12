@@ -1,0 +1,159 @@
+"""Self-check for the live-mid bounded-limit-price fix and the
+thin-liquidity trailing-stop halving (2026-08-12).
+
+Bounded limit price: entries/exits during regular hours used to be plain
+MarketOrderRequest -- no price bound, so a wide bid-ask spread gets absorbed
+in full (NBIL 2026-08-12: bought $28.76, the exact high tick of that 5-min
+bar). Now _create_bracket_order/_create_simple_order/_submit_closing_order
+all price off a LIVE bid/ask quote (_live_quote_mid) bounded within
+MARKETABLE_LIMIT_BUFFER_PCT (1%) via _marketable_limit_price, instead of a
+possibly-stale signal.price/pos.current_price -- the whole point of "delayed
+entries" is that the scan-time reference can be seconds to minutes old by
+the time the order reaches the broker.
+
+Trailing-stop halving: a symbol admitted only via TRADE_THIN_LIQUIDITY_REJECTS
+(signal.thin_liquidity=True) gets HALF the normal dynamic-tier trail% for its
+whole life (entry, protect_positions, ratchet, after-hours virtual-stop, all
+re-arm fallbacks) via the single _trail_pct_for() helper, not 6 separate
+get_dynamic_tier() call sites that could drift out of sync.
+
+Run with:
+  python scripts/test_marketable_limit_and_trail.py
+No network calls -- client / get_dynamic_tier / MarketState are stubbed.
+"""
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+from engine.config import MARKETABLE_LIMIT_BUFFER_PCT, THIN_LIQUIDITY_TRAILING_STOP_MULT
+import engine.execution.enhanced as ee
+from engine.execution.enhanced import (
+    _marketable_limit_price, _live_quote_mid, _trail_pct_for,
+    _apply_thin_liquidity_override,
+)
+from engine.equity.strategies import Signal
+
+assert MARKETABLE_LIMIT_BUFFER_PCT == 1.0, f"expected 1% buffer (user spec), config has {MARKETABLE_LIMIT_BUFFER_PCT}"
+assert THIN_LIQUIDITY_TRAILING_STOP_MULT == 0.5, f"expected half, config has {THIN_LIQUIDITY_TRAILING_STOP_MULT}"
+
+
+# --- _marketable_limit_price(): bounded, direction-aware ---
+assert _marketable_limit_price(100.0, is_long=True) == 101.0, "buy/cover should round UP by the buffer"
+assert _marketable_limit_price(100.0, is_long=False) == 99.0, "sell/short should round DOWN by the buffer"
+assert _marketable_limit_price(100.0, is_long=True, buffer_pct=0.2) == 100.2, "custom buffer_pct honored"
+
+
+# --- _live_quote_mid(): live quote wins, any failure/missing side falls back ---
+class _Quote:
+    def __init__(self, bid, ask):
+        self.bid_price, self.ask_price = bid, ask
+
+
+class _QuoteClient:
+    def __init__(self, quote_or_exc):
+        self._q = quote_or_exc
+
+    def get_latest_quote(self, symbol):
+        if isinstance(self._q, Exception):
+            raise self._q
+        return self._q
+
+
+assert _live_quote_mid(_QuoteClient(_Quote(9.98, 10.02)), "TEST", fallback=999) == 10.0, "should average a healthy quote"
+assert _live_quote_mid(_QuoteClient(RuntimeError("boom")), "TEST", fallback=42.0) == 42.0, "quote call failing falls back"
+assert _live_quote_mid(_QuoteClient(_Quote(0, 10.02)), "TEST", fallback=42.0) == 42.0, "missing bid falls back"
+assert _live_quote_mid(_QuoteClient(_Quote(9.98, 0)), "TEST", fallback=42.0) == 42.0, "missing ask falls back"
+
+
+# --- _trail_pct_for(): thin-liquidity halves the tier value, everything else doesn't ---
+_orig_get_dynamic_tier = ee.get_dynamic_tier
+ee.get_dynamic_tier = lambda symbol, price: {"tier": "NORMAL", "ts": 8.0}  # stub out the ATR/bars lookup
+try:
+    pct, label = _trail_pct_for("AAA", 10.0, entry_log={})
+    assert (pct, label) == (8.0, "NORMAL"), f"no entry_log record -> plain tier value, got {(pct, label)}"
+    pct, label = _trail_pct_for("BBB", 10.0, entry_log={"BBB": {"thin_liquidity": False}})
+    assert (pct, label) == (8.0, "NORMAL"), f"flagged False -> plain tier value, got {(pct, label)}"
+    pct, label = _trail_pct_for("CCC", 10.0, entry_log={"CCC": {"thin_liquidity": True}})
+    assert (pct, label) == (4.0, "NORMAL/THIN"), f"flagged True -> half the tier value, got {(pct, label)}"
+finally:
+    ee.get_dynamic_tier = _orig_get_dynamic_tier
+
+
+# --- _apply_thin_liquidity_override(): sizing AND (when present) stop_loss_pct both halve ---
+def _sig(thin=False):
+    return Signal("TEST", "buy", 10.0, 0.90, "test reason", "TestStrat", thin_liquidity=thin)
+
+
+risk_info = {"dollar_amount": 150.0, "allocation_pct": 7.5, "tier": "NORMAL", "stop_loss_pct": 4.0}
+out = _apply_thin_liquidity_override(risk_info, _sig(thin=True), equity=2000.0)
+assert out["dollar_amount"] == 60.0, f"expected 3% of $2000 = $60, got {out['dollar_amount']}"
+assert out["stop_loss_pct"] == 2.0, f"expected stop_loss_pct halved 4.0 -> 2.0, got {out['stop_loss_pct']}"
+assert risk_info["stop_loss_pct"] == 4.0, "original dict must not be mutated in place"
+
+risk_info_no_sl = {"dollar_amount": 150.0, "allocation_pct": 7.5, "tier": "NORMAL"}  # live-mode risk_info has no stop_loss_pct key
+out = _apply_thin_liquidity_override(risk_info_no_sl, _sig(thin=True), equity=2000.0)
+assert "stop_loss_pct" not in out, "must not invent a stop_loss_pct key that wasn't there"
+
+out = _apply_thin_liquidity_override(risk_info, _sig(thin=False), equity=2000.0)
+assert out is risk_info, "unflagged signal should return the exact same dict, not a copy"
+
+
+# --- _create_simple_order(): regular hours now submits a bounded LimitOrderRequest
+#     off the LIVE mid, never MarketOrderRequest, and ignores stale signal.price ---
+class _FakeTradeClient:
+    def __init__(self, quote):
+        self._q = quote
+        self.orders = []
+
+    def get_latest_quote(self, symbol):
+        return self._q
+
+    def submit_order(self, req):
+        self.orders.append(req)
+        return SimpleNamespace(id="fake-order-id")
+
+
+ex = ee.EnhancedExecutor.__new__(ee.EnhancedExecutor)  # skip __init__, no broker creds needed
+ex.client = _FakeTradeClient(_Quote(9.99, 10.01))       # live mid = 10.00
+ex.order_cache = {}
+ex._current_market_state = lambda: SimpleNamespace(is_regular_hours=True)
+sig = Signal("ZZZ", "buy", 10.50, 0.8, "test", "TestStrat")  # signal.price deliberately stale vs. live mid
+assert ex._create_simple_order(sig, 10, ee.OrderType.LONG) is True
+req = ex.client.orders[-1]
+assert isinstance(req, ee.LimitOrderRequest), f"regular-hours entry must be a bounded limit, not {type(req).__name__}"
+assert req.limit_price == 10.10, f"expected 1% over the LIVE mid (10.00 -> 10.10), not off stale signal.price 10.50; got {req.limit_price}"
+assert req.extended_hours is False
+
+# Extended-hours branch still flows through correctly after the refactor.
+_orig_extended = ee.EXTENDED_HOURS
+ee.EXTENDED_HOURS = True
+try:
+    ex.client.orders.clear()
+    ex._current_market_state = lambda: SimpleNamespace(is_regular_hours=False)
+    sig_short = Signal("YYY", "short", 50.0, 0.8, "test", "TestStrat")
+    assert ex._create_simple_order(sig_short, 5, ee.OrderType.SHORT) is True
+    req = ex.client.orders[-1]
+    assert isinstance(req, ee.LimitOrderRequest)
+    assert req.extended_hours is True
+    assert req.limit_price == 9.90, f"short/sell rounds DOWN 1% off the 10.00 mid, got {req.limit_price}"
+finally:
+    ee.EXTENDED_HOURS = _orig_extended
+
+
+# --- _submit_closing_order(): regular hours now bounded too, off the LIVE mid ---
+_orig_market_state = ee.MarketState
+ee.MarketState = SimpleNamespace(from_now=lambda: SimpleNamespace(is_regular_hours=True))
+try:
+    ex2 = ee.EnhancedExecutor.__new__(ee.EnhancedExecutor)
+    ex2.client = _FakeTradeClient(_Quote(19.98, 20.02))  # live mid = 20.00
+    ex2._submit_closing_order("ZZZ", 5, ee.OrderSide.SELL, current_price=999.0, slip_pct=0.5)
+    req = ex2.client.orders[-1]
+    assert isinstance(req, ee.LimitOrderRequest), f"regular-hours close must be a bounded limit, not {type(req).__name__}"
+    assert req.limit_price == 19.90, f"expected 0.5% below the LIVE mid (20.00 -> 19.90), not stale current_price=999; got {req.limit_price}"
+    assert req.extended_hours is False
+finally:
+    ee.MarketState = _orig_market_state
+
+print("OK: bounded-limit-price helpers (live mid, 1% bound) and thin-liquidity trailing-stop halving all check out")

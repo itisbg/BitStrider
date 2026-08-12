@@ -30,6 +30,7 @@ class _FakeClient:
     def __init__(self, positions):
         self._positions = positions
         self.submitted = []
+        self.trail_pct_used = {}
 
     def get_all_positions(self):
         return self._positions
@@ -39,6 +40,7 @@ class _FakeClient:
 
     def submit_order(self, req):
         self.submitted.append(req.symbol)
+        self.trail_pct_used[req.symbol] = req.trail_percent
         return SimpleNamespace(id="fake-order-id")
 
 
@@ -47,11 +49,12 @@ def _pos(symbol, qty, qty_available, price=10.0):
                             current_price=price, avg_entry_price=price)
 
 
-def _make_executor(positions):
+def _make_executor(positions, entry_log=None):
     ex = EnhancedExecutor.__new__(EnhancedExecutor)  # skip __init__ (no broker creds needed)
     ex.client = _FakeClient(positions)
     ex._pdt_overnight_forced = set()
     ex._pdt_stop_blocked = {}
+    ex._entry_log = entry_log or {}
     return ex
 
 
@@ -60,8 +63,9 @@ positions = [
     _pos("LONG_RESV",  qty=100, qty_available=0),     # long, fully reserved -> skip
     _pos("SHORT_FREE", qty=-26, qty_available=-26),   # short, free -> protect (this was the bug)
     _pos("SHORT_RESV", qty=-26, qty_available=0),      # short, fully reserved -> skip
+    _pos("THIN_FREE",  qty=50, qty_available=50),     # long, free, thin-liquidity admit -> half stop
 ]
-ex = _make_executor(positions)
+ex = _make_executor(positions, entry_log={"THIN_FREE": {"thin_liquidity": True}})
 ex.protect_positions()
 
 assert "LONG_FREE" in ex.client.submitted, "free long should get a trailing stop"
@@ -69,4 +73,10 @@ assert "LONG_RESV" not in ex.client.submitted, "fully-reserved long should be sk
 assert "SHORT_FREE" in ex.client.submitted, "free short should get a trailing stop -- this was skipped unconditionally before the fix"
 assert "SHORT_RESV" not in ex.client.submitted, "fully-reserved short should be skipped"
 
-print("OK: protect_positions() arms trailing stops for free shorts, not just longs")
+# 2026-08-12: thin-liquidity admits get HALF the normal trail% for their whole
+# life, via _trail_pct_for() -- exercised here end-to-end through the real
+# protect_positions() method, not just the pure helper in isolation.
+assert ex.client.trail_pct_used["LONG_FREE"] == 8.0, "normal position keeps the plain 8% tier value"
+assert ex.client.trail_pct_used["THIN_FREE"] == 4.0, "thin-liquidity admit should get half (4%), not the plain 8% tier value"
+
+print("OK: protect_positions() arms trailing stops for free shorts, not just longs, and halves the stop for thin-liquidity admits")
