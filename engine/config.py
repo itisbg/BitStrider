@@ -848,7 +848,7 @@ MIN_AVG_DAILY_VOLUME_REGULAR_HOURS = 700_000  # 60+ min into regular hours — r
 # liquid (HTZ/RUM/NN-style) without betting full size on the ones that turn
 # out thin (PLAG-style: passes on paper, 154 shares traded in a 30-min bar
 # at the highs) -- a flat 3% caps the downside on the latter either way.
-TRADE_THIN_LIQUIDITY_REJECTS     = False  # master switch for this path
+TRADE_THIN_LIQUIDITY_REJECTS     = True   # master switch for this path — enabled 2026-08-12 at the user's request
 THIN_LIQUIDITY_POSITION_SIZE_PCT = 3.0
 MIN_MARKET_CAP           = 100_000_000 # Skip micro-caps below $100M
 MAX_GAP_CHASE_PCT        = 15.0       # Skip if already up >15% without consolidation

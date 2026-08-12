@@ -22,9 +22,12 @@ sys.path.insert(0, str(ROOT))
 import engine.equity.scan as scan
 from engine.equity.strategies import Signal
 from engine.execution.enhanced import _apply_thin_liquidity_override
-from engine.config import THIN_LIQUIDITY_POSITION_SIZE_PCT, TRADE_THIN_LIQUIDITY_REJECTS
+from engine.config import THIN_LIQUIDITY_POSITION_SIZE_PCT
 
-assert TRADE_THIN_LIQUIDITY_REJECTS is False, "should ship OFF by default"
+# NOTE: TRADE_THIN_LIQUIDITY_REJECTS's live value is a deployment decision
+# (started False 2026-08-12, flipped True same day at the user's request) —
+# not asserted here. Both directions are exercised explicitly below via
+# scan.TRADE_THIN_LIQUIDITY_REJECTS regardless of what's currently live.
 assert THIN_LIQUIDITY_POSITION_SIZE_PCT == 3.0
 
 # --- _should_admit_thin_liquidity(): the scan-side gate ---
