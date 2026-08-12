@@ -12,9 +12,19 @@
 #     8am-triggered run on 2026-08-04 and caused the collision.
 #   - Added RestartOnFailure (5 attempts, 2 min apart) so a bad exit gets
 #     retried same-day instead of waiting for the next trigger.
+#   - Added a 3rd trigger: daily @ 00:00, repeating every 30 min for 24h.
+#     RestartOnFailure only covers 5 attempts / ~10 min before giving up --
+#     without this, a crash that outlasts that window sits dead until the
+#     next boot or the following day's 8am trigger. Same failure shape that
+#     bit the TI-capture task once already (crashed 2026-08-03, stayed dead
+#     30+ hours, nothing re-armed it). This was live on the task since
+#     2026-08-05 but missing from this script's XML -- folded in
+#     2026-08-12 so the two stop drifting apart. IgnoreNew (below) makes it
+#     a no-op whenever the bot is already running.
 #
 # ponytail: single XML re-register, no new dependencies — Task Scheduler's
-# native retry/boot-trigger covers this, no custom supervisor script needed.
+# native retry/boot-trigger/repeating-trigger covers this, no custom
+# supervisor script needed.
 
 $ErrorActionPreference = 'Stop'
 
@@ -76,6 +86,16 @@ $xml = @"
           <Friday />
         </DaysOfWeek>
       </ScheduleByWeek>
+    </CalendarTrigger>
+    <CalendarTrigger>
+      <StartBoundary>2026-08-05T00:00:00-05:00</StartBoundary>
+      <Repetition>
+        <Interval>PT30M</Interval>
+        <Duration>P1D</Duration>
+      </Repetition>
+      <ScheduleByDay>
+        <DaysInterval>1</DaysInterval>
+      </ScheduleByDay>
     </CalendarTrigger>
   </Triggers>
   <Actions Context="Author">
