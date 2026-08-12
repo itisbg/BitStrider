@@ -53,10 +53,13 @@ from engine.config import (
     POSITION_SIZE_PCT, SMALL_ACCOUNT_POSITION_SIZE_PCT,
     CONF_SCALE_MIN_MULT, CONF_SCALE_FULL_CONF,
     CONF_RATCHET_ENABLED, CONF_RATCHET_TRIGGER_GAIN_PCT, CONF_RATCHET_MAX_TIGHTEN,
+    MOMENTUM_FRESHNESS_ENABLED, MOMENTUM_FRESHNESS_STRATEGIES,
+    MOMENTUM_FRESHNESS_LOOKBACK_MIN, MOMENTUM_FRESHNESS_MAX_PULLBACK_PCT,
     LIVE,
 )
 from engine.equity.strategies import Signal
 from engine.utils import MarketState, calculate_risk_adjusted_size, check_vix_roc_filter, get_dynamic_tier
+from engine.utils.bars import get_bars
 from engine.never_trade import is_never_trade
 from engine.notifications.notifications import send_email
 
@@ -77,6 +80,38 @@ def ratchet_scale(confidence: float) -> float:
     span = max(1e-6, 1.0 - SWAP_MIN_CONFIDENCE)
     frac = min(1.0, (confidence - SWAP_MIN_CONFIDENCE) / span)
     return 1.0 - frac * (1.0 - CONF_RATCHET_MAX_TIGHTEN)
+
+
+def _check_momentum_freshness(signal: Signal) -> Tuple[bool, Optional[str]]:
+    """Reject a gap/momentum signal (MOMENTUM_FRESHNESS_STRATEGIES) if price
+    has already faded MOMENTUM_FRESHNESS_MAX_PULLBACK_PCT+ off its high over
+    the last MOMENTUM_FRESHNESS_LOOKBACK_MIN minutes — the move may already
+    be rolling over by the time the order is about to submit, seconds to
+    minutes after the strategy detected it. See engine/config.py for the
+    full reasoning and known limitations (sharp reversals only, not gradual
+    multi-hour fades).
+
+    Returns (fresh, reject_reason). fresh=True with no reason for any
+    strategy not in MOMENTUM_FRESHNESS_STRATEGIES, or when there isn't
+    enough recent bar data to judge — never blocks on missing data.
+    """
+    if not MOMENTUM_FRESHNESS_ENABLED or signal.strategy not in MOMENTUM_FRESHNESS_STRATEGIES:
+        return True, None
+    bars = get_bars(signal.symbol, period="1d", interval="1m")
+    if bars.empty or "high" not in bars.columns or "close" not in bars.columns:
+        return True, None
+    recent = bars.tail(MOMENTUM_FRESHNESS_LOOKBACK_MIN)
+    recent_high = float(recent["high"].max())
+    current_price = float(bars["close"].iloc[-1])
+    if recent_high <= 0:
+        return True, None
+    pullback_pct = (recent_high - current_price) / recent_high * 100
+    if pullback_pct > MOMENTUM_FRESHNESS_MAX_PULLBACK_PCT:
+        return False, (
+            f"{signal.symbol}: faded {pullback_pct:.1f}% off its {MOMENTUM_FRESHNESS_LOOKBACK_MIN}-min "
+            f"high (${recent_high:.2f} -> ${current_price:.2f}) — {signal.strategy} entry not fresh"
+        )
+    return True, None
 
 
 def _demo() -> None:
@@ -543,6 +578,15 @@ class EnhancedExecutor:
         # avoid wastefully re-scanning a symbol we already know is blocked.
         if signal.symbol in self.get_afterhours_cooldown_symbols():
             return False, f"{signal.symbol} in post-loss re-entry cooldown"
+
+        # Momentum entry freshness (long only — a short entry isn't chasing a
+        # gap up) — reject a gap/momentum signal that's already faded off its
+        # recent high by the time we're about to submit. See engine/config.py
+        # MOMENTUM_FRESHNESS_* for the reasoning and known limitations.
+        if order_type == OrderType.LONG:
+            fresh, fade_reason = _check_momentum_freshness(signal)
+            if not fresh:
+                return False, fade_reason
 
         # Asset tradability check: skip halted or suspended symbols
         try:

@@ -826,6 +826,27 @@ GAP_CHASE_CONSOL_BARS    = 5          # Number of 1-min bars to check for tight 
 # month suggest it's costing more legit movers than it's protecting). Flip to True
 # to reactivate if the no-guard month looks worse.
 GAP_CHASE_GUARD_ENABLED  = False
+
+# Momentum entry freshness — reject a gap/momentum signal if price has already
+# faded off its recent high by the time the order is about to be submitted.
+# Different axis from GAP_CHASE (which gates on gap SIZE, still disabled
+# above): the 2026-08-11 case studies (ACHR, PLUG, CLSK, SOUN) all faded
+# before or shortly after fill despite gaps ranging 5.5%-27.9% — magnitude
+# didn't predict it, timing did. Scan cadence (3-5min) plus limit-order fill
+# lag means the move can already be rolling over by the time execution
+# happens, seconds to minutes after the signal fired.
+# ponytail: MOMENTUM_FRESHNESS_MAX_PULLBACK_PCT and _LOOKBACK_MIN below are a
+# first-pass estimate sized against those 4 case studies, not a backtest —
+# PLUG's costlier 2nd entry (-$8.49, 6.1% off its 30-min high at fill) would
+# have been caught at these settings; CLSK's slow multi-hour bleed (which
+# never showed a sharp pullback right at entry) would not — this targets a
+# sharp reversal, not a gradual one. Revisit with real win/loss data once
+# it's run for a while, same experiment shape as GAP_CHASE_GUARD_ENABLED.
+MOMENTUM_FRESHNESS_ENABLED          = True
+MOMENTUM_FRESHNESS_STRATEGIES       = {"PreMarketMomentum", "GapBreakout"}
+MOMENTUM_FRESHNESS_LOOKBACK_MIN     = 30   # minutes of recent bars to find the high against
+MOMENTUM_FRESHNESS_MAX_PULLBACK_PCT = 5.0  # reject if price has faded more than this % off that high
+
 USE_MARKET_REGIME_FILTER = True       # SPY below 200-day MA → cut signals to 1
 MARKET_REGIME_SIGNALS_CAP  = 5        # Max LONG entries per cycle in bear regime (swap-only); tries until one succeeds
 BEAR_SHORT_SIGNALS_CAP     = 3        # Max SHORT entries per cycle in bear regime
