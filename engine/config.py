@@ -836,6 +836,20 @@ MIN_FLOAT_SHARES         = 200_000_000 # pre-open / first hour / after-hours —
 MIN_FLOAT_SHARES_REGULAR_HOURS = 20_000_000  # 60+ min into regular hours — loosened 10x to actually admit TI's low-float movers
 MIN_AVG_DAILY_VOLUME     = 1_000_000   # pre-open / first hour / after-hours — unchanged
 MIN_AVG_DAILY_VOLUME_REGULAR_HOURS = 700_000  # 60+ min into regular hours — rescues near-misses (BCAX 721K, SEZL 692K)
+
+# 2026-08-12, user request: the low_float/avg_volume guardrails above are
+# UNCHANGED and still reject these symbols exactly as before (counted in
+# [GUARDRAIL SUMMARY] same as always) -- this is a separate, toggleable path
+# that re-admits a symbol rejected for ONLY those two reasons (min_price,
+# RVOL, dollar_vol, market cap, gap_chase are untouched and still block
+# outright), sized at THIN_LIQUIDITY_POSITION_SIZE_PCT instead of the normal
+# POSITION_SIZE_PCT. Off by default -- flip TRADE_THIN_LIQUIDITY_REJECTS to
+# switch it on. Gives exposure to below-the-floor names that are genuinely
+# liquid (HTZ/RUM/NN-style) without betting full size on the ones that turn
+# out thin (PLAG-style: passes on paper, 154 shares traded in a 30-min bar
+# at the highs) -- a flat 3% caps the downside on the latter either way.
+TRADE_THIN_LIQUIDITY_REJECTS     = False  # master switch for this path
+THIN_LIQUIDITY_POSITION_SIZE_PCT = 3.0
 MIN_MARKET_CAP           = 100_000_000 # Skip micro-caps below $100M
 MAX_GAP_CHASE_PCT        = 15.0       # Skip if already up >15% without consolidation
 GAP_CHASE_CONSOL_BARS    = 5          # Number of 1-min bars to check for tight base

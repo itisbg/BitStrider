@@ -55,6 +55,7 @@ from engine.config import (
     CONF_RATCHET_ENABLED, CONF_RATCHET_TRIGGER_GAIN_PCT, CONF_RATCHET_MAX_TIGHTEN,
     MOMENTUM_FRESHNESS_ENABLED, MOMENTUM_FRESHNESS_STRATEGIES,
     MOMENTUM_FRESHNESS_LOOKBACK_MIN, MOMENTUM_FRESHNESS_MAX_PULLBACK_PCT,
+    THIN_LIQUIDITY_POSITION_SIZE_PCT,
     LIVE,
 )
 from engine.equity.strategies import Signal
@@ -112,6 +113,26 @@ def _check_momentum_freshness(signal: Signal) -> Tuple[bool, Optional[str]]:
             f"high (${recent_high:.2f} -> ${current_price:.2f}) — {signal.strategy} entry not fresh"
         )
     return True, None
+
+
+def _apply_thin_liquidity_override(risk_info: Dict, signal: Signal, equity: float) -> Dict:
+    """If signal.thin_liquidity is set (rejected-list symbol admitted anyway —
+    see TRADE_THIN_LIQUIDITY_REJECTS, engine/equity/scan.py _scan_one), replace
+    dollar_amount with a flat THIN_LIQUIDITY_POSITION_SIZE_PCT of equity,
+    overriding confidence-scaling entirely rather than stacking on top of it —
+    a predictable cap on the downside for a name that failed the float/
+    avg-volume floor, regardless of how confident the firing strategy was.
+    Returns risk_info unchanged if the signal isn't flagged.
+    """
+    if not getattr(signal, "thin_liquidity", False):
+        return risk_info
+    thin_dollars = round(equity * THIN_LIQUIDITY_POSITION_SIZE_PCT / 100, 2)
+    log.info(
+        f"[SIZE] {signal.symbol}: thin-liquidity admit — "
+        f"${risk_info['dollar_amount']:,.0f} -> ${thin_dollars:,.0f} "
+        f"({THIN_LIQUIDITY_POSITION_SIZE_PCT:.0f}% flat)"
+    )
+    return dict(risk_info, dollar_amount=thin_dollars, allocation_pct=THIN_LIQUIDITY_POSITION_SIZE_PCT)
 
 
 def _demo() -> None:
@@ -926,6 +947,8 @@ class EnhancedExecutor:
             f"[SIZE] {signal.symbol} conf={signal.confidence:.0%} → "
             f"scale={_conf_mult:.2f}× → ${risk_info['dollar_amount']:,.0f}"
         )
+
+        risk_info = _apply_thin_liquidity_override(risk_info, signal, acct.equity)
 
         shares, skip_reason = self._size_with_buying_power(acct.buying_power, signal, risk_info, order_type)
         if shares < 1:

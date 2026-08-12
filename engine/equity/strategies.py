@@ -45,6 +45,10 @@ class Signal:
     reason:     str
     strategy:   str
     atr_stop:   Optional[float] = None   # ATR-based stop distance ($); None = use % fallback
+    thin_liquidity: bool = False  # admitted below the float/avg-volume floor (2026-08-12) —
+                                   # sized at THIN_LIQUIDITY_POSITION_SIZE_PCT instead of the
+                                   # normal POSITION_SIZE_PCT; set by scan.py, read by
+                                   # _execute_entry() in engine/execution/enhanced.py
 
 
 def _calc_atr14(bars: pd.DataFrame, period: int = 14) -> float:

@@ -62,6 +62,7 @@ from engine.config import (
     BEAR_SHORT_UNIVERSE,
     HMM_REGIME_LOOKBACK_DAYS,
     HMM_REGIME_CONFIDENCE_BOOST,
+    TRADE_THIN_LIQUIDITY_REJECTS,
 )
 from engine.utils import MarketState, clear_bar_cache, get_bars, get_daily_volume_bars, is_dead_ticker, get_hmm_regime
 from engine.utils.bars import get_data_client as _get_data_client
@@ -146,6 +147,19 @@ def _effective_liquidity_floors(market_state: Optional[MarketState], now_et: Opt
         if minutes_since_open >= REGULAR_HOURS_LOOSE_FLOOR_DELAY_MIN:
             return MIN_FLOAT_SHARES_REGULAR_HOURS, MIN_AVG_DAILY_VOLUME_REGULAR_HOURS
     return MIN_FLOAT_SHARES, MIN_AVG_DAILY_VOLUME
+
+
+def _should_admit_thin_liquidity(reason: Optional[str]) -> bool:
+    """True if a _passes_guardrails() rejection reason should be re-admitted
+    (sized down via THIN_LIQUIDITY_POSITION_SIZE_PCT) instead of discarded.
+
+    2026-08-12, user request, off by default (TRADE_THIN_LIQUIDITY_REJECTS).
+    Only avg_volume/low_float qualify — min_price, RVOL, dollar_vol, market
+    cap, and gap_chase rejections are never rescued by this path. Split out
+    as its own function so this decision is unit-testable without driving
+    the rest of scan_universe()'s threaded scan machinery.
+    """
+    return TRADE_THIN_LIQUIDITY_REJECTS and reason in ('avg_volume', 'low_float')
 
 
 def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Optional[MarketState] = None, return_reason: bool = False) -> bool:
@@ -506,18 +520,29 @@ def scan_universe(scan_targets: List[str], sentiment: str, market_state: MarketS
         'low_mcap': 0,
         'other': 0
     }
+    thin_liquidity_stats = {'admitted': 0}  # rejected-list symbols scanned anyway; see TRADE_THIN_LIQUIDITY_REJECTS
 
     def _scan_one(symbol: str):
         # Dead-ticker check already done in get_scan_targets() — skip here.
         # Pass pre-computed regime into guardrails to avoid re-calling _is_bull_regime()
         # Custom: get rejection reason from _passes_guardrails
         passed, reason = _passes_guardrails(symbol, bull_regime=bull_regime, market_state=market_state, return_reason=True)
+        thin_liquidity = False
         if not passed:
             if reason in guardrail_rejections:
                 guardrail_rejections[reason] += 1
             else:
                 guardrail_rejections['other'] += 1
-            return None
+            # Rejection itself is unchanged and still counted above — this is a
+            # separate, toggleable path on top of it: a symbol rejected for ONLY
+            # thin float/volume still gets scanned, just flagged so _execute_entry
+            # sizes it at THIN_LIQUIDITY_POSITION_SIZE_PCT instead of skipping it
+            # outright. min_price/RVOL/dollar_vol/mcap/gap_chase are never rescued.
+            if _should_admit_thin_liquidity(reason):
+                thin_liquidity = True
+                thin_liquidity_stats['admitted'] += 1
+            else:
+                return None
 
         candidates = []
         for s in strats:
@@ -538,6 +563,8 @@ def scan_universe(scan_targets: List[str], sentiment: str, market_state: MarketS
         if not candidates:
             return None
         best = max(candidates, key=lambda s: s.confidence)
+        if thin_liquidity:
+            best.thin_liquidity = True
 
         # Per-symbol HMM regime alignment: confidence bonus only, never a gate.
         # Buys get a boost when the symbol's own 2-state HMM regime is bullish;
@@ -574,6 +601,7 @@ def scan_universe(scan_targets: List[str], sentiment: str, market_state: MarketS
             f"MinPrice: {guardrail_rejections['min_price']} | AvgVolume: {guardrail_rejections['avg_volume']} | "
             f"LowFloat: {guardrail_rejections['low_float']} | LowMcap: {guardrail_rejections['low_mcap']} | "
             f"Other: {guardrail_rejections['other']}"
+            + (f" | ThinLiquidityAdmitted: {thin_liquidity_stats['admitted']}" if thin_liquidity_stats['admitted'] else "")
         )
 
     signals.sort(key=lambda x: x.confidence, reverse=True)
