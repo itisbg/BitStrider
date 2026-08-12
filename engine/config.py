@@ -647,7 +647,13 @@ HMM_REGIME_LOOKBACK_DAYS        = 2     # days of 1-min bars used to fit the HMM
 HMM_REGIME_CONFIDENCE_BOOST     = 0.03  # added to confidence when aligned
 
 # Parallel Scanning
-SCAN_WORKERS        = 8    # Threads scanning symbols concurrently (kept below Alpaca pool defaults)
+SCAN_WORKERS        = 16   # Threads scanning symbols concurrently. Was capped at 8 to stay below
+                            # alpaca-py's default urllib3 pool_maxsize=10 — obsolete now that
+                            # mount_wide_pool() (engine/utils/bars.py) raises the pool to 20 on
+                            # both the stock and option data clients (2026-08-11). Faster full-
+                            # universe scan completion = less time between a mover appearing and
+                            # us actually checking it — pure throughput, doesn't change what gets
+                            # traded, so it's not another variable in reading tomorrow's results.
 SCAN_SYMBOL_TIMEOUT = 15   # Max seconds per symbol before it is skipped
 SCAN_MAX_SYMBOLS    = 75   # Max symbols to scan per cycle (increased for better bear regime coverage)
 BEAR_SHORT_TARGET_RESERVE = 30  # In bear regime, reserve more scan slots for short universe backups
