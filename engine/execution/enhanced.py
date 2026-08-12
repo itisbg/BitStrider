@@ -1138,12 +1138,20 @@ class EnhancedExecutor:
             if sym in self._pdt_overnight_forced:
                 continue
 
-            # Secondary guard: skip if broker reports zero available qty
+            # Secondary guard: skip if broker reports zero available qty. Alpaca
+            # mirrors qty_available's sign to qty for shorts (a fully-free -26
+            # share short reports qty_available=-26, not +26) — checking <= 0
+            # is only correct for longs. Confirmed live 2026-08-12: every open
+            # short (ACHR, CORZ, IREN, MARA, ONON, SE, WULF) has a negative
+            # qty_available and was being skipped here every single cycle,
+            # leaving the entire short book with zero trailing-stop protection.
+            # 0 (not sign) is what actually means "fully reserved by another
+            # order" on both sides, so that's the only case to skip.
             try:
                 qty_available = int(float(pos.qty_available))
             except (AttributeError, TypeError, ValueError):
                 qty_available = 0
-            if qty_available <= 0:
+            if qty_available == 0:
                 continue
 
             try:
@@ -1891,14 +1899,25 @@ class EnhancedExecutor:
         }
 
     def close_no_gain_positions(self) -> Optional[dict]:
-        """Close any long position that hasn't settled into a clear positive
-        trend within NO_GAIN_EXIT_HOURS of entry: exit on ANY positive gain
-        (stop waiting once it's decided), or on a NO_GAIN_EXIT_MAX_LOSS_PCT
-        drop (cut it early rather than riding the full trailing stop down).
-        Only a narrow flat/small-loss band survives the check and keeps
-        holding. Checked every scan cycle (unlike close_stale_swing_positions,
-        which only runs once/day) since the N-hour mark can land mid-session,
-        not just at EOD."""
+        """Close any position (long or short) that hasn't settled into a clear
+        positive trend within NO_GAIN_EXIT_HOURS of entry: exit on ANY
+        positive gain (stop waiting once it's decided), or on a
+        NO_GAIN_EXIT_MAX_LOSS_PCT drop (cut it early rather than riding the
+        full trailing stop down). Only a narrow flat/small-loss band survives
+        the check and keeps holding. Checked every scan cycle (unlike
+        close_stale_swing_positions, which only runs once/day) since the
+        N-hour mark can land mid-session, not just at EOD.
+
+        Was long-only ("if qty <= 0: continue") until 2026-08-12, at the
+        user's request after finding a live short (ACHR) that had been open
+        well past NO_GAIN_EXIT_HOURS with no exit path at all -- this rule
+        skipped it by direction, same blind spot as the qty_available sign
+        bug in protect_positions() found the same day. pos.unrealized_plpc is
+        already sign-correct for shorts (negative when a short is losing, i.e.
+        price rose) so the gain_pct band check below needs no changes for
+        direction -- only the close side does: SELL for longs, BUY (cover)
+        for shorts.
+        """
         if not NO_GAIN_EXIT_ENABLED:
             return None
 
@@ -1923,8 +1942,8 @@ class EnhancedExecutor:
                 continue  # options legs — managed separately
 
             qty = int(float(pos.qty))
-            if qty <= 0:
-                continue  # only long positions are subject to this policy
+            if qty == 0:
+                continue  # no position
 
             strategy = self._entry_log.get(sym, {}).get("strategy")
             if strategy in EOD_CLOSE_STRATEGIES:
@@ -1987,10 +2006,11 @@ class EnhancedExecutor:
                     log.warning(f"close_no_gain_positions {sym}: GTC cancel failed, will retry next cycle: {e}")
                     continue
 
+            close_side = OrderSide.SELL if qty > 0 else OrderSide.BUY  # SELL to close a long, BUY to cover a short
             try:
                 chase_n  = self._no_gain_chase_count.get(sym, 0)
                 slip_pct = min(0.5 * (chase_n + 1), 3.0)
-                self._submit_closing_order(sym, abs(qty), OrderSide.SELL, float(pos.current_price), slip_pct=slip_pct)
+                self._submit_closing_order(sym, abs(qty), close_side, float(pos.current_price), slip_pct=slip_pct)
                 self._no_gain_chase_count[sym] = chase_n + 1
                 _strategy = self._entry_log.get(sym, {}).get("strategy", "unknown")
                 try:
@@ -2018,7 +2038,7 @@ class EnhancedExecutor:
                     try:
                         trail_pct = get_dynamic_tier(sym, float(pos.current_price))["ts"]
                         self.client.submit_order(TrailingStopOrderRequest(
-                            symbol=sym, qty=abs(qty), side=OrderSide.SELL,
+                            symbol=sym, qty=abs(qty), side=close_side,
                             type=AlpacaOrderType.TRAILING_STOP,
                             time_in_force=TimeInForce.GTC, trail_percent=trail_pct,
                         ))
