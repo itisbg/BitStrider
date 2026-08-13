@@ -29,8 +29,11 @@ sys.path.insert(0, str(ROOT))
 
 import engine.equity.scan as scan
 from engine.equity.strategies import Signal
-from engine.execution.enhanced import _apply_thin_liquidity_override
-from engine.config import THIN_LIQUIDITY_POSITION_SIZE_PCT
+from engine.execution.enhanced import _apply_thin_liquidity_override, _apply_high_confidence_bonus
+from engine.config import (
+    THIN_LIQUIDITY_POSITION_SIZE_PCT,
+    HIGH_CONFIDENCE_BONUS_THRESHOLD, HIGH_CONFIDENCE_BONUS_PCT,
+)
 
 # NOTE: TRADE_THIN_LIQUIDITY_REJECTS's live value is a deployment decision
 # (started False 2026-08-12, flipped True same day at the user's request) —
@@ -84,4 +87,30 @@ assert out["dollar_amount"] == 60.0, f"expected 3% of $2000 = $60, got {out['dol
 assert out["allocation_pct"] == 3.0
 assert risk_info["dollar_amount"] == 150.0, "original dict must not be mutated in place"
 
-print("OK: thin-liquidity admit path — toggle gates by reason correctly, sizing override is a flat 3% override")
+# --- _apply_high_confidence_bonus(): the +1.5pt bump above 92% confidence ---
+
+assert HIGH_CONFIDENCE_BONUS_THRESHOLD == 0.92
+assert HIGH_CONFIDENCE_BONUS_PCT == 1.5
+
+risk_info = {"dollar_amount": 150.0, "allocation_pct": 7.5, "tier": "NORMAL"}
+
+# At or below threshold -> unchanged, same dict (no copy).
+out = _apply_high_confidence_bonus(risk_info, confidence=0.92, equity=2000.0)
+assert out is risk_info, "at the threshold (not above it) must not bonus"
+out = _apply_high_confidence_bonus(risk_info, confidence=0.85, equity=2000.0)
+assert out is risk_info
+
+# Above threshold -> +1.5 points on allocation_pct, dollar_amount recomputed
+# from equity at the new pct (not just added to the old dollar_amount).
+out = _apply_high_confidence_bonus(risk_info, confidence=0.93, equity=2000.0)
+assert out["allocation_pct"] == 9.0, f"expected 7.5 + 1.5 = 9.0, got {out['allocation_pct']}"
+assert out["dollar_amount"] == 180.0, f"expected 9.0% of $2000 = $180, got {out['dollar_amount']}"
+assert risk_info["allocation_pct"] == 7.5, "original dict must not be mutated in place"
+
+# Stacks on whatever allocation_pct already is (e.g. a small-account rate),
+# doesn't reset to a fixed value.
+small_risk_info = {"dollar_amount": 50.0, "allocation_pct": 5.0, "tier": "NORMAL"}
+out = _apply_high_confidence_bonus(small_risk_info, confidence=0.99, equity=1000.0)
+assert out["allocation_pct"] == 6.5, f"expected 5.0 + 1.5 = 6.5, got {out['allocation_pct']}"
+
+print("OK: thin-liquidity admit path and high-confidence sizing bonus both check out")

@@ -54,6 +54,7 @@ from engine.config import (
     SMALL_ACCOUNT_MIN_POSITION_DOLLARS,
     POSITION_SIZE_PCT, SMALL_ACCOUNT_POSITION_SIZE_PCT,
     CONF_SCALE_MIN_MULT, CONF_SCALE_FULL_CONF,
+    HIGH_CONFIDENCE_BONUS_THRESHOLD, HIGH_CONFIDENCE_BONUS_PCT,
     CONF_RATCHET_ENABLED, CONF_RATCHET_TRIGGER_GAIN_PCT, CONF_RATCHET_MAX_TIGHTEN,
     MOMENTUM_FRESHNESS_ENABLED, MOMENTUM_FRESHNESS_STRATEGIES,
     MOMENTUM_FRESHNESS_LOOKBACK_MIN, MOMENTUM_FRESHNESS_MAX_PULLBACK_PCT,
@@ -176,6 +177,21 @@ def _apply_thin_liquidity_override(risk_info: Dict, signal: Signal, equity: floa
         f"({THIN_LIQUIDITY_POSITION_SIZE_PCT:.0f}% flat){log_extra}"
     )
     return out
+
+
+def _apply_high_confidence_bonus(risk_info: Dict, confidence: float, equity: float) -> Dict:
+    """2026-08-13, user request: confidence-scaling (_execute_entry's
+    CONF_SCALE_MIN_MULT..CONF_SCALE_FULL_CONF ramp) plateaus at 1.0x for any
+    confidence >= 85% -- 85% and 99% get sized identically. This adds one
+    more tier: a flat +HIGH_CONFIDENCE_BONUS_PCT points on top of whatever
+    allocation_pct is already, for confidence strictly above
+    HIGH_CONFIDENCE_BONUS_THRESHOLD (92%). Returns risk_info unchanged
+    otherwise. Applied before _apply_thin_liquidity_override in the caller,
+    which fully overrides -- not stacks with -- either scaling step."""
+    if confidence <= HIGH_CONFIDENCE_BONUS_THRESHOLD:
+        return risk_info
+    bonus_pct = risk_info["allocation_pct"] + HIGH_CONFIDENCE_BONUS_PCT
+    return dict(risk_info, allocation_pct=bonus_pct, dollar_amount=round(equity * bonus_pct / 100.0, 2))
 
 
 def _trail_pct_for(symbol: str, price: float, entry_log: Dict) -> Tuple[float, str]:
@@ -707,18 +723,35 @@ class EnhancedExecutor:
         # causing the bot to permanently block new entries even when capital is available.
         # We compute effective_max from equity × position_size_pct, then separately gate each
         # execution on whether buying_power is sufficient for one position.
+        #
+        # 2026-08-13, user request ("max position increase to 24"): SMALL_ACCOUNT_MAX_POSITIONS
+        # (24) had been defined in config.py since before this file existed but was dead --
+        # imported here and never referenced, so every account, small or not, was silently
+        # capped at plain MAX_POSITIONS (12). Wired it in as the ceiling for accounts under
+        # SMALL_ACCOUNT_EQUITY_THRESHOLD. Also switched the equity_capacity estimate to use
+        # THIN_LIQUIDITY_POSITION_SIZE_PCT (3%) when the signal itself is a thin-liquidity
+        # admit, not the flat 7.5% small-account rate -- otherwise the affordability math
+        # still silently caps out around 12 (7.5% x 12 ≈ 90% of equity) regardless of the new
+        # 24 ceiling, since today's guardrail widening means most newly-eligible signals will
+        # actually execute at the smaller 3% size, not 7.5%.
         _pos_size_pct = (
-            SMALL_ACCOUNT_POSITION_SIZE_PCT
-            if acct.equity < SMALL_ACCOUNT_EQUITY_THRESHOLD
+            THIN_LIQUIDITY_POSITION_SIZE_PCT if getattr(signal, "thin_liquidity", False)
+            else SMALL_ACCOUNT_POSITION_SIZE_PCT if acct.equity < SMALL_ACCOUNT_EQUITY_THRESHOLD
             else POSITION_SIZE_PCT
         )
         _pos_size_dollars = max(MIN_POSITION_DOLLARS, acct.equity * _pos_size_pct / 100.0)
         # Strategic max: how many positions our equity allocation strategy supports
         equity_capacity = max(1, int(acct.equity * 0.95 / _pos_size_dollars))
-        effective_max = min(MAX_POSITIONS, equity_capacity)
+        _max_positions_cap = (
+            SMALL_ACCOUNT_MAX_POSITIONS
+            if acct.equity < SMALL_ACCOUNT_EQUITY_THRESHOLD
+            else MAX_POSITIONS
+        )
+        effective_max = min(_max_positions_cap, equity_capacity)
         log.debug(
             f"[DBG] effective_max={effective_max} equity={acct.equity:.0f} bp={acct.buying_power:.0f} "
-            f"pos_size=${_pos_size_dollars:.0f} ({_pos_size_pct:.0f}%) equity_cap={equity_capacity}"
+            f"pos_size=${_pos_size_dollars:.0f} ({_pos_size_pct:.0f}%) equity_cap={equity_capacity} "
+            f"max_cap={_max_positions_cap}"
         )
 
         # ── Buying power gate (must come first) ───────────────────────────
@@ -1012,6 +1045,15 @@ class EnhancedExecutor:
             f"[SIZE] {signal.symbol} conf={signal.confidence:.0%} → "
             f"scale={_conf_mult:.2f}× → ${risk_info['dollar_amount']:,.0f}"
         )
+
+        _pre_bonus_pct = risk_info["allocation_pct"]
+        risk_info = _apply_high_confidence_bonus(risk_info, signal.confidence, acct.equity)
+        if risk_info["allocation_pct"] != _pre_bonus_pct:
+            log.debug(
+                f"[SIZE] {signal.symbol} conf={signal.confidence:.0%} > {HIGH_CONFIDENCE_BONUS_THRESHOLD:.0%} "
+                f"— high-confidence bonus: allocation {_pre_bonus_pct:.1f}% → {risk_info['allocation_pct']:.1f}% "
+                f"(${risk_info['dollar_amount']:,.0f})"
+            )
 
         risk_info = _apply_thin_liquidity_override(risk_info, signal, acct.equity)
 

@@ -359,6 +359,15 @@ RISK_PER_TRADE_PCT   = 0.8    # Risk 0.8% of account per trade (unused with fixe
 CONF_SCALE_MIN_MULT  = 0.50   # 50% of normal size at the confidence floor (0.72)
 CONF_SCALE_FULL_CONF = 0.85   # 100% of normal size at this confidence and above
 
+# 2026-08-13, user request: the scaling above plateaus at 1.0x (full
+# POSITION_SIZE_PCT) for anything >= CONF_SCALE_FULL_CONF (85%) -- 85% and
+# 99% confidence get sized identically. This adds one more tier on top: a
+# flat +1.5 percentage-point bump (7.5% -> 9.0%) for genuinely exceptional
+# signals above this threshold. Applied before the thin-liquidity override
+# (still trumps everything with its own flat 3%, unaffected by confidence).
+HIGH_CONFIDENCE_BONUS_THRESHOLD = 0.92
+HIGH_CONFIDENCE_BONUS_PCT       = 1.5   # added to allocation_pct, not multiplied
+
 # Small account reduction caps (sub-$5k equity)
 SMALL_ACCOUNT_POSITION_SIZE_PCT = 7.5   # same allocation as POSITION_SIZE_PCT for small accounts — reverted 2026-08-11
 SMALL_ACCOUNT_RISK_PER_TRADE_PCT = 0.5 # lower risk per trade for small accounts
