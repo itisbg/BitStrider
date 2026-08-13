@@ -149,7 +149,7 @@ def _effective_liquidity_floors(market_state: Optional[MarketState], now_et: Opt
     return MIN_FLOAT_SHARES, MIN_AVG_DAILY_VOLUME
 
 
-def _should_admit_thin_liquidity(reason: Optional[str]) -> bool:
+def _should_admit_thin_liquidity(reason: Optional[str], market_state: Optional[MarketState] = None) -> bool:
     """True if a _passes_guardrails() rejection reason should be re-admitted
     (sized down via THIN_LIQUIDITY_POSITION_SIZE_PCT) instead of discarded.
 
@@ -158,8 +158,22 @@ def _should_admit_thin_liquidity(reason: Optional[str]) -> bool:
     cap, and gap_chase rejections are never rescued by this path. Split out
     as its own function so this decision is unit-testable without driving
     the rest of scan_universe()'s threaded scan machinery.
+
+    2026-08-13, user request ("no stocks to be held or traded overnight
+    which fail guards"): regular-hours only. NRGV got admitted via this path
+    at 16:02 ET (2 min after close, ext-hours) and sat failing the overnight
+    guardrail all night until the no-gain-exit rule caught it at 06:37 the
+    next morning -- an entry opened outside regular hours IS an overnight
+    hold from the moment it fills, with no same-day close_guardrail_fail_
+    positions run left to catch it before the close it already missed. The
+    daytime version of this path is unaffected: a name admitted during
+    regular hours can still get force-closed by close_guardrail_fail_
+    positions at 15:45 ET like any other guardrail-failing position.
+    market_state=None (caller didn't pass one) fails closed -- no admit.
     """
-    return TRADE_THIN_LIQUIDITY_REJECTS and reason in ('avg_volume', 'low_float')
+    if not (TRADE_THIN_LIQUIDITY_REJECTS and reason in ('avg_volume', 'low_float')):
+        return False
+    return bool(market_state and market_state.is_regular_hours)
 
 
 def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Optional[MarketState] = None, return_reason: bool = False) -> bool:
@@ -538,7 +552,7 @@ def scan_universe(scan_targets: List[str], sentiment: str, market_state: MarketS
             # thin float/volume still gets scanned, just flagged so _execute_entry
             # sizes it at THIN_LIQUIDITY_POSITION_SIZE_PCT instead of skipping it
             # outright. min_price/RVOL/dollar_vol/mcap/gap_chase are never rescued.
-            if _should_admit_thin_liquidity(reason):
+            if _should_admit_thin_liquidity(reason, market_state):
                 thin_liquidity = True
                 thin_liquidity_stats['admitted'] += 1
             else:

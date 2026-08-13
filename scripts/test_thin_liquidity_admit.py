@@ -32,17 +32,29 @@ assert THIN_LIQUIDITY_POSITION_SIZE_PCT == 3.0
 
 # --- _should_admit_thin_liquidity(): the scan-side gate ---
 
-# Toggle off -> never admits, regardless of reason.
+_regular  = SimpleNamespace(is_regular_hours=True)
+_extended = SimpleNamespace(is_regular_hours=False)
+
+# Toggle off -> never admits, regardless of reason or session.
 scan.TRADE_THIN_LIQUIDITY_REJECTS = False
 for reason in ("avg_volume", "low_float", "min_price", "rvol", "dollar_vol", "low_mcap", "gap_chase", "other", None):
-    assert scan._should_admit_thin_liquidity(reason) is False, f"toggle off should never admit ({reason})"
+    assert scan._should_admit_thin_liquidity(reason, _regular) is False, f"toggle off should never admit ({reason})"
 
-# Toggle on -> only avg_volume/low_float get admitted; everything else guardrail-related still isn't rescued.
+# Toggle on, regular hours -> only avg_volume/low_float get admitted; everything
+# else guardrail-related still isn't rescued.
 scan.TRADE_THIN_LIQUIDITY_REJECTS = True
-assert scan._should_admit_thin_liquidity("avg_volume") is True
-assert scan._should_admit_thin_liquidity("low_float") is True
+assert scan._should_admit_thin_liquidity("avg_volume", _regular) is True
+assert scan._should_admit_thin_liquidity("low_float", _regular) is True
 for reason in ("min_price", "rvol", "dollar_vol", "low_mcap", "gap_chase", "other", None):
-    assert scan._should_admit_thin_liquidity(reason) is False, f"should not rescue {reason} even with the toggle on"
+    assert scan._should_admit_thin_liquidity(reason, _regular) is False, f"should not rescue {reason} even with the toggle on"
+
+# 2026-08-13: toggle on, but OUTSIDE regular hours -> never admits, even for
+# avg_volume/low_float. An entry opened outside regular hours is an overnight
+# hold from the moment it fills (NRGV, 2026-08-12: admitted at 16:02 ET,
+# 2 min after close, sat failing its guardrail all night).
+assert scan._should_admit_thin_liquidity("avg_volume", _extended) is False, "must not admit outside regular hours"
+assert scan._should_admit_thin_liquidity("low_float", _extended) is False, "must not admit outside regular hours"
+assert scan._should_admit_thin_liquidity("avg_volume", None) is False, "no market_state -> fail closed, no admit"
 
 scan.TRADE_THIN_LIQUIDITY_REJECTS = False  # restore default for anything else in-process
 
