@@ -530,7 +530,7 @@ FORCE_SCAN = os.getenv("FORCE_SCAN", "false").lower() in ("1", "true", "yes")
 # Intraday strategies should never be held overnight — close by EOD_CLOSE_TIME
 # ─────────────────────────────────────────────────────────────────
 EOD_CLOSE_ENABLED    = True
-EOD_CLOSE_TIME       = "15:50"   # Close intraday positions 10 min before market close
+EOD_CLOSE_TIME       = "15:45"   # Close intraday positions 15 min before market close (was 10 min/15:50, widened 2026-08-12)
 EOD_CLOSE_STRATEGIES = {         # Strategy names that must be closed same day
     "FloatRotation",
     "GapBreakout",

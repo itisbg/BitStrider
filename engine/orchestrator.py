@@ -678,6 +678,27 @@ def get_adaptive_interval(ctx: AppContext) -> int:
     return interval
 
 
+def _eod_close_job(ctx: AppContext) -> None:
+    """schedule-driven wrapper for close_eod_positions, same reasoning as
+    _guardrail_close_job below: was scan-cadence-gated with a narrow window
+    (EOD_CLOSE_TIME through the hard 16:00 ET cutoff) that could fall
+    between two cycles. 2026-08-12: retimed 15:50->15:45 (15 min before
+    close, was 10) and decoupled the same way."""
+    eod_summary = None
+    try:
+        eod_summary = ctx.executor.close_eod_positions()
+    except Exception as e:
+        log.error(f"close_eod_positions error: {e}", exc_info=True)
+
+    if eod_summary:
+        try:
+            account   = ctx.client.get_account()
+            positions = ctx.client.get_all_positions()
+            notify_eod(eod_summary, account, positions, _session.daily_pnl, _session.trades, _discovery.trending_stocks)
+        except Exception as e:
+            log.error(f"EOD notify error: {e}", exc_info=True)
+
+
 def _guardrail_close_job(ctx: AppContext) -> None:
     """schedule-driven wrapper for close_guardrail_fail_positions.
 
@@ -856,6 +877,7 @@ def start() -> None:
     schedule.every(30).minutes.do(log_status, ctx)
     schedule.every(30).minutes.do(_prune_universe_job)
     schedule.every(1).minutes.do(_guardrail_close_job, ctx)
+    schedule.every(1).minutes.do(_eod_close_job, ctx)
 
     try:
         while True:
@@ -879,20 +901,6 @@ def start() -> None:
                         ctx.executor.ratchet_confident_winners()
                     except Exception as e:
                         log.error(f"ratchet_confident_winners error: {e}", exc_info=True)
-
-                    eod_summary = None
-                    try:
-                        eod_summary = ctx.executor.close_eod_positions()
-                    except Exception as e:
-                        log.error(f"close_eod_positions error: {e}", exc_info=True)
-
-                    if eod_summary:
-                        try:
-                            account   = ctx.client.get_account()
-                            positions = ctx.client.get_all_positions()
-                            notify_eod(eod_summary, account, positions, _session.daily_pnl, _session.trades, _discovery.trending_stocks)
-                        except Exception as e:
-                            log.error(f"EOD notify error: {e}", exc_info=True)
 
                     try:
                         ctx.executor.close_stale_swing_positions()
