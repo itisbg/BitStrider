@@ -474,6 +474,15 @@ def _check_kill_mode(ctx: AppContext) -> bool:
     )
 
 
+def _margin_cushion_ok(equity: float, maintenance_margin: float, min_ratio: float) -> bool:
+    """True if equity is still >= min_ratio x maintenance_margin (safe cushion
+    against an Alpaca maintenance margin call). No margin exposure at all
+    (maintenance_margin <= 0) is always safe -- nothing to protect against."""
+    if maintenance_margin <= 0:
+        return True
+    return equity >= min_ratio * maintenance_margin
+
+
 def scan_and_trade(ctx: AppContext) -> None:
     """One complete scan-and-trade cycle.
 
@@ -535,6 +544,15 @@ def scan_and_trade(ctx: AppContext) -> None:
     if acct.buying_power < min_needed:
         log.info(
             f"[SYSTEM] Buying power ${acct.buying_power:,.0f} < minimum position ${min_needed:,.0f} "
+            f"— skipping discovery/scan this cycle (existing stops/TP/concentration checks still ran above)"
+        )
+        return
+
+    if cfg.MARGIN_SAFEGUARD_ENABLED and not _margin_cushion_ok(acct.equity, acct.maintenance_margin, cfg.MARGIN_CUSHION_MIN_RATIO):
+        cushion_ratio = (acct.equity / acct.maintenance_margin) if acct.maintenance_margin > 0 else float("inf")
+        log.warning(
+            f"[SYSTEM] Margin cushion {cushion_ratio:.2f}x < {cfg.MARGIN_CUSHION_MIN_RATIO}x minimum "
+            f"(equity ${acct.equity:,.0f} vs maintenance ${acct.maintenance_margin:,.0f}) "
             f"— skipping discovery/scan this cycle (existing stops/TP/concentration checks still ran above)"
         )
         return

@@ -512,6 +512,19 @@ DAILY_PROFIT_TARGET       = 3500.0
 USE_QUARTERLY_TARGET        = True
 QUARTERLY_PROFIT_TARGET_PCT = 50.0   # Halt new entries once +50% equity this quarter
 
+# 2026-08-12, user request: protect against an Alpaca maintenance margin call.
+# Nothing previously tracked maintenance_margin vs equity at all --
+# MIN_BUYING_POWER_PCT only reserves spending buffer for new entries, and
+# MAX_POSITION_CONCENTRATION_PCT/CORRELATION_GROUPS cap individual position/
+# group size, neither watches the account's aggregate margin cushion. Trips
+# when equity falls below MARGIN_CUSHION_MIN_RATIO x maintenance_margin (1.5x
+# = equity has to drop another 33% from here before an actual call at 1.0x).
+# Blocks new entries only (like the daily-loss-limit halt) -- existing
+# positions keep their normal stops/exits, doesn't force a sale at a bad
+# price. See orchestrator._margin_cushion_ok / scan_and_trade.
+MARGIN_SAFEGUARD_ENABLED   = True
+MARGIN_CUSHION_MIN_RATIO   = 1.5
+
 # ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 # Extended Hours Trading
 # ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ

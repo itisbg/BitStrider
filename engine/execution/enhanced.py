@@ -262,6 +262,7 @@ class AccountSnapshot:
     buying_power:        float
     daytrade_count:      int
     pattern_day_trader:  bool = False
+    maintenance_margin:  float = 0.0
     timestamp:           float = field(default=0.0)
 
 
@@ -503,6 +504,7 @@ class EnhancedExecutor:
                 buying_power=float(raw.buying_power),
                 daytrade_count=int(raw.daytrade_count or 0),
                 pattern_day_trader=str(getattr(raw, "pattern_day_trader", False)).lower() in ("1", "true", "yes"),
+                maintenance_margin=float(getattr(raw, "maintenance_margin", None) or 0.0),
                 timestamp=now,
             )
         return self._account_cache
