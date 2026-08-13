@@ -770,8 +770,8 @@ def scan_top3_only(ctx: AppContext) -> None:
 # makes a broker call when _pdt_stop_blocked is non-empty.
 
 def _start_software_stop_thread(ctx: AppContext) -> None:
-    """Spawn a daemon thread that polls check_software_stops() and
-    check_afterhours_stops() every 10 seconds."""
+    """Spawn a daemon thread that polls check_software_stops(),
+    check_afterhours_stops(), and _sweep_force_closes() every 10 seconds."""
     import threading
 
     def _loop() -> None:
@@ -785,6 +785,10 @@ def _start_software_stop_thread(ctx: AppContext) -> None:
                 ctx.executor.check_afterhours_stops()
             except Exception as e:
                 log.error(f"[STOP-THREAD] check_afterhours_stops error: {e}", exc_info=True)
+            try:
+                ctx.executor._sweep_force_closes()
+            except Exception as e:
+                log.error(f"[STOP-THREAD] _sweep_force_closes error: {e}", exc_info=True)
             try:
                 ctx.executor.detect_stopped_out_positions()
             except Exception as e:

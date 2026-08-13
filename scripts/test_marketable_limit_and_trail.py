@@ -152,8 +152,15 @@ try:
     req = ex2.client.orders[-1]
     assert isinstance(req, ee.LimitOrderRequest), f"regular-hours close must be a bounded limit, not {type(req).__name__}"
     assert req.limit_price == 19.90, f"expected 0.5% below the LIVE mid (20.00 -> 19.90), not stale current_price=999; got {req.limit_price}"
-    assert req.extended_hours is False
+    assert req.extended_hours is False, "no override -> falls back to the is_regular_hours-derived flag"
+
+    # force_extended_hours=True (EOD/guardrail force-closes): must survive past
+    # the close even though the call itself happens during regular hours.
+    ex2.client.orders.clear()
+    ex2._submit_closing_order("ZZZ", 5, ee.OrderSide.SELL, current_price=999.0, force_extended_hours=True)
+    req = ex2.client.orders[-1]
+    assert req.extended_hours is True, "force_extended_hours=True must override the regular-hours default"
 finally:
     ee.MarketState = _orig_market_state
 
-print("OK: bounded-limit-price helpers (live mid, 1% bound) and thin-liquidity trailing-stop halving all check out")
+print("OK: bounded-limit-price helpers (live mid, 1% bound), force_extended_hours override, and thin-liquidity trailing-stop halving all check out")

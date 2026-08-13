@@ -294,6 +294,7 @@ class EnhancedExecutor:
         self._pdt_overnight_forced: set = set()  # symbols where PDT also blocks close — forced overnight, no retries
         self._pdt_violation_alerted: bool = False  # tracks whether the PDT violation email has been sent this session
         self._eod_close_done: object = None  # date of last completed EOD close (prevents duplicate runs)
+        self._force_close_pending: Dict[str, dict] = {}  # {symbol: {"reason": str, "chase_count": int}} — EOD/guardrail closes not yet confirmed flat; swept by _sweep_force_closes until filled
         self._stale_exit_done: object = None  # date of last completed swing stale-exit check
         self.market_state: Optional[MarketState] = None
         self._rebuild_entry_log_from_orders()
@@ -1355,14 +1356,21 @@ class EnhancedExecutor:
             except Exception as e:
                 log.warning(f"ratchet_confident_winners {sym}: {e}")
 
-    def _submit_closing_order(self, symbol: str, qty: int, side: OrderSide, current_price: float, slip_pct: float = 0.5) -> None:
+    def _submit_closing_order(
+        self, symbol: str, qty: int, side: OrderSide, current_price: float,
+        slip_pct: float = 0.5, force_extended_hours: bool = False,
+    ) -> None:
         """Submit a position-closing order as a marketable limit crossing the
         spread by slip_pct off the LIVE bid/ask mid (see _live_quote_mid) --
         never a naked MarketOrderRequest during regular hours either
         anymore: same unbounded-spread risk as the entry side (NBIL,
         MARKETABLE_LIMIT_BUFFER_PCT), just on the way out instead of in.
         extended_hours is set whenever we're actually outside regular hours,
-        since Alpaca rejects market orders (and non-extended limits) then.
+        since Alpaca rejects market orders (and non-extended limits) then --
+        force_extended_hours=True overrides that for callers submitted DURING
+        regular hours that still need to survive past the close if unfilled
+        (EOD/guardrail force-closes at 15:45 ET: a plain DAY order expires
+        worthless at 16:00 instead of carrying into the after-hours session).
         Callers that keep missing the fill (fast-moving book) should widen
         slip_pct on retry rather than resubmitting at the same price forever."""
         mid  = _live_quote_mid(self.client, symbol, current_price)
@@ -1370,7 +1378,7 @@ class EnhancedExecutor:
         req = LimitOrderRequest(
             symbol=symbol, qty=qty, side=side, time_in_force=TimeInForce.DAY,
             limit_price=round(mid * slip, 2),
-            extended_hours=not MarketState.from_now().is_regular_hours,
+            extended_hours=force_extended_hours or not MarketState.from_now().is_regular_hours,
         )
         self.client.submit_order(req)
 
@@ -1793,12 +1801,12 @@ class EnhancedExecutor:
                     pass
 
                 side = OrderSide.SELL if qty > 0 else OrderSide.BUY
-                req = MarketOrderRequest(
-                    symbol=sym, qty=abs(qty),
-                    side=side, time_in_force=TimeInForce.DAY,
-                )
-                self.client.submit_order(req)
+                # force_extended_hours=True: submitted during regular hours (15:45 ET)
+                # but must survive past the 16:00 close if unfilled, not expire worthless
+                # -- _sweep_force_closes (below) re-chases it into after-hours if needed.
+                self._submit_closing_order(sym, abs(qty), side, float(pos.current_price), force_extended_hours=True)
                 self._entry_log.pop(sym, None)
+                self._force_close_pending[sym] = {"reason": f"eod:{entry_info.get('strategy', 'unknown')}", "chase_count": 0}
 
                 pnl = float(pos.unrealized_pl)
                 closed_items.append({
@@ -1899,7 +1907,11 @@ class EnhancedExecutor:
 
             close_side = OrderSide.SELL if qty > 0 else OrderSide.BUY
             try:
-                self._submit_closing_order(sym, abs(qty), close_side, float(pos.current_price))
+                # force_extended_hours=True: same reasoning as close_eod_positions --
+                # submitted during regular hours but must survive past 16:00 if
+                # unfilled; _sweep_force_closes re-chases it into after-hours.
+                self._submit_closing_order(sym, abs(qty), close_side, float(pos.current_price), force_extended_hours=True)
+                self._force_close_pending[sym] = {"reason": f"guardrail:{fail_reason}", "chase_count": 0}
                 pnl = float(pos.unrealized_pl)
                 closed_items.append({"symbol": sym, "qty": abs(qty), "reason": fail_reason, "pnl": pnl})
                 log.info(f"GUARDRAIL EOD CLOSE {sym}: {abs(qty)} shares | {fail_reason} | P&L ${pnl:.2f}")
@@ -1918,6 +1930,79 @@ class EnhancedExecutor:
             "asof": now_et.isoformat(),
         }
         return summary
+
+    def _sweep_force_closes(self) -> None:
+        """Poll every symbol close_eod_positions / close_guardrail_fail_positions
+        submitted a close for but hasn't confirmed flat yet (self._force_close_pending).
+        A single limit order can miss its fill -- price drifted past the limit, or
+        it was still resting when the regular/extended session boundary hit --
+        without this the position would just sit open, silently surviving the
+        force-close it was supposed to get. Re-chases with a fresh live-bid/ask
+        limit at escalating slip (same shape as check_afterhours_stops) until
+        it's actually flat. Meant to be polled frequently (the 10s software-stop
+        thread) so it catches a stale order quickly, including after the initial
+        close's regular-hours submit rolls into the after-hours session.
+        ponytail: no cap on total re-chase attempts (only slip% is capped, at
+        3%) -- a genuinely halted/no-bid symbol would retry indefinitely. Add a
+        max-attempts giveup (with an alert) if that's ever observed live."""
+        if not self._force_close_pending:
+            return
+        try:
+            positions   = {p.symbol: p for p in self.client.get_all_positions()}
+            open_orders = self.client.get_orders() or []
+        except Exception as e:
+            log.warning(f"_sweep_force_closes: fetch failed: {e}")
+            return
+
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        orders_by_sym: Dict[str, list] = {}
+        for o in open_orders:
+            orders_by_sym.setdefault(o.symbol, []).append(o)
+
+        for sym, info in list(self._force_close_pending.items()):
+            pos = positions.get(sym)
+            qty = int(float(pos.qty)) if pos is not None else 0
+            if pos is None or qty == 0:
+                self._force_close_pending.pop(sym, None)  # confirmed flat
+                continue
+
+            sym_orders = orders_by_sym.get(sym, [])
+            pending = next((o for o in sym_orders if getattr(o, "time_in_force", None) != TimeInForce.GTC), None)
+            if pending is not None:
+                submitted_at = getattr(pending, "submitted_at", None) or getattr(pending, "created_at", None)
+                age_s = (now_utc - submitted_at).total_seconds() if submitted_at else 0.0
+                if age_s < AFTERHOURS_CHASE_STALE_SECONDS:
+                    continue  # still fresh — give it time to fill
+                try:
+                    self.client.cancel_order_by_id(str(pending.id))
+                    time.sleep(0.4)
+                except Exception as e:
+                    log.warning(f"_sweep_force_closes {sym}: stale-close cancel failed, will retry next poll: {e}")
+                    continue
+
+            # A resting GTC (re-armed as a fallback by another path, or never
+            # cancelled) reserves the qty and would reject the replacement close.
+            gtc = next((o for o in sym_orders if getattr(o, "time_in_force", None) == TimeInForce.GTC), None)
+            if gtc:
+                try:
+                    self.client.cancel_order_by_id(str(gtc.id))
+                    time.sleep(0.4)
+                except Exception as e:
+                    log.warning(f"_sweep_force_closes {sym}: GTC cancel failed, will retry next poll: {e}")
+                    continue
+
+            side = OrderSide.SELL if qty > 0 else OrderSide.BUY
+            try:
+                chase_n  = info.get("chase_count", 0)
+                slip_pct = min(0.5 * (chase_n + 1), 3.0)
+                self._submit_closing_order(sym, abs(qty), side, float(pos.current_price), slip_pct=slip_pct, force_extended_hours=True)
+                info["chase_count"] = chase_n + 1
+                log.warning(
+                    f"FORCE-CLOSE RE-CHASE {sym} [{info.get('reason')}]: unfilled after prior attempt "
+                    f"— resubmitted @ {slip_pct:.1f}% slip (attempt {chase_n + 1})"
+                )
+            except Exception as e:
+                log.error(f"_sweep_force_closes {sym}: re-chase failed: {e}")
 
     # ── Stale Swing Exit ─────────────────────────────────────────────────────
     def _get_entry_date(self, symbol: str) -> Optional[datetime.date]:
