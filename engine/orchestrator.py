@@ -739,6 +739,16 @@ def _guardrail_close_job(ctx: AppContext) -> None:
         log.error(f"close_guardrail_fail_positions error: {e}", exc_info=True)
 
 
+def _price_drift_stop_job(ctx: AppContext) -> None:
+    """schedule-driven wrapper for check_price_drift_stop -- runs on its own
+    PRICE_DRIFT_CHECK_INTERVAL_MIN cadence (30 min) rather than the variable
+    scan-cadence block, same decoupling reasoning as _guardrail_close_job."""
+    try:
+        ctx.executor.check_price_drift_stop()
+    except Exception as e:
+        log.error(f"check_price_drift_stop error: {e}", exc_info=True)
+
+
 def _prune_universe_job() -> None:
     try:
         from .equity.universe import prune as _prune
@@ -900,6 +910,7 @@ def start() -> None:
     schedule.every(30).minutes.do(_prune_universe_job)
     schedule.every(1).minutes.do(_guardrail_close_job, ctx)
     schedule.every(1).minutes.do(_eod_close_job, ctx)
+    schedule.every(cfg.PRICE_DRIFT_CHECK_INTERVAL_MIN).minutes.do(_price_drift_stop_job, ctx)
 
     try:
         while True:

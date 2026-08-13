@@ -42,6 +42,7 @@ from engine.config import (
     ATR_TP_RATIO, MAX_SHORT_FLOAT_PCT, HIGH_SHORT_FLOAT_STOCKS, is_high_short_float,
     EOD_CLOSE_ENABLED, EOD_CLOSE_TIME, EOD_CLOSE_STRATEGIES,
     GUARDRAIL_EOD_CLOSE_ENABLED, GUARDRAIL_EOD_CLOSE_TIME,
+    PRICE_DRIFT_STOP_ENABLED, PRICE_DRIFT_STOP_PCT,
     MIN_AVG_DAILY_VOLUME_REGULAR_HOURS, MIN_FLOAT_SHARES, MIN_MARKET_CAP,
     SWING_STALE_EXIT_ENABLED, SWING_STALE_DAYS, SWING_STALE_MIN_GAIN_PCT,
     NO_GAIN_EXIT_ENABLED, NO_GAIN_EXIT_HOURS, NO_GAIN_EXIT_MIN_PCT, NO_GAIN_EXIT_MAX_LOSS_PCT,
@@ -313,6 +314,7 @@ class EnhancedExecutor:
         self._pdt_violation_alerted: bool = False  # tracks whether the PDT violation email has been sent this session
         self._eod_close_done: object = None  # date of last completed EOD close (prevents duplicate runs)
         self._force_close_pending: Dict[str, dict] = {}  # {symbol: {"reason": str, "chase_count": int}} — EOD/guardrail closes not yet confirmed flat; swept by _sweep_force_closes until filled
+        self._price_drift_snapshot: Dict[str, float] = {}  # {symbol: price at the last check_price_drift_stop run} — the rolling "30 minutes ago" reference
         self._stale_exit_done: object = None  # date of last completed swing stale-exit check
         self.market_state: Optional[MarketState] = None
         self._rebuild_entry_log_from_orders()
@@ -2390,6 +2392,126 @@ class EnhancedExecutor:
             "closed_items": closed_items,
             "failed_items": failed_items,
         }
+
+    # ── Price Drift Stop (30-min, same-day entries) ─────────────────────────
+    @staticmethod
+    def _drift_stop_reason(
+        current: float, entry: float, last_snapshot: Optional[float], is_long: bool, stop_pct: float,
+    ) -> Optional[str]:
+        """Pure decision logic for check_price_drift_stop: return a reason
+        string if the adverse move from EITHER entry OR last_snapshot
+        exceeds stop_pct, else None. Split out for unit-testability without
+        a broker connection. A reference <= 0 (or None) is treated as
+        "no signal from this reference" rather than a false trigger."""
+        def _adverse_pct(reference: Optional[float]) -> float:
+            if reference is None or reference <= 0:
+                return 0.0
+            return ((reference - current) / reference * 100) if is_long else ((current - reference) / reference * 100)
+
+        drift_from_entry    = _adverse_pct(entry)
+        drift_from_snapshot = _adverse_pct(last_snapshot)
+        if drift_from_entry > stop_pct:
+            return f"entry ${entry:.2f}->${current:.2f} ({drift_from_entry:+.1f}%)"
+        if drift_from_snapshot > stop_pct:
+            return f"30min ${last_snapshot:.2f}->${current:.2f} ({drift_from_snapshot:+.1f}%)"
+        return None
+
+    def check_price_drift_stop(self) -> None:
+        """Every PRICE_DRIFT_CHECK_INTERVAL_MIN, exit any same-day position
+        that's moved against it by more than PRICE_DRIFT_STOP_PCT since
+        EITHER entry OR the price recorded the last time this check ran
+        (~30 min ago). Tighter and faster than the normal trailing stop --
+        see the PRICE_DRIFT_STOP block in config.py for why (2026-08-13,
+        confirmed live: DFSC/HLIT/EROC/JACK all bought right at the open,
+        all faded 4-8% before the wider trailing stop caught them). Longs:
+        drop > PRICE_DRIFT_STOP_PCT%. Shorts: rise > PRICE_DRIFT_STOP_PCT%
+        (mirrored). Scoped to same-day entries only (self._entry_log date),
+        not by strategy -- survives the strategy-name loss a restart causes.
+
+        Re-entry cooldown is automatic: detect_stopped_out_positions() (10s
+        thread) applies AFTERHOURS_STOP_COOLDOWN_MIN to ANY position that
+        disappears near a loss, regardless of which path closed it -- no
+        separate cooldown logic needed here."""
+        if not PRICE_DRIFT_STOP_ENABLED:
+            return
+
+        try:
+            positions = self.client.get_all_positions()
+        except Exception as e:
+            log.warning(f"check_price_drift_stop: fetch failed: {e}")
+            return
+
+        today = datetime.date.today()
+        live_syms = set()
+
+        for pos in positions:
+            sym = pos.symbol
+            if re.match(r'^[A-Z]+\d{6}[CP]\d{8}$', sym):
+                continue  # options legs — managed separately
+            qty = int(float(pos.qty))
+            if qty == 0:
+                continue
+
+            entry_info = self._entry_log.get(sym)
+            if not entry_info or entry_info.get("date") != today:
+                continue  # not a same-day entry — out of scope, leave on its normal trailing stop
+
+            live_syms.add(sym)
+            try:
+                current = float(pos.current_price)
+                entry   = float(pos.avg_entry_price)
+            except (TypeError, ValueError):
+                continue
+            if current <= 0 or entry <= 0:
+                continue
+
+            is_long = qty > 0
+            last_snapshot = self._price_drift_snapshot.get(sym)
+            reason = self._drift_stop_reason(current, entry, last_snapshot, is_long, PRICE_DRIFT_STOP_PCT)
+
+            # Refresh the baseline for the next check regardless of outcome —
+            # "30 minutes ago" always means "the last time this ran", not a
+            # fixed reference that never moves.
+            self._price_drift_snapshot[sym] = current
+
+            if reason is None:
+                continue
+
+            try:
+                sym_orders = [o for o in (self.client.get_orders() or []) if o.symbol == sym]
+                for _o in sym_orders:
+                    try:
+                        self.client.cancel_order_by_id(str(_o.id))
+                    except Exception:
+                        pass
+                if sym_orders:
+                    time.sleep(0.4)
+            except Exception as e:
+                log.warning(f"check_price_drift_stop {sym}: order fetch/cancel failed, will retry next cycle: {e}")
+                continue
+
+            side = OrderSide.SELL if is_long else OrderSide.BUY
+            try:
+                self._submit_closing_order(sym, abs(qty), side, current)
+                log.warning(f"PRICE DRIFT STOP {sym}: {abs(qty)} shares | {reason}")
+            except Exception as e:
+                log.error(f"PRICE DRIFT STOP {sym}: close failed: {e}")
+                # The resting GTC was just cancelled above — re-arm a fallback
+                # so the position isn't left fully unprotected.
+                try:
+                    trail_pct, _ = _trail_pct_for(sym, current, self._entry_log)
+                    self.client.submit_order(TrailingStopOrderRequest(
+                        symbol=sym, qty=abs(qty), side=side,
+                        type=AlpacaOrderType.TRAILING_STOP, time_in_force=TimeInForce.GTC,
+                        trail_percent=trail_pct,
+                    ))
+                    log.warning(f"check_price_drift_stop {sym}: re-armed GTC trailing stop after failed close")
+                except Exception as rearm_err:
+                    log.error(f"check_price_drift_stop {sym}: close failed AND GTC re-arm failed — position may be UNPROTECTED: {rearm_err}")
+
+        # Drop snapshots for symbols no longer held or no longer in scope
+        for sym in [s for s in self._price_drift_snapshot if s not in live_syms]:
+            self._price_drift_snapshot.pop(sym, None)
 
     # ── Kill Mode: Emergency Close All ───────────────────────────────────────
     def emergency_close_all(self, equity: float) -> None:

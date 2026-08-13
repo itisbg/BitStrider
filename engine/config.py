@@ -580,6 +580,28 @@ GUARDRAIL_EOD_CLOSE_ENABLED = True
 GUARDRAIL_EOD_CLOSE_TIME    = EOD_CLOSE_TIME   # fires alongside close_eod_positions
 
 # ─────────────────────────────────────────────────────────────────
+# Price Drift Stop (30-min check, same-day entries only)
+# 2026-08-13, user request: this morning's losses shared a common pattern --
+# bought right after the open on a gap/momentum signal, then faded back as
+# the pop unwound, giving back 4-8% before the normal trailing stop (set by
+# protect_positions() at the strategy's dynamic tier) finally caught it.
+# Confirmed live: DFSC, HLIT, EROC, JACK all bought within the first 20 min
+# of the 2026-08-13 open, all gave back most of their gain before the wider
+# stop fired. This is a tighter, faster check layered on top: every
+# PRICE_DRIFT_CHECK_INTERVAL_MIN, compare current price against BOTH the
+# entry price and the price recorded the last time this check ran (~30 min
+# ago) -- exit if either move exceeds PRICE_DRIFT_STOP_PCT against the
+# position (longs: drop > 1%; shorts: rise > 1%, mirrored). Scoped to
+# same-day entries only (user's choice) -- a multi-day swing hold is
+# expected to tolerate more than 1% noise on the way to a bigger target, and
+# scoping by entry date, not strategy, survives the strategy-name loss a
+# process restart causes (see _rebuild_entry_log_from_orders).
+# ─────────────────────────────────────────────────────────────────
+PRICE_DRIFT_STOP_ENABLED       = True
+PRICE_DRIFT_STOP_PCT           = 1.0    # % adverse move (from entry OR from the last check) that triggers an exit
+PRICE_DRIFT_CHECK_INTERVAL_MIN = 30
+
+# ─────────────────────────────────────────────────────────────────
 # Swing Position Staleness Exit
 # Positions held by strategies NOT in EOD_CLOSE_STRATEGIES (Momentum,
 # Technical, etc.) are meant to ride a trend via the GTC trailing stop rather
