@@ -544,15 +544,17 @@ EOD_CLOSE_STRATEGIES = {         # Strategy names that must be closed same day
 
 # ─────────────────────────────────────────────────────────────────
 # Guardrail-Fail Overnight Exit
-# 2026-08-12, user request: 5 min before close, force-close ANY open position
-# (any strategy, not just EOD_CLOSE_STRATEGIES) that currently fails the
-# standard liquidity/quality guardrails — avg daily volume, float shares,
-# market cap (same thresholds the live scanner uses: MIN_AVG_DAILY_VOLUME_
-# REGULAR_HOURS, MIN_FLOAT_SHARES, MIN_MARKET_CAP). Only names that still
-# pass those guardrails get held after-hours/overnight.
+# 2026-08-12, user request: force-close ANY open position (any strategy, not
+# just EOD_CLOSE_STRATEGIES) that currently fails the standard liquidity/
+# quality guardrails — avg daily volume, float shares, market cap (same
+# thresholds the live scanner uses: MIN_AVG_DAILY_VOLUME_REGULAR_HOURS,
+# MIN_FLOAT_SHARES, MIN_MARKET_CAP). Only names that still pass those
+# guardrails get held after-hours/overnight. Originally 15:55 (5 min before
+# close); aligned to EOD_CLOSE_TIME same day at the user's request so both
+# EOD closes fire together.
 # ─────────────────────────────────────────────────────────────────
 GUARDRAIL_EOD_CLOSE_ENABLED = True
-GUARDRAIL_EOD_CLOSE_TIME    = "15:55"   # 5 min before the 16:00 ET close
+GUARDRAIL_EOD_CLOSE_TIME    = EOD_CLOSE_TIME   # fires alongside close_eod_positions
 
 # ─────────────────────────────────────────────────────────────────
 # Swing Position Staleness Exit
