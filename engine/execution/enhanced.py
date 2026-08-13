@@ -54,7 +54,7 @@ from engine.config import (
     SMALL_ACCOUNT_MIN_POSITION_DOLLARS,
     POSITION_SIZE_PCT, SMALL_ACCOUNT_POSITION_SIZE_PCT,
     CONF_SCALE_MIN_MULT, CONF_SCALE_FULL_CONF,
-    HIGH_CONFIDENCE_BONUS_THRESHOLD, HIGH_CONFIDENCE_BONUS_PCT,
+    HIGH_CONFIDENCE_BONUS_THRESHOLD, HIGH_CONFIDENCE_BONUS_MULT,
     CONF_RATCHET_ENABLED, CONF_RATCHET_TRIGGER_GAIN_PCT, CONF_RATCHET_MAX_TIGHTEN,
     MOMENTUM_FRESHNESS_ENABLED, MOMENTUM_FRESHNESS_STRATEGIES,
     MOMENTUM_FRESHNESS_LOOKBACK_MIN, MOMENTUM_FRESHNESS_MAX_PULLBACK_PCT,
@@ -183,14 +183,15 @@ def _apply_high_confidence_bonus(risk_info: Dict, confidence: float, equity: flo
     """2026-08-13, user request: confidence-scaling (_execute_entry's
     CONF_SCALE_MIN_MULT..CONF_SCALE_FULL_CONF ramp) plateaus at 1.0x for any
     confidence >= 85% -- 85% and 99% get sized identically. This adds one
-    more tier: a flat +HIGH_CONFIDENCE_BONUS_PCT points on top of whatever
-    allocation_pct is already, for confidence strictly above
-    HIGH_CONFIDENCE_BONUS_THRESHOLD (92%). Returns risk_info unchanged
-    otherwise. Applied before _apply_thin_liquidity_override in the caller,
-    which fully overrides -- not stacks with -- either scaling step."""
+    more tier: allocation_pct x HIGH_CONFIDENCE_BONUS_MULT (7.5% -> 11.25%
+    at the default 1.5x -- a multiplier, not a flat point-add: "7.5 to 11%
+    not 9") for confidence strictly above HIGH_CONFIDENCE_BONUS_THRESHOLD
+    (92%). Returns risk_info unchanged otherwise. Applied before
+    _apply_thin_liquidity_override in the caller, which fully overrides --
+    not stacks with -- either scaling step."""
     if confidence <= HIGH_CONFIDENCE_BONUS_THRESHOLD:
         return risk_info
-    bonus_pct = risk_info["allocation_pct"] + HIGH_CONFIDENCE_BONUS_PCT
+    bonus_pct = risk_info["allocation_pct"] * HIGH_CONFIDENCE_BONUS_MULT
     return dict(risk_info, allocation_pct=bonus_pct, dollar_amount=round(equity * bonus_pct / 100.0, 2))
 
 
