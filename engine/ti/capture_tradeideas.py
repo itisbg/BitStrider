@@ -178,6 +178,29 @@ DROPDOWN_REFRESH_SEC = 2
 _edge_driver: Optional["webdriver.Edge"] = None
 
 
+def _installed_edge_version() -> Optional[str]:
+    """Full version string (e.g. '151.0.4129.78') of the installed msedge.exe,
+    or None if it can't be determined. See _find_existing_edgedriver below for
+    why this matters."""
+    import subprocess, os
+    for env_var in ("ProgramFiles(x86)", "ProgramFiles"):
+        base = os.environ.get(env_var)
+        if not base:
+            continue
+        candidate = os.path.join(base, "Microsoft", "Edge", "Application", "msedge.exe")
+        if os.path.isfile(candidate):
+            try:
+                out = subprocess.run(
+                    [candidate, "--version"], capture_output=True, text=True, timeout=10
+                ).stdout
+                parts = out.strip().split()  # "Microsoft Edge 151.0.4129.78" -> last token
+                if parts:
+                    return parts[-1]
+            except Exception:
+                return None
+    return None
+
+
 def _find_existing_edgedriver() -> Optional[str]:
     """Locate msedgedriver.exe — checks repo .drivers/ first, then ~/.wdm cache."""
     import glob, os
@@ -206,9 +229,37 @@ def _find_existing_edgedriver() -> Optional[str]:
         ):
             candidates.extend(glob.glob(pattern, recursive=True))
     candidates = [c for c in candidates if os.path.isfile(c)]
-    if candidates:
-        return max(candidates, key=lambda p: os.path.getmtime(p))
-    return None
+    if not candidates:
+        return None
+
+    # 2026-08-13: picking the newest-by-mtime candidate silently kept handing
+    # back a driver for an Edge version that no longer exists once Edge
+    # auto-updates in the background (confirmed live: browser auto-updated
+    # 151.0.4129.59 -> .78, cache still only had .59) -- every launch then
+    # failed with "session not created: Chrome instance exited", the classic
+    # driver/browser version-mismatch symptom, in a loop with nothing to
+    # break it since the stale driver just kept winning the mtime race
+    # forever. Filter to drivers whose cache path actually matches the
+    # currently-installed Edge version; if none match, return None so the
+    # caller falls through to EdgeChromiumDriverManager().install(), which
+    # fetches (and re-caches) a version-correct driver over the network.
+    return _select_cached_driver(candidates, _installed_edge_version())
+
+
+def _select_cached_driver(candidates: list, installed_version: Optional[str]) -> Optional[str]:
+    """Pure selection logic split out of _find_existing_edgedriver for
+    testability: given real cached-driver file paths and the currently-
+    installed Edge version (or None if unknown), pick which cached driver
+    (if any) is safe to reuse."""
+    import os
+    if not candidates:
+        return None
+    if installed_version:
+        matching = [c for c in candidates if installed_version in c]
+        if matching:
+            return max(matching, key=lambda p: os.path.getmtime(p))
+        return None  # every cached driver is for a stale Edge version
+    return max(candidates, key=lambda p: os.path.getmtime(p))  # version unknown — best-effort fallback
 
 
 def _is_driver_alive(driver: "webdriver.Edge") -> bool:
