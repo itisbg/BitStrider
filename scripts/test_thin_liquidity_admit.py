@@ -1,13 +1,21 @@
-"""Self-check for the thin-liquidity rejected-list trading path (2026-08-12).
+"""Self-check for the thin-liquidity rejected-list trading path (2026-08-12,
+widened 2026-08-13).
 
-At the user's request: the low_float/avg_volume guardrails in
-_passes_guardrails() are UNCHANGED and still reject these symbols exactly as
-before (counted in [GUARDRAIL SUMMARY] same as always). This adds a
-separate, toggleable path (TRADE_THIN_LIQUIDITY_REJECTS, off by default) that
-re-admits a symbol rejected for ONLY those two reasons, sized at a flat
-THIN_LIQUIDITY_POSITION_SIZE_PCT (3%) instead of the normal POSITION_SIZE_PCT
--- confidence-scaling included, not stacked on top of it. min_price, RVOL,
-dollar_vol, market cap, and gap_chase rejections are never rescued.
+At the user's request: the guardrails in _passes_guardrails() are UNCHANGED
+and still reject these symbols exactly as before (counted in [GUARDRAIL
+SUMMARY] same as always). This adds a separate, toggleable path
+(TRADE_THIN_LIQUIDITY_REJECTS, off by default) that re-admits a rejected
+symbol during regular hours, sized at a flat THIN_LIQUIDITY_POSITION_SIZE_PCT
+(3%) instead of the normal POSITION_SIZE_PCT -- confidence-scaling included,
+not stacked on top of it.
+
+2026-08-13, user request ("no guard rails for ANY scanner during intra day",
+refined same day to "only avoid penny stocks, everything else allow"):
+widened from avg_volume/low_float only to every guardrail reason EXCEPT
+min_price (RVOL, dollar_vol, gap_chase, market cap included; penny stocks
+stay hard-blocked) -- the overnight boundary is still fully enforced by
+close_guardrail_fail_positions regardless of what got waived at entry, see
+engine/execution/enhanced.py.
 
 Run with:
   python scripts/test_thin_liquidity_admit.py
@@ -40,12 +48,13 @@ scan.TRADE_THIN_LIQUIDITY_REJECTS = False
 for reason in ("avg_volume", "low_float", "min_price", "rvol", "dollar_vol", "low_mcap", "gap_chase", "other", None):
     assert scan._should_admit_thin_liquidity(reason, _regular) is False, f"toggle off should never admit ({reason})"
 
-# Toggle on, regular hours -> only avg_volume/low_float get admitted; everything
-# else guardrail-related still isn't rescued.
+# Toggle on, regular hours -> every real guardrail reason gets admitted
+# EXCEPT min_price (penny stocks stay hard-blocked) and 'other' (not a
+# guardrail at all).
 scan.TRADE_THIN_LIQUIDITY_REJECTS = True
-assert scan._should_admit_thin_liquidity("avg_volume", _regular) is True
-assert scan._should_admit_thin_liquidity("low_float", _regular) is True
-for reason in ("min_price", "rvol", "dollar_vol", "low_mcap", "gap_chase", "other", None):
+for reason in ("avg_volume", "low_float", "rvol", "dollar_vol", "low_mcap", "gap_chase"):
+    assert scan._should_admit_thin_liquidity(reason, _regular) is True, f"{reason} should be rescued intraday"
+for reason in ("min_price", "other", None):
     assert scan._should_admit_thin_liquidity(reason, _regular) is False, f"should not rescue {reason} even with the toggle on"
 
 # 2026-08-13: toggle on, but OUTSIDE regular hours -> never admits, even for

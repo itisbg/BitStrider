@@ -864,31 +864,43 @@ MIN_FLOAT_SHARES_REGULAR_HOURS = 20_000_000  # 60+ min into regular hours — lo
 MIN_AVG_DAILY_VOLUME     = 1_000_000   # pre-open / first hour / after-hours — unchanged
 MIN_AVG_DAILY_VOLUME_REGULAR_HOURS = 700_000  # 60+ min into regular hours — rescues near-misses (BCAX 721K, SEZL 692K)
 
-# 2026-08-12, user request: the low_float/avg_volume guardrails above are
-# UNCHANGED and still reject these symbols exactly as before (counted in
-# [GUARDRAIL SUMMARY] same as always) -- this is a separate, toggleable path
-# that re-admits a symbol rejected for ONLY those two reasons (min_price,
-# RVOL, dollar_vol, market cap, gap_chase are untouched and still block
-# outright), sized at THIN_LIQUIDITY_POSITION_SIZE_PCT instead of the normal
+# 2026-08-12, user request: the guardrails above are UNCHANGED and still
+# reject these symbols exactly as before (counted in [GUARDRAIL SUMMARY] same
+# as always) -- this is a separate, toggleable path that re-admits a rejected
+# symbol, sized at THIN_LIQUIDITY_POSITION_SIZE_PCT instead of the normal
 # POSITION_SIZE_PCT. Off by default -- flip TRADE_THIN_LIQUIDITY_REJECTS to
 # switch it on. Gives exposure to below-the-floor names that are genuinely
 # liquid (HTZ/RUM/NN-style) without betting full size on the ones that turn
 # out thin (PLAG-style: passes on paper, 154 shares traded in a 30-min bar
 # at the highs) -- a flat 3% caps the downside on the latter either way.
+#
+# 2026-08-13, user request ("no guard rails for ANY scanner during intra
+# day... check before closing end of day if the tickers pass guardrail, keep
+# them overnight" -- refined same day to "only avoid penny stocks, everything
+# else allow during intraday trading"): widened from avg_volume/low_float
+# only to every guardrail reason except min_price (RVOL, dollar_vol,
+# gap_chase, market cap included -- penny stocks stay hard-blocked; see
+# _ALL_GUARDRAIL_REASONS in scan.py). The overnight boundary is still fully
+# enforced regardless of what got waived at entry: close_guardrail_fail_
+# positions checks every open position against avg_volume/float/mcap at
+# 15:45 ET and force-closes anything still failing, same as before this
+# widening -- that's the "check before closing end of day" half of the ask,
+# already built. This just stops the entry-side gate from being stricter
+# than the exit-side one when the position is getting flattened by the
+# close regardless of how it got in.
 TRADE_THIN_LIQUIDITY_REJECTS     = True   # master switch for this path — enabled 2026-08-12 at the user's request
 THIN_LIQUIDITY_POSITION_SIZE_PCT = 3.0
 
-# 2026-08-12, user request: these names already failed a liquidity guardrail,
-# so hold them on a shorter leash for their whole life too, not just a
-# smaller size at entry -- every trailing-stop placement/re-place/tighten for
-# a thin_liquidity=True symbol (entry bracket, protect_positions, ratchet
+# 2026-08-12, user request: these names already failed a guardrail, so hold
+# them on a shorter leash for their whole life too, not just a smaller size
+# at entry -- every trailing-stop placement/re-place/tighten for a
+# thin_liquidity=True symbol (entry bracket, protect_positions, ratchet
 # tightening, after-hours virtual-stop, all re-arm fallbacks) uses HALF the
 # normal dynamic-tier trail% instead of the tier's own value. See
 # _trail_pct_for() in enhanced.py -- one shared helper, not 6 special cases.
-# NOTE: still scoped to float/avg_volume admits only, same as
-# TRADE_THIN_LIQUIDITY_REJECTS above -- market cap and other guardrail
-# rejections are still hard-blocked at entry, not merely given a tighter
-# stop. Widening the admit scope itself is a separate ask.
+# Scope tracks TRADE_THIN_LIQUIDITY_REJECTS above automatically (both keyed
+# off signal.thin_liquidity) -- as that admit path widened 2026-08-13, this
+# tighter-stop treatment widened with it, no separate change needed here.
 THIN_LIQUIDITY_TRAILING_STOP_MULT = 0.5
 MIN_MARKET_CAP           = 100_000_000 # Skip micro-caps below $100M
 

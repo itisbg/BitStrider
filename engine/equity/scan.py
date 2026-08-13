@@ -149,15 +149,28 @@ def _effective_liquidity_floors(market_state: Optional[MarketState], now_et: Opt
     return MIN_FLOAT_SHARES, MIN_AVG_DAILY_VOLUME
 
 
+# Every guardrail-rejection reason _passes_guardrails() can return that this
+# path is allowed to rescue. Deliberately excludes two things:
+#   - 'other': not a guardrail at all, the catch-all for non-guardrail skips
+#     (stale data, symbol errors, etc.) this path was never meant to override.
+#   - 'min_price': penny stocks stay hard-blocked even intraday, 2026-08-13
+#     user request ("only avoid penny stocks") -- the one guardrail reason
+#     that's about instrument quality (poor fill quality, wide spreads on
+#     sub-MIN_STOCK_PRICE names) rather than liquidity/volume/momentum
+#     thresholds this widening is meant to relax.
+_ALL_GUARDRAIL_REASONS = frozenset({
+    'dollar_vol', 'rvol', 'gap_chase', 'avg_volume', 'low_float', 'low_mcap',
+})
+
+
 def _should_admit_thin_liquidity(reason: Optional[str], market_state: Optional[MarketState] = None) -> bool:
     """True if a _passes_guardrails() rejection reason should be re-admitted
     (sized down via THIN_LIQUIDITY_POSITION_SIZE_PCT) instead of discarded.
 
     2026-08-12, user request, off by default (TRADE_THIN_LIQUIDITY_REJECTS).
-    Only avg_volume/low_float qualify — min_price, RVOL, dollar_vol, market
-    cap, and gap_chase rejections are never rescued by this path. Split out
-    as its own function so this decision is unit-testable without driving
-    the rest of scan_universe()'s threaded scan machinery.
+    Originally only avg_volume/low_float qualified. Split out as its own
+    function so this decision is unit-testable without driving the rest of
+    scan_universe()'s threaded scan machinery.
 
     2026-08-13, user request ("no stocks to be held or traded overnight
     which fail guards"): regular-hours only. NRGV got admitted via this path
@@ -165,13 +178,25 @@ def _should_admit_thin_liquidity(reason: Optional[str], market_state: Optional[M
     guardrail all night until the no-gain-exit rule caught it at 06:37 the
     next morning -- an entry opened outside regular hours IS an overnight
     hold from the moment it fills, with no same-day close_guardrail_fail_
-    positions run left to catch it before the close it already missed. The
-    daytime version of this path is unaffected: a name admitted during
-    regular hours can still get force-closed by close_guardrail_fail_
-    positions at 15:45 ET like any other guardrail-failing position.
+    positions run left to catch it before the close it already missed.
+
+    2026-08-13, user request ("no guard rails for ANY scanner during intra
+    day... check before closing end of day if the tickers pass guardrail,
+    keep them overnight" -- refined same day to "only avoid penny stocks"):
+    widened from avg_volume/low_float to every real guardrail reason except
+    min_price (_ALL_GUARDRAIL_REASONS) -- RVOL, dollar_vol, gap_chase, and
+    market cap are no longer hard-blocked at entry; penny stocks still are.
+    The overnight side already enforces the real safety boundary regardless
+    of which reasons got waived at entry: close_guardrail_fail_positions
+    checks every open position, any strategy, against avg_volume/float/mcap
+    at 15:45 ET and force-closes anything still failing -- that's the "check
+    before closing end of day" the user asked for, already built (2026-08-12
+    guardrail-fail overnight exit feature). This just stops the entry-side
+    gate from being stricter than the exit-side one for intraday trades that
+    are getting flattened by the close regardless.
     market_state=None (caller didn't pass one) fails closed -- no admit.
     """
-    if not (TRADE_THIN_LIQUIDITY_REJECTS and reason in ('avg_volume', 'low_float')):
+    if not (TRADE_THIN_LIQUIDITY_REJECTS and reason in _ALL_GUARDRAIL_REASONS):
         return False
     return bool(market_state and market_state.is_regular_hours)
 
