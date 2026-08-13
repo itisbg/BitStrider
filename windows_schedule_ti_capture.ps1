@@ -30,7 +30,17 @@ $weekdayTrigger.Repetition = $repetition
 
 $trigger = @($logonTrigger, $weekdayTrigger)
 
-$principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:UserName" -LogonType Interactive -RunLevel Highest
+# 2026-08-13: RunLevel Highest (elevated) with no documented reason -- this
+# task only browses a public website and writes to files under the user's
+# own OneDrive folder, nothing here needs admin rights. Confirmed live and
+# repeatedly (Start-ScheduledTask triggered twice on-demand, clean
+# environment both times) that running elevated is actually what breaks it:
+# every elevated run failed "session not created: Chrome instance exited"
+# immediately after the browser window opened -- crashes before ever
+# reaching trade-ideas.com -- while the identical script run from a normal,
+# non-elevated shell succeeded every single time. Dropped to Limited
+# (standard, non-elevated) to match what's actually been working.
+$principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:UserName" -LogonType Interactive -RunLevel Limited
 
 # IgnoreNew: if a run is still going (or wedged) when the next 20-min slot fires,
 # skip that slot rather than piling up overlapping Edge sessions.
