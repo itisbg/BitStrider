@@ -179,25 +179,30 @@ _edge_driver: Optional["webdriver.Edge"] = None
 
 
 def _installed_edge_version() -> Optional[str]:
-    """Full version string (e.g. '151.0.4129.78') of the installed msedge.exe,
-    or None if it can't be determined. See _find_existing_edgedriver below for
-    why this matters."""
-    import subprocess, os
+    """Full version string (e.g. '151.0.4129.78') of the installed Edge, or
+    None if it can't be determined. See _find_existing_edgedriver below for
+    why this matters.
+
+    2026-08-13: `msedge.exe --version` looked like the obvious way to get
+    this and is what a first pass used -- confirmed live it's NOT reliable:
+    Edge is a single-instance app, so a `--version` invocation from a fresh
+    process can hand off to an already-running instance over IPC and exit
+    rc=0 with EMPTY stdout instead of printing anything, silently returning
+    None every time and making the whole version-match check a no-op.
+    Reading the versioned install subdirectory Edge creates next to
+    msedge.exe (Application/<version>/, e.g. Application/151.0.4129.78/)
+    needs no subprocess at all and isn't subject to that IPC handoff."""
+    import re, os
     for env_var in ("ProgramFiles(x86)", "ProgramFiles"):
         base = os.environ.get(env_var)
         if not base:
             continue
-        candidate = os.path.join(base, "Microsoft", "Edge", "Application", "msedge.exe")
-        if os.path.isfile(candidate):
-            try:
-                out = subprocess.run(
-                    [candidate, "--version"], capture_output=True, text=True, timeout=10
-                ).stdout
-                parts = out.strip().split()  # "Microsoft Edge 151.0.4129.78" -> last token
-                if parts:
-                    return parts[-1]
-            except Exception:
-                return None
+        app_dir = os.path.join(base, "Microsoft", "Edge", "Application")
+        if not os.path.isdir(app_dir):
+            continue
+        versions = [d for d in os.listdir(app_dir) if re.fullmatch(r"\d+\.\d+\.\d+\.\d+", d)]
+        if versions:
+            return max(versions, key=lambda v: tuple(int(p) for p in v.split(".")))
     return None
 
 
