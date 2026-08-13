@@ -1984,11 +1984,13 @@ class EnhancedExecutor:
 
             # A resting GTC (re-armed as a fallback by another path, or never
             # cancelled) reserves the qty and would reject the replacement close.
+            gtc_cancelled = False
             gtc = next((o for o in sym_orders if getattr(o, "time_in_force", None) == TimeInForce.GTC), None)
             if gtc:
                 try:
                     self.client.cancel_order_by_id(str(gtc.id))
                     time.sleep(0.4)
+                    gtc_cancelled = True
                 except Exception as e:
                     log.warning(f"_sweep_force_closes {sym}: GTC cancel failed, will retry next poll: {e}")
                     continue
@@ -2005,6 +2007,23 @@ class EnhancedExecutor:
                 )
             except Exception as e:
                 log.error(f"_sweep_force_closes {sym}: re-chase failed: {e}")
+                # GTC is gone and the replacement didn't go through -- without a
+                # fallback the position would sit fully unprotected until the next
+                # poll. Re-arm one now, same as check_afterhours_stops.
+                if gtc_cancelled:
+                    try:
+                        trail_pct, _ = _trail_pct_for(sym, float(pos.current_price), self._entry_log)
+                        self.client.submit_order(TrailingStopOrderRequest(
+                            symbol        = sym,
+                            qty           = abs(qty),
+                            side          = side,
+                            type          = AlpacaOrderType.TRAILING_STOP,
+                            time_in_force = TimeInForce.GTC,
+                            trail_percent = trail_pct,
+                        ))
+                        log.warning(f"_sweep_force_closes {sym}: re-armed GTC trailing stop as fallback after failed re-chase")
+                    except Exception as rearm_err:
+                        log.error(f"_sweep_force_closes {sym}: re-chase failed AND GTC re-arm failed — position may be UNPROTECTED: {rearm_err}")
 
     # ── Stale Swing Exit ─────────────────────────────────────────────────────
     def _get_entry_date(self, symbol: str) -> Optional[datetime.date]:
