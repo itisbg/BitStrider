@@ -678,6 +678,28 @@ def get_adaptive_interval(ctx: AppContext) -> int:
     return interval
 
 
+def _guardrail_close_job(ctx: AppContext) -> None:
+    """schedule-driven wrapper for close_guardrail_fail_positions.
+
+    2026-08-12: this used to run only inside the main scan-cadence block
+    below, gated on the same variable interval (5-60 min depending on
+    VIX/position count) as everything else there. That let the function's
+    own internal 5-min close window (GUARDRAIL_EOD_CLOSE_TIME through
+    16:00 ET) fall entirely between two cycles -- confirmed same-day: one
+    cycle started 15:54:16 ET (too early), the next didn't start until
+    ~16:01 ET (already past the hard 16:00 cutoff), so the window never
+    got checked at all. Running it as its own schedule.every(1).minutes
+    job decouples it from scan cadence -- schedule.run_pending() ticks
+    every 5s in the main loop regardless, so a 1-min job is guaranteed to
+    land inside any 5-min window. The function's own internal gating
+    (time-of-day check + once-per-day done flag) still does the real work;
+    this just guarantees it's actually asked every minute."""
+    try:
+        ctx.executor.close_guardrail_fail_positions()
+    except Exception as e:
+        log.error(f"close_guardrail_fail_positions error: {e}", exc_info=True)
+
+
 def _prune_universe_job() -> None:
     try:
         from .equity.universe import prune as _prune
@@ -833,6 +855,7 @@ def start() -> None:
 
     schedule.every(30).minutes.do(log_status, ctx)
     schedule.every(30).minutes.do(_prune_universe_job)
+    schedule.every(1).minutes.do(_guardrail_close_job, ctx)
 
     try:
         while True:
@@ -880,11 +903,6 @@ def start() -> None:
                         ctx.executor.close_no_gain_positions()
                     except Exception as e:
                         log.error(f"close_no_gain_positions error: {e}", exc_info=True)
-
-                    try:
-                        ctx.executor.close_guardrail_fail_positions()
-                    except Exception as e:
-                        log.error(f"close_guardrail_fail_positions error: {e}", exc_info=True)
 
                     try:
                         scan_and_trade(ctx)
