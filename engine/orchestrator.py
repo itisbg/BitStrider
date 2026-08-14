@@ -788,6 +788,30 @@ def _price_drift_stop_job(ctx: AppContext) -> None:
         log.error(f"check_price_drift_stop error: {e}", exc_info=True)
 
 
+def _schedule_on_clock_grid(interval_min: int, job, *args) -> None:
+    """Register `job` to run at fixed wall-clock marks (:00, :10, :20, ... for
+    interval_min=10) instead of schedule.every(N).minutes, which counts N
+    minutes from whenever this line executes -- i.e. from process start.
+
+    2026-08-14, found while investigating why FFAI's drift-stop check missed
+    a brief dip-and-recover: on a day with this many restarts, each restart
+    re-registered schedule.every(10).minutes fresh, so the first fire landed
+    10 min after THAT restart, not on any fixed grid -- confirmed live,
+    checks landed 11:06, 11:25, 11:41, 11:54 (13-19 min gaps, not a clean
+    10), widening the blind spot between checks. A drift stop is a
+    point-in-time poll, not a continuous high/low tracker, so wider gaps
+    mean more brief moves slip through entirely. This doesn't fix that
+    inherent polling gap, but it does stop restarts from making it worse --
+    every restart now re-aligns to the same clock marks instead of resetting
+    its own independent countdown.
+
+    interval_min must evenly divide 60 (10, 12, 15, 20, 30 ... — 10 is what
+    every caller here actually uses)."""
+    assert 60 % interval_min == 0, f"{interval_min} must evenly divide 60 to land on a fixed grid"
+    for minute in range(0, 60, interval_min):
+        schedule.every().hour.at(f":{minute:02d}").do(job, *args)
+
+
 def _prune_universe_job() -> None:
     try:
         from .equity.universe import prune as _prune
@@ -955,7 +979,7 @@ def start() -> None:
     schedule.every(30).minutes.do(_prune_universe_job)
     schedule.every(1).minutes.do(_guardrail_close_job, ctx)
     schedule.every(1).minutes.do(_eod_close_job, ctx)
-    schedule.every(cfg.PRICE_DRIFT_CHECK_INTERVAL_MIN).minutes.do(_price_drift_stop_job, ctx)
+    _schedule_on_clock_grid(cfg.PRICE_DRIFT_CHECK_INTERVAL_MIN, _price_drift_stop_job, ctx)
 
     try:
         while True:
