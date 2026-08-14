@@ -587,19 +587,28 @@ GUARDRAIL_EOD_CLOSE_TIME    = EOD_CLOSE_TIME   # fires alongside close_eod_posit
 # protect_positions() at the strategy's dynamic tier) finally caught it.
 # Confirmed live: DFSC, HLIT, EROC, JACK all bought within the first 20 min
 # of the 2026-08-13 open, all gave back most of their gain before the wider
-# stop fired. This is a tighter, faster check layered on top: every
-# PRICE_DRIFT_CHECK_INTERVAL_MIN, compare current price against BOTH the
-# entry price and the price recorded the last time this check ran (~30 min
-# ago) -- exit if either move exceeds PRICE_DRIFT_STOP_PCT against the
-# position (longs: drop > 1%; shorts: rise > 1%, mirrored). Scoped to
-# same-day entries only (user's choice) -- a multi-day swing hold is
-# expected to tolerate more than 1% noise on the way to a bigger target, and
-# scoping by entry date, not strategy, survives the strategy-name loss a
+# stop fired. This is a tighter, faster check layered on top: exit if price
+# has moved against the position by more than PRICE_DRIFT_STOP_PCT versus
+# where it was PRICE_DRIFT_LOOKBACK_MIN ago (longs: drop > 1%; shorts: rise
+# > 1%, mirrored).
+#
+# 2026-08-13, refined same day: originally checked every 30 min (comparing
+# against both entry price and the prior check's price) -- narrowed to a
+# single reference (price ~30 min ago only, entry-price leg dropped) and the
+# poll frequency raised to every PRICE_DRIFT_CHECK_INTERVAL_MIN (10 min, to
+# match the TI-scrape cadence) so the 30-min-ago comparison stays accurate
+# without waiting a full 30 min between looks -- a fast 10-15 min collapse
+# (see DFSC/JACK/EROC 2026-08-13, done in under 15 min) has a much better
+# chance of being caught by the next check instead of only the one after.
+# Scoped to same-day entries only (user's choice) -- a multi-day swing hold
+# is expected to tolerate more than 1% noise on the way to a bigger target,
+# and scoping by entry date, not strategy, survives the strategy-name loss a
 # process restart causes (see _rebuild_entry_log_from_orders).
 # ─────────────────────────────────────────────────────────────────
 PRICE_DRIFT_STOP_ENABLED       = True
-PRICE_DRIFT_STOP_PCT           = 1.0    # % adverse move (from entry OR from the last check) that triggers an exit
-PRICE_DRIFT_CHECK_INTERVAL_MIN = 30
+PRICE_DRIFT_STOP_PCT           = 1.0    # % adverse move vs. the price PRICE_DRIFT_LOOKBACK_MIN ago that triggers an exit
+PRICE_DRIFT_CHECK_INTERVAL_MIN = 10     # how often the check runs
+PRICE_DRIFT_LOOKBACK_MIN       = 30     # how far back the comparison price is from ("price from 30 min ago")
 
 # ─────────────────────────────────────────────────────────────────
 # Swing Position Staleness Exit

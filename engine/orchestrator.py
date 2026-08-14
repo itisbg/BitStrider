@@ -741,8 +741,9 @@ def _guardrail_close_job(ctx: AppContext) -> None:
 
 def _price_drift_stop_job(ctx: AppContext) -> None:
     """schedule-driven wrapper for check_price_drift_stop -- runs on its own
-    PRICE_DRIFT_CHECK_INTERVAL_MIN cadence (30 min) rather than the variable
-    scan-cadence block, same decoupling reasoning as _guardrail_close_job."""
+    PRICE_DRIFT_CHECK_INTERVAL_MIN cadence (10 min, matching the TI-scrape
+    cadence) rather than the variable scan-cadence block, same decoupling
+    reasoning as _guardrail_close_job."""
     try:
         ctx.executor.check_price_drift_stop()
     except Exception as e:

@@ -11,7 +11,8 @@ import logging
 import datetime
 import re
 import time
-from typing import Optional, Dict, Tuple
+from collections import deque
+from typing import Optional, Dict, Tuple, Deque
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -43,6 +44,7 @@ from engine.config import (
     EOD_CLOSE_ENABLED, EOD_CLOSE_TIME, EOD_CLOSE_STRATEGIES,
     GUARDRAIL_EOD_CLOSE_ENABLED, GUARDRAIL_EOD_CLOSE_TIME,
     PRICE_DRIFT_STOP_ENABLED, PRICE_DRIFT_STOP_PCT,
+    PRICE_DRIFT_CHECK_INTERVAL_MIN, PRICE_DRIFT_LOOKBACK_MIN,
     MIN_AVG_DAILY_VOLUME_REGULAR_HOURS, MIN_FLOAT_SHARES, MIN_MARKET_CAP,
     SWING_STALE_EXIT_ENABLED, SWING_STALE_DAYS, SWING_STALE_MIN_GAIN_PCT,
     NO_GAIN_EXIT_ENABLED, NO_GAIN_EXIT_HOURS, NO_GAIN_EXIT_MIN_PCT, NO_GAIN_EXIT_MAX_LOSS_PCT,
@@ -314,7 +316,9 @@ class EnhancedExecutor:
         self._pdt_violation_alerted: bool = False  # tracks whether the PDT violation email has been sent this session
         self._eod_close_done: object = None  # date of last completed EOD close (prevents duplicate runs)
         self._force_close_pending: Dict[str, dict] = {}  # {symbol: {"reason": str, "chase_count": int}} — EOD/guardrail closes not yet confirmed flat; swept by _sweep_force_closes until filled
-        self._price_drift_snapshot: Dict[str, float] = {}  # {symbol: price at the last check_price_drift_stop run} — the rolling "30 minutes ago" reference
+        # {symbol: deque of the last N check_price_drift_stop prices, maxlen = PRICE_DRIFT_LOOKBACK_MIN / PRICE_DRIFT_CHECK_INTERVAL_MIN}
+        # deque[0] is the oldest sample kept — the ~PRICE_DRIFT_LOOKBACK_MIN-minutes-ago reference once full.
+        self._price_drift_history: Dict[str, Deque[float]] = {}
         self._stale_exit_done: object = None  # date of last completed swing stale-exit check
         self.market_state: Optional[MarketState] = None
         self._rebuild_entry_log_from_orders()
@@ -2393,40 +2397,37 @@ class EnhancedExecutor:
             "failed_items": failed_items,
         }
 
-    # ── Price Drift Stop (30-min, same-day entries) ─────────────────────────
+    # ── Price Drift Stop (10-min poll, 30-min lookback, same-day entries) ──
     @staticmethod
     def _drift_stop_reason(
-        current: float, entry: float, last_snapshot: Optional[float], is_long: bool, stop_pct: float,
+        current: float, reference: Optional[float], is_long: bool, stop_pct: float,
     ) -> Optional[str]:
         """Pure decision logic for check_price_drift_stop: return a reason
-        string if the adverse move from EITHER entry OR last_snapshot
-        exceeds stop_pct, else None. Split out for unit-testability without
-        a broker connection. A reference <= 0 (or None) is treated as
-        "no signal from this reference" rather than a false trigger."""
-        def _adverse_pct(reference: Optional[float]) -> float:
-            if reference is None or reference <= 0:
-                return 0.0
-            return ((reference - current) / reference * 100) if is_long else ((current - reference) / reference * 100)
-
-        drift_from_entry    = _adverse_pct(entry)
-        drift_from_snapshot = _adverse_pct(last_snapshot)
-        if drift_from_entry > stop_pct:
-            return f"entry ${entry:.2f}->${current:.2f} ({drift_from_entry:+.1f}%)"
-        if drift_from_snapshot > stop_pct:
-            return f"30min ${last_snapshot:.2f}->${current:.2f} ({drift_from_snapshot:+.1f}%)"
+        string if the adverse move versus `reference` (the price
+        PRICE_DRIFT_LOOKBACK_MIN ago) exceeds stop_pct, else None. Split out
+        for unit-testability without a broker connection. reference<=0 or
+        None (not enough history yet) means "no signal", not a false
+        trigger."""
+        if reference is None or reference <= 0:
+            return None
+        drift = ((reference - current) / reference * 100) if is_long else ((current - reference) / reference * 100)
+        if drift > stop_pct:
+            return f"${reference:.2f}->${current:.2f} ({drift:+.1f}% vs {PRICE_DRIFT_LOOKBACK_MIN}min ago)"
         return None
 
     def check_price_drift_stop(self) -> None:
-        """Every PRICE_DRIFT_CHECK_INTERVAL_MIN, exit any same-day position
-        that's moved against it by more than PRICE_DRIFT_STOP_PCT since
-        EITHER entry OR the price recorded the last time this check ran
-        (~30 min ago). Tighter and faster than the normal trailing stop --
-        see the PRICE_DRIFT_STOP block in config.py for why (2026-08-13,
-        confirmed live: DFSC/HLIT/EROC/JACK all bought right at the open,
-        all faded 4-8% before the wider trailing stop caught them). Longs:
-        drop > PRICE_DRIFT_STOP_PCT%. Shorts: rise > PRICE_DRIFT_STOP_PCT%
-        (mirrored). Scoped to same-day entries only (self._entry_log date),
-        not by strategy -- survives the strategy-name loss a restart causes.
+        """Every PRICE_DRIFT_CHECK_INTERVAL_MIN (10 min), exit any same-day
+        position that's moved against it by more than PRICE_DRIFT_STOP_PCT
+        versus its own price PRICE_DRIFT_LOOKBACK_MIN (30 min) ago. Tighter
+        and faster than the normal trailing stop -- see the PRICE_DRIFT_STOP
+        block in config.py for why (2026-08-13, confirmed live: DFSC/HLIT/
+        EROC/JACK all bought right at the open, all faded 4-8% before the
+        wider trailing stop caught them; polling every 10 min instead of 30
+        gives a fast 10-15 min collapse a real chance of being caught by the
+        very next check). Longs: drop > PRICE_DRIFT_STOP_PCT%. Shorts: rise
+        > PRICE_DRIFT_STOP_PCT% (mirrored). Scoped to same-day entries only
+        (self._entry_log date), not by strategy -- survives the strategy-name
+        loss a restart causes.
 
         Re-entry cooldown is automatic: detect_stopped_out_positions() (10s
         thread) applies AFTERHOURS_STOP_COOLDOWN_MIN to ANY position that
@@ -2443,6 +2444,7 @@ class EnhancedExecutor:
 
         today = datetime.date.today()
         live_syms = set()
+        lookback_ticks = max(1, PRICE_DRIFT_LOOKBACK_MIN // PRICE_DRIFT_CHECK_INTERVAL_MIN)
 
         for pos in positions:
             sym = pos.symbol
@@ -2459,20 +2461,23 @@ class EnhancedExecutor:
             live_syms.add(sym)
             try:
                 current = float(pos.current_price)
-                entry   = float(pos.avg_entry_price)
             except (TypeError, ValueError):
                 continue
-            if current <= 0 or entry <= 0:
+            if current <= 0:
                 continue
 
-            is_long = qty > 0
-            last_snapshot = self._price_drift_snapshot.get(sym)
-            reason = self._drift_stop_reason(current, entry, last_snapshot, is_long, PRICE_DRIFT_STOP_PCT)
+            is_long  = qty > 0
+            history  = self._price_drift_history.setdefault(sym, deque(maxlen=lookback_ticks))
+            # deque[0] is the oldest sample once full -- exactly lookback_ticks
+            # checks back, i.e. ~PRICE_DRIFT_LOOKBACK_MIN minutes ago at this
+            # check's own cadence. Not enough history yet -> no reference, skip.
+            reference = history[0] if len(history) == lookback_ticks else None
+            reason = self._drift_stop_reason(current, reference, is_long, PRICE_DRIFT_STOP_PCT)
 
-            # Refresh the baseline for the next check regardless of outcome —
-            # "30 minutes ago" always means "the last time this ran", not a
-            # fixed reference that never moves.
-            self._price_drift_snapshot[sym] = current
+            # Record this check's price regardless of outcome — the deque
+            # naturally evicts the oldest sample once full, keeping the
+            # lookback window rolling forward.
+            history.append(current)
 
             if reason is None:
                 continue
@@ -2509,9 +2514,9 @@ class EnhancedExecutor:
                 except Exception as rearm_err:
                     log.error(f"check_price_drift_stop {sym}: close failed AND GTC re-arm failed — position may be UNPROTECTED: {rearm_err}")
 
-        # Drop snapshots for symbols no longer held or no longer in scope
-        for sym in [s for s in self._price_drift_snapshot if s not in live_syms]:
-            self._price_drift_snapshot.pop(sym, None)
+        # Drop history for symbols no longer held or no longer in scope
+        for sym in [s for s in self._price_drift_history if s not in live_syms]:
+            self._price_drift_history.pop(sym, None)
 
     # ── Kill Mode: Emergency Close All ───────────────────────────────────────
     def emergency_close_all(self, equity: float) -> None:
