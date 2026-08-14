@@ -474,6 +474,14 @@ def _check_kill_mode(ctx: AppContext) -> bool:
     )
 
 
+def _within_entry_window(now_et: datetime.datetime) -> bool:
+    """True if now_et (ET, tz-aware) falls within [ENTRY_WINDOW_START_ET,
+    ENTRY_WINDOW_END_ET]. Pure string-time comparison, same pattern
+    MarketState.from_now() already uses for is_market_open/is_regular_hours."""
+    t = now_et.strftime("%H:%M")
+    return cfg.ENTRY_WINDOW_START_ET <= t <= cfg.ENTRY_WINDOW_END_ET
+
+
 def _margin_cushion_ok(equity: float, maintenance_margin: float, min_ratio: float) -> bool:
     """True if equity is still >= min_ratio x maintenance_margin (safe cushion
     against an Alpaca maintenance margin call). No margin exposure at all
@@ -511,8 +519,19 @@ def scan_and_trade(ctx: AppContext) -> None:
             return
         log.warning("[SYSTEM] FORCE_SCAN active — bypassing market-hours gate")
 
+    # Kill mode has real protective side effects (emergency close on an
+    # extreme-bear trigger) beyond just gating entries, so it must run
+    # unconditionally here -- the entry-window check below only ever blocks
+    # new entries and must not stand in front of it.
     if _check_kill_mode(ctx):
         log.info("[SYSTEM] Kill mode active — aborting cycle")
+        return
+
+    if not _within_entry_window(market_state.now):
+        log.info(
+            f"[SYSTEM] Outside entry window ({cfg.ENTRY_WINDOW_START_ET}-{cfg.ENTRY_WINDOW_END_ET} ET) "
+            f"— skipping discovery/scan this cycle (existing stops/TP/concentration checks still ran above)"
+        )
         return
 
     _session.refresh_daily_pnl(ctx.client)

@@ -518,6 +518,18 @@ DAILY_LOSS_LIMIT_BULL_PCT = 1.0   # Halt if down >1% of start equity in bull reg
 DAILY_LOSS_LIMIT_BEAR_PCT = 2.0   # Halt if down >2% of start equity in bear regime (wider room)
 DAILY_PROFIT_TARGET       = 3500.0
 
+# 2026-08-14, user request: "restrict trading to 7.30am ET to 8pm ET for
+# buying" -- new entries (either direction) only submitted within this ET
+# window. Existing positions are completely unaffected: protect_positions,
+# every close_*/check_*_stop path, and detect_stopped_out_positions all run
+# from the orchestrator main loop regardless of this window, same as they
+# already ignore is_market_open. Deliberately a separate, narrower gate from
+# MarketState.is_market_open (07:00-20:00) rather than tightening that shared
+# flag in place -- is_market_open also drives allocation-split and options-
+# lull-hours logic that isn't part of this ask.
+ENTRY_WINDOW_START_ET = "07:30"
+ENTRY_WINDOW_END_ET   = "20:00"
+
 # Quarterly Profit Target
 USE_QUARTERLY_TARGET        = True
 QUARTERLY_PROFIT_TARGET_PCT = 50.0   # Halt new entries once +50% equity this quarter
