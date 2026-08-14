@@ -60,12 +60,15 @@ for reason in ("avg_volume", "low_float", "min_price", "rvol", "dollar_vol", "lo
     assert scan._should_admit_thin_liquidity(reason, _regular) is False, f"toggle off should never admit ({reason})"
 
 # Toggle on, regular hours -> every real guardrail reason gets admitted
-# EXCEPT min_price (penny stocks stay hard-blocked) and 'other' (not a
-# guardrail at all).
+# EXCEPT min_price (penny stocks stay hard-blocked), avg_volume_hard_floor
+# and low_float_hard_floor (2026-08-14: <200K avg daily volume / <1M float
+# stay hard-blocked too, unlike the rescuable 700K/20M session floors --
+# AEHL, 0.2M float, is exactly the profile these exclude), and 'other'
+# (not a guardrail at all).
 scan.TRADE_THIN_LIQUIDITY_REJECTS = True
 for reason in ("avg_volume", "low_float", "rvol", "dollar_vol", "low_mcap", "gap_chase"):
     assert scan._should_admit_thin_liquidity(reason, _regular) is True, f"{reason} should be rescued intraday"
-for reason in ("min_price", "other", None):
+for reason in ("min_price", "avg_volume_hard_floor", "low_float_hard_floor", "other", None):
     assert scan._should_admit_thin_liquidity(reason, _regular) is False, f"should not rescue {reason} even with the toggle on"
 
 # 2026-08-13: toggle on, but OUTSIDE regular hours -> never admits, even for

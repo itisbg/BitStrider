@@ -48,7 +48,8 @@ from engine.config import (
     SCAN_SYMBOL_TIMEOUT,
     MIN_DOLLAR_VOLUME,
     MIN_FLOAT_SHARES, MIN_FLOAT_SHARES_REGULAR_HOURS,
-    MIN_AVG_DAILY_VOLUME, MIN_AVG_DAILY_VOLUME_REGULAR_HOURS,
+    MIN_AVG_DAILY_VOLUME, MIN_AVG_DAILY_VOLUME_REGULAR_HOURS, MIN_AVG_DAILY_VOLUME_HARD_FLOOR,
+    MIN_FLOAT_SHARES_HARD_FLOOR,
     REGULAR_HOURS_LOOSE_FLOOR_DELAY_MIN,
     MIN_MARKET_CAP,
     MIN_STOCK_PRICE,
@@ -357,6 +358,14 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
         daily = get_daily_volume_bars(symbol)
         if not daily.empty and len(daily) >= 2:
             avg_daily_vol = float(daily["volume"].iloc[:-1].mean())
+            # Absolute floor -- never rescued by the thin-liquidity/stale-
+            # momentum trade-anyway paths, unlike the session-based check
+            # below. See MIN_AVG_DAILY_VOLUME_HARD_FLOOR in config.py.
+            if avg_daily_vol < MIN_AVG_DAILY_VOLUME_HARD_FLOOR:
+                _log.warning(f"[GUARDRAIL] {symbol} blocked: avg daily volume {avg_daily_vol:.0f} < hard floor {MIN_AVG_DAILY_VOLUME_HARD_FLOOR:.0f} (never bypassed)")
+                if return_reason:
+                    return False, 'avg_volume_hard_floor'
+                return False
             if avg_daily_vol < effective_min_avg_vol:
                 _log.warning(f"[GUARDRAIL] {symbol} blocked: avg daily volume {avg_daily_vol:.0f} < {effective_min_avg_vol:.0f}")
                 if return_reason:
@@ -364,11 +373,19 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
                 return False
 
         shares_float = _get_float_shares(symbol)
-        if shares_float is not None and shares_float < effective_min_float:
-            _log.warning(f"[GUARDRAIL] {symbol} blocked: float {shares_float/1e6:.1f}M < {effective_min_float/1e6:.0f}M")
-            if return_reason:
-                return False, 'low_float'
-            return False
+        if shares_float is not None:
+            # Absolute floor -- never rescued, unlike the session-based check
+            # below. See MIN_FLOAT_SHARES_HARD_FLOOR in config.py.
+            if shares_float < MIN_FLOAT_SHARES_HARD_FLOOR:
+                _log.warning(f"[GUARDRAIL] {symbol} blocked: float {shares_float/1e6:.2f}M < hard floor {MIN_FLOAT_SHARES_HARD_FLOOR/1e6:.1f}M (never bypassed)")
+                if return_reason:
+                    return False, 'low_float_hard_floor'
+                return False
+            if shares_float < effective_min_float:
+                _log.warning(f"[GUARDRAIL] {symbol} blocked: float {shares_float/1e6:.1f}M < {effective_min_float/1e6:.0f}M")
+                if return_reason:
+                    return False, 'low_float'
+                return False
 
         market_cap = _get_market_cap(symbol)
         if market_cap is not None and market_cap < MIN_MARKET_CAP:
@@ -555,7 +572,9 @@ def scan_universe(scan_targets: List[str], sentiment: str, market_state: MarketS
         'gap_chase': 0,
         'min_price': 0,
         'avg_volume': 0,
+        'avg_volume_hard_floor': 0,
         'low_float': 0,
+        'low_float_hard_floor': 0,
         'low_mcap': 0,
         'other': 0
     }
@@ -638,7 +657,10 @@ def scan_universe(scan_targets: List[str], sentiment: str, market_state: MarketS
             f"[GUARDRAIL SUMMARY] Rejected: {total_rejected} | DollarVol: {guardrail_rejections['dollar_vol']} | "
             f"RVOL: {guardrail_rejections['rvol']} | GapChase: {guardrail_rejections['gap_chase']} | "
             f"MinPrice: {guardrail_rejections['min_price']} | AvgVolume: {guardrail_rejections['avg_volume']} | "
-            f"LowFloat: {guardrail_rejections['low_float']} | LowMcap: {guardrail_rejections['low_mcap']} | "
+            f"AvgVolHardFloor: {guardrail_rejections['avg_volume_hard_floor']} | "
+            f"LowFloat: {guardrail_rejections['low_float']} | "
+            f"LowFloatHardFloor: {guardrail_rejections['low_float_hard_floor']} | "
+            f"LowMcap: {guardrail_rejections['low_mcap']} | "
             f"Other: {guardrail_rejections['other']}"
             + (f" | ThinLiquidityAdmitted: {thin_liquidity_stats['admitted']}" if thin_liquidity_stats['admitted'] else "")
         )

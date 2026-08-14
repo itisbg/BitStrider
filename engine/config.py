@@ -917,6 +917,27 @@ MIN_FLOAT_SHARES_REGULAR_HOURS = 20_000_000  # 60+ min into regular hours — lo
 MIN_AVG_DAILY_VOLUME     = 1_000_000   # pre-open / first hour / after-hours — unchanged
 MIN_AVG_DAILY_VOLUME_REGULAR_HOURS = 700_000  # 60+ min into regular hours — rescues near-misses (BCAX 721K, SEZL 692K)
 
+# 2026-08-14, user request ("avoid average daily volume below 200K stocks"):
+# an ABSOLUTE floor, never bypassed by TRADE_THIN_LIQUIDITY_REJECTS or
+# TRADE_STALE_MOMENTUM_REJECTS -- unlike MIN_AVG_DAILY_VOLUME_REGULAR_HOURS
+# above (700K, which IS rescuable at reduced size), a symbol below this
+# floor is excluded outright, full stop. Confirmed live same day: AEHL
+# (0.2M float, already down 25.5% off its 30-min high before entry, no
+# protective stop for the first 30 min after a same-day fill) is exactly
+# the profile this exists to keep out. reason 'avg_volume_hard_floor' is
+# deliberately excluded from _ALL_GUARDRAIL_REASONS in scan.py, same as
+# min_price -- never eligible for the reduced-size rescue path.
+MIN_AVG_DAILY_VOLUME_HARD_FLOOR = 200_000
+
+# 2026-08-14, user request ("seems pump and dump easy to manipulate stocks,
+# find some rules that are absolutely not touched"): same treatment for
+# float -- an ABSOLUTE floor, never bypassed by TRADE_THIN_LIQUIDITY_REJECTS,
+# unlike MIN_FLOAT_SHARES_REGULAR_HOURS above (20M, which IS rescuable at
+# reduced size). AEHL (0.2M float) is exactly the profile this excludes.
+# reason 'low_float_hard_floor' deliberately excluded from
+# _ALL_GUARDRAIL_REASONS in scan.py, same as avg_volume_hard_floor/min_price.
+MIN_FLOAT_SHARES_HARD_FLOOR = 1_000_000
+
 # 2026-08-12, user request: the guardrails above are UNCHANGED and still
 # reject these symbols exactly as before (counted in [GUARDRAIL SUMMARY] same
 # as always) -- this is a separate, toggleable path that re-admits a rejected
