@@ -27,6 +27,8 @@ from engine.config import (
     ATR_STOP_MULTIPLIER, ATR_TP_RATIO, HIGH_SHORT_FLOAT_STOCKS, is_high_short_float,
     PRE_MARKET_MOMENTUM, OPENING_BELL_SURGE, PM_HIGH_BREAKOUT, EARLY_SQUEEZE, BEAR_BREAKDOWN,
     SENTIMENT_STRATEGY,
+    MOMENTUM_ENABLED, SENTIMENT_ENABLED, LIQUIDITY_SWEEP_ENABLED,
+    PRE_MARKET_MOMENTUM_ENABLED, PM_HIGH_BREAKOUT_ENABLED, TECHNICAL_ENABLED,
 )
 
 ET = pytz.timezone("America/New_York")
@@ -1247,23 +1249,30 @@ def get_strategy_instances(bull_regime: bool = True):
         GapBreakoutStrategy(),
         ORBStrategy(),
         VWAPReclaimStrategy(),
-        LiquiditySweepStrategy(),
         FloatRotationStrategy(),
-        MomentumStrategy(),
-        TechnicalStrategy(),
         TrendBreakerStrategy(),
-        SentimentStrategy(),
-        PreMarketMomentumStrategy(),
         OpeningBellSurgeStrategy(),
-        PMHighBreakoutStrategy(),
         EarlySqueezeDetector(),
         PowerOf3Strategy(),
     ]
 
     # 2026-08-14: disabled — backtested net-negative at every confidence
-    # level (see VWAP_FADE_ENABLED in config.py for the numbers).
+    # level, same as VWAPFade below (see the toggles' block in config.py
+    # for the numbers behind each one).
     if VWAP_FADE_ENABLED:
         strategies.append(VWAPFadeStrategy())
+    if MOMENTUM_ENABLED:
+        strategies.append(MomentumStrategy())
+    if TECHNICAL_ENABLED:
+        strategies.append(TechnicalStrategy())
+    if SENTIMENT_ENABLED:
+        strategies.append(SentimentStrategy())
+    if PRE_MARKET_MOMENTUM_ENABLED:
+        strategies.append(PreMarketMomentumStrategy())
+    if PM_HIGH_BREAKOUT_ENABLED:
+        strategies.append(PMHighBreakoutStrategy())
+    if LIQUIDITY_SWEEP_ENABLED:
+        strategies.append(LiquiditySweepStrategy())
 
     # Only add bear-regime strategies when we are actually in a bear regime
     if not bull_regime:

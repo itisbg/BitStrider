@@ -766,6 +766,35 @@ BEAR_SHORT_TARGET_RESERVE = 30  # In bear regime, reserve more scan slots for sh
 # ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 # Strategy Parameters
 # ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+# ─────────────────────────────────────────────────────────────────
+# Strategy enable/disable toggles — 2026-08-14, at the user's request:
+# backtested every strategy's matched entry/exit trades since each went
+# live, bucketed by confidence (same methodology as VWAP_FADE_ENABLED
+# below). User's rule: disable anything with an overall win rate below
+# VWAPFade's own 37% (already disabled) — EXCEPT don't judge a strategy
+# on fewer than 10 completed trades, too early to call. Confidence
+# gating doesn't rescue either of the two that clear that bar — same
+# finding as VWAPFade, no winning bucket even at their own ceiling:
+#   Momentum           n=25  20% win  -1.73% avg  (worst bucket, 90%+: -2.19%)
+#   PreMarketMomentum  n=25  32% win  -1.60% avg  (90%+: -1.47%)
+# Below the n=10 floor — win rate not trustworthy yet, left enabled:
+#   Sentiment          n=9   22% win  +0.54% avg
+#   LiquiditySweep     n=4   25% win  -0.80% avg
+#   PMHighBreakout     n=3   33% win  -2.82% avg
+#   Technical          n=3    0% win  -3.33% avg
+# FloatRotation (n=35, 37% win, -1.35% avg) sits exactly AT 37%, not
+# below it — also left enabled pending an explicit call on that tie.
+# Strategy code and tuning params below are untouched for all of these;
+# flip a flag to True to re-enable / False to disable. See
+# scripts/test_strategy_toggles.py.
+# ─────────────────────────────────────────────────────────────────
+MOMENTUM_ENABLED            = False
+SENTIMENT_ENABLED           = True
+LIQUIDITY_SWEEP_ENABLED     = True
+PRE_MARKET_MOMENTUM_ENABLED = False
+PM_HIGH_BREAKOUT_ENABLED    = True
+TECHNICAL_ENABLED           = True
+
 TECHNICAL = {
     "rsi_oversold":   30,
     "rsi_overbought": 70,
