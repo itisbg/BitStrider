@@ -2548,6 +2548,25 @@ class EnhancedExecutor:
             return f"${reference:.2f}->${current:.2f} ({drift:+.1f}% vs {PRICE_DRIFT_LOOKBACK_MIN}min ago)"
         return None
 
+    def _backfill_drift_reference(self, symbol: str) -> Optional[float]:
+        """When _price_drift_history has no rolling history yet for symbol
+        (a fresh position, or a restart wiped it), reconstruct an
+        approximate PRICE_DRIFT_LOOKBACK_MIN-minutes-ago reference from real
+        1-min bar data instead of leaving the position with zero drift
+        protection until PRICE_DRIFT_LOOKBACK_MIN more minutes of in-memory
+        history rebuilds on its own. Same "row N back ~= N minutes ago"
+        approximation _check_momentum_freshness already uses. Returns None
+        if bars are unavailable -- missing data never forces a decision,
+        same fail-safe as everywhere else in this file."""
+        try:
+            bars = get_bars(symbol, period="1d", interval="1m")
+            if bars.empty or "close" not in bars.columns or len(bars) <= PRICE_DRIFT_LOOKBACK_MIN:
+                return None
+            return float(bars["close"].iloc[-1 - PRICE_DRIFT_LOOKBACK_MIN])
+        except Exception as e:
+            log.warning(f"_backfill_drift_reference {symbol}: failed: {e}")
+            return None
+
     def check_price_drift_stop(self) -> None:
         """Every PRICE_DRIFT_CHECK_INTERVAL_MIN (10 min), exit any same-day
         position that's moved against it by more than PRICE_DRIFT_STOP_PCT
@@ -2603,8 +2622,14 @@ class EnhancedExecutor:
             history  = self._price_drift_history.setdefault(sym, deque(maxlen=lookback_ticks))
             # deque[0] is the oldest sample once full -- exactly lookback_ticks
             # checks back, i.e. ~PRICE_DRIFT_LOOKBACK_MIN minutes ago at this
-            # check's own cadence. Not enough history yet -> no reference, skip.
-            reference = history[0] if len(history) == lookback_ticks else None
+            # check's own cadence. Not enough history yet (a fresh position, OR
+            # a restart wiped it -- confirmed live 2026-08-14: TE entered
+            # 09:33, the bot restarted twice before 30 clean minutes had
+            # elapsed, so the in-memory history never rebuilt and TE sat with
+            # zero drift protection past an hour while down -2.8%) -- backfill
+            # an approximate reference from real 1-min bar data instead of
+            # leaving the position unwatched until history rebuilds on its own.
+            reference = history[0] if len(history) == lookback_ticks else self._backfill_drift_reference(sym)
             reason = self._drift_stop_reason(current, reference, is_long, PRICE_DRIFT_STOP_PCT)
 
             # Record this check's price regardless of outcome — the deque
