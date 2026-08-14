@@ -22,7 +22,8 @@ from typing import Optional
 
 from engine.utils import get_bars, calc_rsi, calc_macd, get_premarket_bars
 from engine.config import (
-    TECHNICAL, MOMENTUM, GAP_BREAKOUT, ORB, VWAP_RECLAIM, VWAP_FADE, LIQUIDITY_SWEEP, FLOAT_ROTATION, LONG_ONLY_MODE,
+    TECHNICAL, MOMENTUM, GAP_BREAKOUT, ORB, VWAP_RECLAIM, VWAP_FADE, VWAP_FADE_ENABLED,
+    LIQUIDITY_SWEEP, FLOAT_ROTATION, LONG_ONLY_MODE,
     ATR_STOP_MULTIPLIER, ATR_TP_RATIO, HIGH_SHORT_FLOAT_STOCKS, is_high_short_float,
     PRE_MARKET_MOMENTUM, OPENING_BELL_SURGE, PM_HIGH_BREAKOUT, EARLY_SQUEEZE, BEAR_BREAKDOWN,
     SENTIMENT_STRATEGY,
@@ -1246,7 +1247,6 @@ def get_strategy_instances(bull_regime: bool = True):
         GapBreakoutStrategy(),
         ORBStrategy(),
         VWAPReclaimStrategy(),
-        VWAPFadeStrategy(),
         LiquiditySweepStrategy(),
         FloatRotationStrategy(),
         MomentumStrategy(),
@@ -1259,6 +1259,11 @@ def get_strategy_instances(bull_regime: bool = True):
         EarlySqueezeDetector(),
         PowerOf3Strategy(),
     ]
+
+    # 2026-08-14: disabled — backtested net-negative at every confidence
+    # level (see VWAP_FADE_ENABLED in config.py for the numbers).
+    if VWAP_FADE_ENABLED:
+        strategies.append(VWAPFadeStrategy())
 
     # Only add bear-regime strategies when we are actually in a bear regime
     if not bull_regime:

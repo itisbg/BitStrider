@@ -816,7 +816,18 @@ VWAP_RECLAIM = {
 # VWAP Fade Strategy (mean reversion — counter-play to VWAP Reclaim's
 # continuation bet, for range/chop days where continuation entries just
 # grind into stops)
+#
+# 2026-08-14, disabled at the user's request after a backtest of every
+# VWAPFade trade since it went live (89 matched entry/exit pairs,
+# 2026-08-03 -> today, joined against each signal's logged confidence):
+# net-negative at EVERY confidence bucket tested (37% win rate, -0.85%
+# avg P&L overall), and the 90%+ bucket -- its own ceiling -- was the
+# WORST bucket (22% win rate), not the best. Confidence has no predictive
+# value for this strategy's outcomes, so gating it higher (the user's
+# original ask was ">=95%, and it's never logged above 90% anyway) can't
+# fix it. See scripts/test_vwap_fade_disabled.py.
 # ─────────────────────────────────────────────────────────────────
+VWAP_FADE_ENABLED = False
 VWAP_FADE = {
     "zscore_threshold": 1.5,   # price must be this many session std-devs from VWAP
     "min_stretch_pct":  1.5,   # ...and at least this far away in raw % terms
