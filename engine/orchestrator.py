@@ -448,10 +448,28 @@ def _execute_bull_plan(
     daily_loss_limit: float,
     loss_pct: float,
 ) -> None:
-    """Bull (or neutral) regime: execute top-N eligible signals by confidence."""
-    top_signals = sorted(eligible, key=lambda s: s.confidence, reverse=True)[:signals_cap]
-    log.info(f"Executing top {len(top_signals)} signal(s) (cap={signals_cap})")
-    for sig in top_signals:
+    """Bull (or neutral) regime: try eligible signals ranked by confidence,
+    highest first, until signals_cap of them actually SUCCEED (or the list
+    runs out) -- not just attempt the top signals_cap once each.
+
+    2026-08-14, user request ("we should have seen multiple stock picks"):
+    the old version sliced to the top signals_cap candidates BEFORE
+    attempting anything, so if the top-ranked ones all failed for any reason
+    (momentum freshness, hard-to-borrow, insufficient buying power...) the
+    cycle wasted its whole budget on failures and never even looked at the
+    next-ranked candidates. Confirmed live: 5 signals at 96-97% confidence,
+    cap=3, the top 3 all failed and the other 2 (BRUN, LFS) were never
+    tried. Same risk cap as before (still at most signals_cap new
+    positions) -- this only stops giving up early on failures that were
+    never going to fill anyway. Mirrors the pattern _execute_bear_plan's
+    short queue already used correctly (short_success counter, not a
+    pre-slice)."""
+    ranked = sorted(eligible, key=lambda s: s.confidence, reverse=True)
+    log.info(f"Executing up to {signals_cap} signal(s) from {len(ranked)} eligible (cap={signals_cap})")
+    executed = 0
+    for sig in ranked:
+        if executed >= signals_cap:
+            break
         swap_only = (regime == "bear") and sig.action not in ("sell", "short")
         _session.refresh_daily_pnl(ctx.client)
         if _session.daily_pnl <= daily_loss_limit:
@@ -460,6 +478,7 @@ def _execute_bull_plan(
         log.info(f"EXECUTE: {sig.action.upper()} {sig.symbol} @ ${sig.price:.2f} | {sig.strategy} | {sig.reason}")
         if ctx.executor.execute(sig, swap_only=swap_only):
             _session.trades += 1
+            executed += 1
         time.sleep(1)
 
 
