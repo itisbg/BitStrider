@@ -118,6 +118,7 @@ class _FakeTradeClient:
 ex = ee.EnhancedExecutor.__new__(ee.EnhancedExecutor)  # skip __init__, no broker creds needed
 ex.client = _FakeTradeClient(_Quote(9.99, 10.01))       # live mid = 10.00
 ex.order_cache = {}
+ex._entry_pending = {}
 ex._current_market_state = lambda: SimpleNamespace(is_regular_hours=True)
 sig = Signal("ZZZ", "buy", 10.50, 0.8, "test", "TestStrat")  # signal.price deliberately stale vs. live mid
 assert ex._create_simple_order(sig, 10, ee.OrderType.LONG) is True

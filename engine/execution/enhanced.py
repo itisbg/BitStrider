@@ -142,6 +142,14 @@ def _resolve_freshness_reject(signal: Signal, fresh: bool, fade_reason: Optional
     return True, None
 
 
+def _entry_rechase_slip_pct(chase_count: int) -> float:
+    """Next slip% for an entry re-chase attempt (_sweep_pending_entries) --
+    starts beyond the original MARKETABLE_LIMIT_BUFFER_PCT bound and widens
+    each retry, capped at 3% same as every other re-chase path in this file
+    (_sweep_force_closes, check_afterhours_stops, close_no_gain_positions)."""
+    return min(MARKETABLE_LIMIT_BUFFER_PCT * (chase_count + 2), 3.0)
+
+
 def _marketable_limit_price(price: float, is_long: bool, buffer_pct: float = MARKETABLE_LIMIT_BUFFER_PCT) -> float:
     """A limit price just past the reference price -- fills like a market
     order under normal conditions, but caps the worst case at buffer_pct
@@ -340,6 +348,9 @@ class EnhancedExecutor:
         # {symbol: deque of the last N check_price_drift_stop prices, maxlen = PRICE_DRIFT_LOOKBACK_MIN / PRICE_DRIFT_CHECK_INTERVAL_MIN}
         # deque[0] is the oldest sample kept — the ~PRICE_DRIFT_LOOKBACK_MIN-minutes-ago reference once full.
         self._price_drift_history: Dict[str, Deque[float]] = {}
+        # {symbol: {"order_id": str, "qty": int, "is_long": bool, "chase_count": int}}
+        # — resting entry orders not yet confirmed filled; swept by _sweep_pending_entries
+        self._entry_pending: Dict[str, dict] = {}
         self._stale_exit_done: object = None  # date of last completed swing stale-exit check
         self.market_state: Optional[MarketState] = None
         self._rebuild_entry_log_from_orders()
@@ -944,6 +955,10 @@ class EnhancedExecutor:
             )
             order = self.client.submit_order(entry_req)
             self.order_cache[signal.symbol] = order.id
+            self._entry_pending[signal.symbol] = {
+                "order_id": str(order.id), "qty": shares,
+                "is_long": order_type == OrderType.LONG, "chase_count": 0,
+            }
 
             # Store ATR-based TP target — checked each scan cycle by check_tp_targets()
             if signal.atr_stop and signal.atr_stop > 0:
@@ -1002,11 +1017,11 @@ class EnhancedExecutor:
         alloc_pct = risk_info["allocation_pct"]
 
         if USE_DYNAMIC_TIERS and atr_pct > 0 and USE_RISK_EQUALIZED_SIZING:
-            log.info(f"{action} {signal.symbol}: {shares} @ ${signal.price:.2f} "
+            log.info(f"{action} {signal.symbol}: {shares} @ ${signal.price:.2f} submitted "
                      f"({alloc_pct:.1f}% pos) | TRAILING SL {trail_pct:.1f}% "
                      f"| Tier: {tier} (ATR {atr_pct:.1f}%) | {signal.strategy}")
         else:
-            log.info(f"{action} {signal.symbol}: {shares} @ ${signal.price:.2f} "
+            log.info(f"{action} {signal.symbol}: {shares} @ ${signal.price:.2f} submitted "
                      f"| TRAILING SL {trail_pct:.1f}% | Tier: {tier} | {signal.strategy}")
 
     # ΓöÇΓöÇ Simple Order ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
@@ -1036,8 +1051,12 @@ class EnhancedExecutor:
             )
             order = self.client.submit_order(req)
             self.order_cache[signal.symbol] = order.id
+            self._entry_pending[signal.symbol] = {
+                "order_id": str(order.id), "qty": shares,
+                "is_long": order_type == OrderType.LONG, "chase_count": 0,
+            }
             log.info(
-                f"{action} {signal.symbol}: {shares} @ ${limit:.2f}"
+                f"{action} {signal.symbol}: {shares} @ ${limit:.2f} submitted"
                 f"{' (ext-hours)' if extended else ''} | {signal.strategy}"
             )
             return True
@@ -2097,6 +2116,73 @@ class EnhancedExecutor:
                         log.warning(f"_sweep_force_closes {sym}: re-armed GTC trailing stop as fallback after failed re-chase")
                     except Exception as rearm_err:
                         log.error(f"_sweep_force_closes {sym}: re-chase failed AND GTC re-arm failed — position may be UNPROTECTED: {rearm_err}")
+
+    def _sweep_pending_entries(self) -> None:
+        """Re-chase a resting ENTRY order that hasn't filled within
+        AFTERHOURS_CHASE_STALE_SECONDS -- cancel and resubmit at a fresh
+        live-mid-bounded limit with escalating slip, same shape as
+        _sweep_force_closes on the exit side. 2026-08-14, confirmed live:
+        without this, an entry that misses its initial 1%-bounded limit (a
+        fast-moving or wide-spread name -- MF: bid $12.95/ask $17.20,
+        order resting unfilled at $15.21) just sits until end of day and
+        is silently never entered, no matter how good the signal was --
+        every close path already re-chases, entries never did.
+        ponytail: no cap on total re-chase attempts (only slip% is capped,
+        at 3%) -- same known ceiling as _sweep_force_closes."""
+        if not self._entry_pending:
+            return
+        try:
+            open_orders = self.client.get_orders() or []
+        except Exception as e:
+            log.warning(f"_sweep_pending_entries: fetch failed: {e}")
+            return
+
+        orders_by_id = {str(o.id): o for o in open_orders}
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+
+        for sym, info in list(self._entry_pending.items()):
+            pending = orders_by_id.get(info.get("order_id"))
+            if pending is None:
+                # No longer resting under that order id -- filled, cancelled
+                # elsewhere, or expired. Either way, nothing left to chase.
+                self._entry_pending.pop(sym, None)
+                continue
+
+            submitted_at = getattr(pending, "submitted_at", None) or getattr(pending, "created_at", None)
+            age_s = (now_utc - submitted_at).total_seconds() if submitted_at else 0.0
+            if age_s < AFTERHOURS_CHASE_STALE_SECONDS:
+                continue  # still fresh — give it time to fill
+
+            try:
+                self.client.cancel_order_by_id(str(pending.id))
+                time.sleep(0.4)
+            except Exception as e:
+                log.warning(f"_sweep_pending_entries {sym}: stale-order cancel failed, will retry next poll: {e}")
+                continue
+
+            is_long = info["is_long"]
+            side = OrderSide.BUY if is_long else OrderSide.SELL
+            try:
+                chase_n  = info.get("chase_count", 0)
+                slip_pct = _entry_rechase_slip_pct(chase_n)
+                mid = _live_quote_mid(self.client, sym, float(pending.limit_price or 0) or 0.01)
+                fresh_limit = _marketable_limit_price(mid, is_long=is_long, buffer_pct=slip_pct)
+                req = LimitOrderRequest(
+                    symbol=sym, qty=info["qty"], side=side, time_in_force=TimeInForce.DAY,
+                    limit_price=fresh_limit,
+                    client_order_id=f"apex-rechase-{sym}-{int(time.time())}",
+                )
+                new_order = self.client.submit_order(req)
+                self.order_cache[sym] = new_order.id
+                info["order_id"] = str(new_order.id)
+                info["chase_count"] = chase_n + 1
+                log.warning(
+                    f"ENTRY RE-CHASE {sym}: unfilled after prior attempt "
+                    f"— resubmitted @ ${fresh_limit:.2f} ({slip_pct:.1f}% off mid, attempt {chase_n + 1})"
+                )
+            except Exception as e:
+                log.error(f"_sweep_pending_entries {sym}: re-chase failed: {e}")
+                self._entry_pending.pop(sym, None)  # give up tracking rather than loop on a hard failure
 
     # ── Stale Swing Exit ─────────────────────────────────────────────────────
     def _get_entry_date(self, symbol: str) -> Optional[datetime.date]:
