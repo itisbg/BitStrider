@@ -2079,10 +2079,19 @@ class EnhancedExecutor:
         """Return the date a position was opened.
 
         Checks the in-memory entry log first, then falls back to the broker's
-        earliest filled BUY order for the symbol — covers positions opened on
-        a prior day whose entry_log record was lost to a bot restart (the
+        MOST RECENT filled BUY order for the symbol — covers positions opened
+        on a prior day whose entry_log record was lost to a bot restart (the
         startup rebuild in _rebuild_entry_log_from_orders only restores today's
-        orders)."""
+        orders).
+
+        2026-08-14, confirmed live: this used Sort.ASC (oldest first) with no
+        date bound, so a symbol bought, sold, and re-bought weeks apart (SNXX:
+        2026-07-21 and again 2026-08-14) always returned the ANCIENT fill, not
+        the one that actually opened the currently-open lot -- close_stale_
+        swing_positions then saw "held 24d" for a position that was 52 minutes
+        old and force-closed it. The most recent matching BUY is always the
+        right one for a position that's currently open (if it had been closed
+        after an earlier buy, the position wouldn't be open now) -- Sort.DESC."""
         info = self._entry_log.get(symbol)
         if info and info.get("date"):
             return info["date"]
@@ -2094,7 +2103,7 @@ class EnhancedExecutor:
             et  = pytz.timezone("America/New_York")
             req = GetOrdersRequest(
                 status=QueryOrderStatus.CLOSED, symbols=[symbol],
-                side=OrderSide.BUY, direction=Sort.ASC, limit=50,
+                side=OrderSide.BUY, direction=Sort.DESC, limit=50,
             )
             orders = self.client.get_orders(filter=req) or []
             for order in orders:
@@ -2108,10 +2117,24 @@ class EnhancedExecutor:
             log.warning(f"_get_entry_date {symbol}: lookup failed: {e}")
         return None
 
-    def _get_entry_datetime(self, symbol: str) -> Optional[datetime.datetime]:
+    def _get_entry_datetime(self, symbol: str, is_long: bool = True) -> Optional[datetime.datetime]:
         """Return the UTC fill timestamp a position was opened — hour-precision
         counterpart to _get_entry_date, needed for the NO_GAIN_EXIT_HOURS check.
-        Same broker fallback for positions opened before a bot restart."""
+        Same broker fallback for positions opened before a bot restart.
+
+        2026-08-14: two bugs fixed here together, same root pattern as
+        _get_entry_date (see its docstring for the SNXX case that surfaced
+        this) --
+          1. Sort.ASC with no date bound returned the OLDEST matching fill
+             ever, not the one that opened the currently-open lot. Sort.DESC
+             (most recent first) is always correct for a position that's
+             still open. Same fix already confirmed necessary for QNT
+             2026-08-13, where held_hours came back inflated after a restart.
+          2. side was hardcoded to BUY regardless of the position's actual
+             direction -- a SHORT is opened via a SELL, so this fallback
+             could never find the right order for a short at all (silently
+             fell through to a wrong, unrelated BUY or None). is_long now
+             selects the correct side; callers must pass their own qty sign."""
         info = self._entry_log.get(symbol)
         if info and info.get("filled_at"):
             return info["filled_at"]
@@ -2121,7 +2144,7 @@ class EnhancedExecutor:
             from alpaca.trading.enums import QueryOrderStatus
             req = GetOrdersRequest(
                 status=QueryOrderStatus.CLOSED, symbols=[symbol],
-                side=OrderSide.BUY, direction=Sort.ASC, limit=50,
+                side=(OrderSide.BUY if is_long else OrderSide.SELL), direction=Sort.DESC, limit=50,
             )
             orders = self.client.get_orders(filter=req) or []
             for order in orders:
@@ -2293,7 +2316,7 @@ class EnhancedExecutor:
             if strategy in EOD_CLOSE_STRATEGIES:
                 continue  # already force-closed same-day by close_eod_positions
 
-            entry_dt = self._get_entry_datetime(sym)
+            entry_dt = self._get_entry_datetime(sym, is_long=qty > 0)
             if entry_dt is None:
                 log.warning(f"close_no_gain_positions {sym}: can't determine entry time, skipping")
                 continue
