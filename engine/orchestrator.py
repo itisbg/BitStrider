@@ -876,6 +876,7 @@ def start() -> None:
     ctx = _build_context()
 
     _session.load_quarterly_state()
+    _session.load_daily_state()
     log.info("=" * 70)
     log.info("APEXTRADER - Priority-Based Momentum Trading")
     log.info("=" * 70)
