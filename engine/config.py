@@ -944,6 +944,21 @@ MIN_AVG_DAILY_VOLUME_REGULAR_HOURS = 700_000  # 60+ min into regular hours — r
 TRADE_THIN_LIQUIDITY_REJECTS     = True   # master switch for this path — enabled 2026-08-12 at the user's request
 THIN_LIQUIDITY_POSITION_SIZE_PCT = 3.0
 
+# 2026-08-14, user request: "I told ones which fail guard will be traded too
+# but with lower portfolio limit" -- extending the same trade-anyway-at-
+# reduced-size treatment to momentum-freshness rejects (_check_momentum_
+# freshness), a DIFFERENT mechanism from the guardrails above. Confirmed
+# live same day: a cycle found 5 strong candidates (96-97% confidence),
+# but the top 3 by rank all got hard-skipped as "not fresh" (already faded
+# 5-16% off their 30-min high) and the other 2 never even got tried
+# (MAX_SIGNALS_PER_CYCLE slices to the top 3 before attempting anything) --
+# zero fills from a cycle with 5 real candidates. Rather than a hard skip,
+# a stale-momentum signal now trades anyway at THIN_LIQUIDITY_POSITION_
+# SIZE_PCT (reuses signal.thin_liquidity -- same flag, same sizing, same
+# halved trailing stop -- a chased/faded entry deserves the same tighter
+# leash as a liquidity-guardrail admit, not a separate mechanism).
+TRADE_STALE_MOMENTUM_REJECTS = True
+
 # 2026-08-12, user request: these names already failed a guardrail, so hold
 # them on a shorter leash for their whole life too, not just a smaller size
 # at entry -- every trailing-stop placement/re-place/tighten for a

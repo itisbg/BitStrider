@@ -17,6 +17,12 @@ stay hard-blocked) -- the overnight boundary is still fully enforced by
 close_guardrail_fail_positions regardless of what got waived at entry, see
 engine/execution/enhanced.py.
 
+2026-08-14, user request ("ones which fail guard will be traded too but
+with lower portfolio limit"): extended the same reduced-size-instead-of-
+skip treatment to momentum-freshness rejects (_resolve_freshness_reject),
+a different mechanism from the guardrails above -- reuses the same
+signal.thin_liquidity flag and THIN_LIQUIDITY_POSITION_SIZE_PCT sizing.
+
 Run with:
   python scripts/test_thin_liquidity_admit.py
 No network calls -- both pieces are pure functions, no broker/client needed.
@@ -29,9 +35,11 @@ sys.path.insert(0, str(ROOT))
 
 import engine.equity.scan as scan
 from engine.equity.strategies import Signal
-from engine.execution.enhanced import _apply_thin_liquidity_override, _apply_high_confidence_bonus
+from engine.execution.enhanced import (
+    _apply_thin_liquidity_override, _apply_high_confidence_bonus, _resolve_freshness_reject,
+)
 from engine.config import (
-    THIN_LIQUIDITY_POSITION_SIZE_PCT,
+    THIN_LIQUIDITY_POSITION_SIZE_PCT, TRADE_STALE_MOMENTUM_REJECTS,
     HIGH_CONFIDENCE_BONUS_THRESHOLD, HIGH_CONFIDENCE_BONUS_MULT,
 )
 
@@ -113,4 +121,34 @@ small_risk_info = {"dollar_amount": 50.0, "allocation_pct": 5.0, "tier": "NORMAL
 out = _apply_high_confidence_bonus(small_risk_info, confidence=0.99, equity=1000.0)
 assert out["allocation_pct"] == 7.5, f"expected 5.0 x 1.5 = 7.5, got {out['allocation_pct']}"
 
-print("OK: thin-liquidity admit path and high-confidence sizing bonus both check out")
+# --- _resolve_freshness_reject(): stale-momentum trades anyway at reduced size ---
+
+assert TRADE_STALE_MOMENTUM_REJECTS is True
+
+# Fresh -> always valid, signal untouched regardless of the toggle.
+sig = _sig(thin=False)
+valid, reason = _resolve_freshness_reject(sig, fresh=True, fade_reason=None)
+assert (valid, reason) == (True, None)
+assert sig.thin_liquidity is False, "fresh signal must not get flagged"
+
+# Not fresh, toggle on -> valid anyway, flagged thin_liquidity for reduced sizing.
+sig = _sig(thin=False)
+valid, reason = _resolve_freshness_reject(sig, fresh=False, fade_reason="XYZ: faded 10.0% off its 30-min high")
+assert valid is True, "toggle on -> trades anyway, not blocked"
+assert reason is None
+assert sig.thin_liquidity is True, "must flag the signal for reduced sizing"
+
+# Not fresh, toggle off -> hard-blocked, signal untouched (old behavior preserved).
+import engine.execution.enhanced as enhanced
+_orig_toggle = enhanced.TRADE_STALE_MOMENTUM_REJECTS
+enhanced.TRADE_STALE_MOMENTUM_REJECTS = False
+try:
+    sig = _sig(thin=False)
+    valid, reason = _resolve_freshness_reject(sig, fresh=False, fade_reason="XYZ: faded 10.0% off its 30-min high")
+    assert valid is False
+    assert reason == "XYZ: faded 10.0% off its 30-min high"
+    assert sig.thin_liquidity is False, "toggle off -> not flagged, hard-blocked instead"
+finally:
+    enhanced.TRADE_STALE_MOMENTUM_REJECTS = _orig_toggle
+
+print("OK: thin-liquidity admit path, high-confidence sizing bonus, and stale-momentum reduced-size trade-through all check out")

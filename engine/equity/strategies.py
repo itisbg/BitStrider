@@ -45,10 +45,12 @@ class Signal:
     reason:     str
     strategy:   str
     atr_stop:   Optional[float] = None   # ATR-based stop distance ($); None = use % fallback
-    thin_liquidity: bool = False  # admitted below the float/avg-volume floor (2026-08-12) —
-                                   # sized at THIN_LIQUIDITY_POSITION_SIZE_PCT instead of the
-                                   # normal POSITION_SIZE_PCT; set by scan.py, read by
-                                   # _execute_entry() in engine/execution/enhanced.py
+    thin_liquidity: bool = False  # reduced-conviction admit: below a guardrail floor
+                                   # (2026-08-12, set by scan.py) or a stale/faded momentum
+                                   # entry traded anyway (2026-08-14, set in enhanced.py
+                                   # _validate_trade) — either way sized at THIN_LIQUIDITY_
+                                   # POSITION_SIZE_PCT instead of the normal POSITION_SIZE_PCT,
+                                   # read by _execute_entry() in engine/execution/enhanced.py
 
 
 def _calc_atr14(bars: pd.DataFrame, period: int = 14) -> float:

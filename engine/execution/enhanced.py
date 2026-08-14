@@ -60,6 +60,7 @@ from engine.config import (
     HIGH_CONFIDENCE_BONUS_THRESHOLD, HIGH_CONFIDENCE_BONUS_MULT,
     CONF_RATCHET_ENABLED, CONF_RATCHET_TRIGGER_GAIN_PCT, CONF_RATCHET_MAX_TIGHTEN,
     MOMENTUM_FRESHNESS_ENABLED, MOMENTUM_FRESHNESS_STRATEGIES,
+    TRADE_STALE_MOMENTUM_REJECTS,
     MOMENTUM_FRESHNESS_LOOKBACK_MIN, MOMENTUM_FRESHNESS_MAX_PULLBACK_PCT,
     THIN_LIQUIDITY_POSITION_SIZE_PCT,
     THIN_LIQUIDITY_TRAILING_STOP_MULT,
@@ -123,6 +124,24 @@ def _check_momentum_freshness(signal: Signal) -> Tuple[bool, Optional[str]]:
     return True, None
 
 
+def _resolve_freshness_reject(signal: Signal, fresh: bool, fade_reason: Optional[str]) -> Tuple[bool, Optional[str]]:
+    """Decide what _validate_trade does with a _check_momentum_freshness
+    result: (valid, block_reason). fresh=True -> always valid, signal
+    untouched. fresh=False -> hard-blocked (valid=False, block_reason=
+    fade_reason) unless TRADE_STALE_MOMENTUM_REJECTS, in which case the
+    signal is flagged thin_liquidity=True (same reduced sizing as a
+    guardrail admit, see _apply_thin_liquidity_override) and treated as
+    valid so it still trades. Split out for unit-testability without a
+    broker/bars connection — mutates signal in place same as the inline
+    version would, callers pass their own Signal instance."""
+    if fresh:
+        return True, None
+    if not TRADE_STALE_MOMENTUM_REJECTS:
+        return False, fade_reason
+    signal.thin_liquidity = True
+    return True, None
+
+
 def _marketable_limit_price(price: float, is_long: bool, buffer_pct: float = MARKETABLE_LIMIT_BUFFER_PCT) -> float:
     """A limit price just past the reference price -- fills like a market
     order under normal conditions, but caps the worst case at buffer_pct
@@ -154,12 +173,14 @@ def _live_quote_mid(client, symbol: str, fallback: float) -> float:
 
 
 def _apply_thin_liquidity_override(risk_info: Dict, signal: Signal, equity: float) -> Dict:
-    """If signal.thin_liquidity is set (rejected-list symbol admitted anyway —
-    see TRADE_THIN_LIQUIDITY_REJECTS, engine/equity/scan.py _scan_one), replace
-    dollar_amount with a flat THIN_LIQUIDITY_POSITION_SIZE_PCT of equity,
-    overriding confidence-scaling entirely rather than stacking on top of it —
-    a predictable cap on the downside for a name that failed the float/
-    avg-volume floor, regardless of how confident the firing strategy was.
+    """If signal.thin_liquidity is set, replace dollar_amount with a flat
+    THIN_LIQUIDITY_POSITION_SIZE_PCT of equity, overriding confidence-scaling
+    entirely rather than stacking on top of it — a predictable cap on the
+    downside regardless of how confident the firing strategy was. Two
+    independent reasons set this flag, same sizing either way: a rejected-
+    list symbol admitted anyway (TRADE_THIN_LIQUIDITY_REJECTS, engine/
+    equity/scan.py _scan_one) or a momentum-freshness reject traded anyway
+    (TRADE_STALE_MOMENTUM_REJECTS, _validate_trade below, 2026-08-14).
     Returns risk_info unchanged if the signal isn't flagged.
     """
     if not getattr(signal, "thin_liquidity", False):
@@ -693,8 +714,11 @@ class EnhancedExecutor:
         # MOMENTUM_FRESHNESS_* for the reasoning and known limitations.
         if order_type == OrderType.LONG:
             fresh, fade_reason = _check_momentum_freshness(signal)
-            if not fresh:
-                return False, fade_reason
+            valid, block_reason = _resolve_freshness_reject(signal, fresh, fade_reason)
+            if not valid:
+                return False, block_reason
+            if fade_reason:
+                log.info(f"[SIZE] {fade_reason} — trading anyway at reduced size")
 
         # Asset tradability check: skip halted or suspended symbols
         try:
