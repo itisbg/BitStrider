@@ -1,13 +1,19 @@
-"""Self-check for the price drift stop (2026-08-13, at the user's request;
-refined same day). Same-day positions that drop (longs) or rise (shorts)
-more than PRICE_DRIFT_STOP_PCT versus their own price PRICE_DRIFT_LOOKBACK_MIN
-(30 min) ago get exited. Built after confirming live that this morning's
-losers (DFSC, HLIT, EROC, JACK) were all bought right at the open and all
-faded 4-8% before the normal, wider trailing stop caught them. Poll
-frequency raised from every 30 min to every PRICE_DRIFT_CHECK_INTERVAL_MIN
-(10 min, matching the TI-scrape cadence) so a fast 10-15 min collapse has a
-real chance of being caught by the very next check -- the lookback window
-compared against stays 30 min regardless of how often the check itself runs.
+"""Self-check for the price drift stop (2026-08-13, refined 2026-08-14).
+Same-day positions that drop (longs) or rise (shorts) more than
+PRICE_DRIFT_STOP_PCT versus EITHER their own entry price OR their price
+PRICE_DRIFT_LOOKBACK_MIN (30 min) ago get exited. Built after confirming
+live that this morning's losers (DFSC, HLIT, EROC, JACK) were all bought
+right at the open and all faded 4-8% before the normal, wider trailing stop
+caught them.
+
+2026-08-14 correction: the entry-price leg was dropped for one day (checked
+only the 30-min-ago reference) -- confirmed live that TE dropped 2.69% off
+its OWN entry price without ever triggering, because a slow bleed that
+never shows a full move within any single 10-min-to-10-min window is
+exactly what a 30-min-ago-only comparison misses. Restored the entry-price
+leg (OR'd with the 30-min-ago one, same as the very first version). The
+threshold itself stays at the original 1.0% per explicit follow-up
+correction the same day.
 
 Run with:
   python scripts/test_price_drift_stop.py
@@ -32,21 +38,32 @@ assert PRICE_DRIFT_LOOKBACK_MIN == 30
 assert PRICE_DRIFT_LOOKBACK_MIN % PRICE_DRIFT_CHECK_INTERVAL_MIN == 0, "lookback should be a clean multiple of the poll interval"
 assert PRICE_DRIFT_LOOKBACK_MIN // PRICE_DRIFT_CHECK_INTERVAL_MIN == 3, "3 ten-minute ticks = 30 minutes of lookback"
 
-# --- Longs: adverse move is a DROP vs. the 30-min-ago reference ---
+# --- Longs: adverse move is a DROP, checked against EITHER reference ---
 
-assert f(current=10.10, reference=10.05, is_long=True, stop_pct=1.0) is None, "up from reference -> no trigger"
-assert f(current=9.80, reference=10.00, is_long=True, stop_pct=1.0) is not None, "down > 1% -> triggers"
-assert f(current=9.90, reference=10.00, is_long=True, stop_pct=1.0) is None, "exactly at the threshold -> no trigger (strictly >)"
+# Flat/up on both references -> no trigger.
+assert f(current=10.10, entry=10.00, reference=10.05, is_long=True, stop_pct=1.0) is None
 
-# No reference yet (not enough history) -> never a false trigger.
-assert f(current=5.00, reference=None, is_long=True, stop_pct=1.0) is None
-assert f(current=5.00, reference=0.0, is_long=True, stop_pct=1.0) is None
+# Down > 1.0% from entry, even with no 30-min-ago reference yet -> triggers
+# (this is exactly the TE case: a slow bleed the 30-min-ago leg alone missed).
+assert f(current=9.80, entry=10.00, reference=None, is_long=True, stop_pct=1.0) is not None
 
-# --- Shorts: adverse move is a RISE (mirrored) ---
+# Flat vs entry but down > 1.0% from the 30-min-ago reference -> triggers too.
+reason = f(current=9.79, entry=9.80, reference=10.00, is_long=True, stop_pct=1.0)
+assert reason is not None and "min" in reason, f"expected a 30min-drift reason, got {reason!r}"
 
-assert f(current=9.90, reference=9.95, is_long=False, stop_pct=1.0) is None
-assert f(current=10.20, reference=10.00, is_long=False, stop_pct=1.0) is not None
-assert f(current=10.10, reference=10.00, is_long=False, stop_pct=1.0) is None, "exactly at the threshold -> no trigger"
+# Comfortably under the threshold on both -> no trigger.
+assert f(current=9.95, entry=10.00, reference=10.00, is_long=True, stop_pct=1.0) is None
+
+# Neither reference available (fresh position, no history, entry unknown) -> no trigger, no crash.
+assert f(current=5.00, entry=None, reference=None, is_long=True, stop_pct=1.0) is None
+assert f(current=5.00, entry=0.0, reference=0.0, is_long=True, stop_pct=1.0) is None
+
+# --- Shorts: adverse move is a RISE (mirrored), same OR-of-two-legs logic ---
+
+assert f(current=9.90, entry=10.00, reference=9.95, is_long=False, stop_pct=1.0) is None
+assert f(current=10.20, entry=10.00, reference=None, is_long=False, stop_pct=1.0) is not None
+reason = f(current=10.19, entry=10.18, reference=10.00, is_long=False, stop_pct=1.0)
+assert reason is not None and "min" in reason, f"expected a 30min-drift reason, got {reason!r}"
 
 # --- Rolling-history mechanics: deque[0] becomes the reference only once full ---
 
@@ -62,4 +79,4 @@ for i, p in enumerate(prices):
         assert ref == prices[i - lookback_ticks], f"tick {i}: reference should be exactly {lookback_ticks} ticks back"
     history.append(p)
 
-print("OK: price drift stop triggers vs. the 30-min-ago reference, mirrors correctly for shorts, rolling history is exactly 3 ticks deep")
+print("OK: price drift stop triggers vs. EITHER entry or the 30-min-ago reference, mirrors correctly for shorts, rolling history is exactly 3 ticks deep")

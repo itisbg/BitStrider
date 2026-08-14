@@ -2533,19 +2533,33 @@ class EnhancedExecutor:
     # ── Price Drift Stop (10-min poll, 30-min lookback, same-day entries) ──
     @staticmethod
     def _drift_stop_reason(
-        current: float, reference: Optional[float], is_long: bool, stop_pct: float,
+        current: float, entry: Optional[float], reference: Optional[float], is_long: bool, stop_pct: float,
     ) -> Optional[str]:
         """Pure decision logic for check_price_drift_stop: return a reason
-        string if the adverse move versus `reference` (the price
-        PRICE_DRIFT_LOOKBACK_MIN ago) exceeds stop_pct, else None. Split out
-        for unit-testability without a broker connection. reference<=0 or
-        None (not enough history yet) means "no signal", not a false
-        trigger."""
-        if reference is None or reference <= 0:
-            return None
-        drift = ((reference - current) / reference * 100) if is_long else ((current - reference) / reference * 100)
-        if drift > stop_pct:
-            return f"${reference:.2f}->${current:.2f} ({drift:+.1f}% vs {PRICE_DRIFT_LOOKBACK_MIN}min ago)"
+        string if the adverse move versus EITHER `entry` (the position's own
+        entry price) OR `reference` (the price PRICE_DRIFT_LOOKBACK_MIN ago)
+        exceeds stop_pct, else None. Split out for unit-testability without a
+        broker connection. Either reference being None/<=0 (missing data, or
+        not enough rolling history yet) just drops that leg of the check --
+        never a false trigger, and the other leg still applies independently.
+
+        2026-08-14, user correction: entry-price leg restored after being
+        dropped 2026-08-13 -- confirmed live TE dropped 2.69% off its OWN
+        entry price with the 30-min-ago-only version never even looking at
+        entry, so a slow bleed that never shows a full move within any
+        single 10-min window went completely uncaught. Both legs checked
+        again, OR'd together."""
+        def _adverse_pct(ref: Optional[float]) -> Optional[float]:
+            if ref is None or ref <= 0:
+                return None
+            return ((ref - current) / ref * 100) if is_long else ((current - ref) / ref * 100)
+
+        drift_entry = _adverse_pct(entry)
+        if drift_entry is not None and drift_entry > stop_pct:
+            return f"entry ${entry:.2f}->${current:.2f} ({drift_entry:+.1f}%)"
+        drift_ref = _adverse_pct(reference)
+        if drift_ref is not None and drift_ref > stop_pct:
+            return f"{PRICE_DRIFT_LOOKBACK_MIN}min ${reference:.2f}->${current:.2f} ({drift_ref:+.1f}%)"
         return None
 
     def _backfill_drift_reference(self, symbol: str) -> Optional[float]:
@@ -2570,15 +2584,18 @@ class EnhancedExecutor:
     def check_price_drift_stop(self) -> None:
         """Every PRICE_DRIFT_CHECK_INTERVAL_MIN (10 min), exit any same-day
         position that's moved against it by more than PRICE_DRIFT_STOP_PCT
-        versus its own price PRICE_DRIFT_LOOKBACK_MIN (30 min) ago. Tighter
-        and faster than the normal trailing stop -- see the PRICE_DRIFT_STOP
-        block in config.py for why (2026-08-13, confirmed live: DFSC/HLIT/
-        EROC/JACK all bought right at the open, all faded 4-8% before the
-        wider trailing stop caught them; polling every 10 min instead of 30
-        gives a fast 10-15 min collapse a real chance of being caught by the
-        very next check). Longs: drop > PRICE_DRIFT_STOP_PCT%. Shorts: rise
-        > PRICE_DRIFT_STOP_PCT% (mirrored). Scoped to same-day entries only
-        (self._entry_log date), not by strategy -- survives the strategy-name
+        versus EITHER its own entry price OR its price PRICE_DRIFT_LOOKBACK_MIN
+        (30 min) ago (2026-08-14: restored the entry-price leg -- a
+        30-min-ago-only check misses a slow bleed that never shows a full
+        move within any single 10-min window; see _drift_stop_reason).
+        Tighter and faster than the normal trailing stop -- see the
+        PRICE_DRIFT_STOP block in config.py for why (2026-08-13, confirmed
+        live: DFSC/HLIT/EROC/JACK all bought right at the open, all faded
+        4-8% before the wider trailing stop caught them; polling every 10
+        min instead of 30 gives a fast 10-15 min collapse a real chance of
+        being caught by the very next check). Longs: drop > PRICE_DRIFT_STOP_PCT%.
+        Shorts: rise > PRICE_DRIFT_STOP_PCT% (mirrored). Scoped to same-day
+        entries only (self._entry_log date), not by strategy -- survives the strategy-name
         loss a restart causes.
 
         Re-entry cooldown is automatic: detect_stopped_out_positions() (10s
@@ -2613,6 +2630,7 @@ class EnhancedExecutor:
             live_syms.add(sym)
             try:
                 current = float(pos.current_price)
+                entry   = float(pos.avg_entry_price)
             except (TypeError, ValueError):
                 continue
             if current <= 0:
@@ -2630,7 +2648,7 @@ class EnhancedExecutor:
             # an approximate reference from real 1-min bar data instead of
             # leaving the position unwatched until history rebuilds on its own.
             reference = history[0] if len(history) == lookback_ticks else self._backfill_drift_reference(sym)
-            reason = self._drift_stop_reason(current, reference, is_long, PRICE_DRIFT_STOP_PCT)
+            reason = self._drift_stop_reason(current, entry, reference, is_long, PRICE_DRIFT_STOP_PCT)
 
             # Record this check's price regardless of outcome — the deque
             # naturally evicts the oldest sample once full, keeping the
