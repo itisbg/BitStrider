@@ -298,9 +298,13 @@ def get_live_holdings(client) -> Tuple[set, set, set]:
     log = logging.getLogger("ApexTrader")
     try:
         positions = {p.symbol for p in client.get_all_positions()}
+        # o.side is an OrderSide enum; str(enum) is "OrderSide.BUY", not "buy" --
+        # comparing that against a bare "buy" literal never matched, so every
+        # pending buy order was silently excluded from this set (2026-08-14,
+        # same root cause as the entry_log rebuild no-op in enhanced.py).
         orders    = {
             o.symbol for o in client.get_orders()
-            if str(getattr(o, "side", "")).lower() == "buy"
+            if str(getattr(getattr(o, "side", ""), "value", getattr(o, "side", ""))).lower() == "buy"
         }
         return positions, orders, positions | orders
     except Exception as e:

@@ -361,15 +361,35 @@ class EnhancedExecutor:
 
     # -- Entry Log Rebuild (survive restarts) ----------------------------
     def _rebuild_entry_log_from_orders(self) -> None:
-        """On startup, reconstruct today's entry log from Alpaca filled buy orders.
+        """On startup, reconstruct today's entry log from Alpaca filled orders.
         Prevents swap-closes of same-day positions after a bot restart, which would
-        trigger Alpaca PDT protection (error 40310100)."""
+        trigger Alpaca PDT protection (error 40310100).
+
+        2026-08-14: was BUY-only, so a SHORT position (opened via a SELL) never
+        got an entry_log record after a restart. Confirmed live: SPAI entered
+        10:54:41, a routine restart landed 16s later at 10:54:57, and the fresh
+        process's entry_log had no 'SPAI' key at all -- which silently broke TWO
+        things at once, both scoped by entry_log lookups: _trail_pct_for()
+        couldn't see thin_liquidity=True anymore so protect_positions() armed a
+        full 8.0% trailing stop instead of the intended 4.0% thin-liquidity half,
+        and check_price_drift_stop()'s same-day scope (entry_log[sym]['date'] ==
+        today) skipped SPAI entirely, leaving it with zero drift-stop coverage
+        too. Now derives the correct entry side per symbol from the live
+        position (BUY opened a long, SELL opened a short) instead of assuming
+        BUY. thin_liquidity itself still can't be recovered this way (not
+        derivable from broker order data) -- same known gap as the 0.0
+        confidence / 'restored' strategy placeholder below."""
         try:
             today = datetime.date.today()
             import pytz
             from alpaca.trading.requests import GetOrdersRequest
             from alpaca.trading.enums import QueryOrderStatus
             et       = pytz.timezone("America/New_York")
+            try:
+                positions = self.client.get_all_positions()
+            except Exception:
+                positions = []
+            is_long_by_sym = {p.symbol: float(p.qty) > 0 for p in positions}
             # Filter to today only — avoids fetching the full account order history
             # on accounts with months of activity (can be thousands of orders).
             today_start = datetime.datetime.combine(today, datetime.time.min).replace(tzinfo=pytz.UTC)
@@ -385,10 +405,22 @@ class EnhancedExecutor:
                     order_date = today  # conservative fallback
                 if order_date != today:
                     continue
-                side = str(getattr(order, "side", "")).lower()
-                if side != "buy":
-                    continue
                 sym = order.symbol
+                if sym not in is_long_by_sym:
+                    continue  # no open position left for this symbol — nothing to protect
+                # order.side is an OrderSide enum; str(enum) is "OrderSide.SELL", not
+                # "sell" -- comparing that against a bare "buy"/"sell" literal never
+                # matches. .value gives the plain string; getattr falls back to the
+                # raw attribute so a plain string (e.g. from a test double) still
+                # works. 2026-08-14: this was the actual root cause of the rebuild
+                # being a total no-op — the "Entry log rebuilt from today's orders"
+                # log line had never once fired in the whole log history, for ANY
+                # symbol, long or short.
+                raw_side = getattr(order, "side", "")
+                side = str(getattr(raw_side, "value", raw_side)).lower()
+                entry_side = "buy" if is_long_by_sym[sym] else "sell"
+                if side != entry_side:
+                    continue  # this order closed/trimmed the position, not opened it
                 if sym not in self._entry_log:
                     self._entry_log[sym] = {
                         "strategy": "restored",
