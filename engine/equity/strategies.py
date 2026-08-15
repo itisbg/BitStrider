@@ -29,6 +29,7 @@ from engine.config import (
     SENTIMENT_STRATEGY,
     MOMENTUM_ENABLED, SENTIMENT_ENABLED, LIQUIDITY_SWEEP_ENABLED,
     PRE_MARKET_MOMENTUM_ENABLED, PM_HIGH_BREAKOUT_ENABLED, TECHNICAL_ENABLED,
+    FLOAT_ROTATION_ENABLED,
 )
 
 ET = pytz.timezone("America/New_York")
@@ -1249,20 +1250,20 @@ def get_strategy_instances(bull_regime: bool = True):
         GapBreakoutStrategy(),
         ORBStrategy(),
         VWAPReclaimStrategy(),
-        FloatRotationStrategy(),
         TrendBreakerStrategy(),
         OpeningBellSurgeStrategy(),
         EarlySqueezeDetector(),
         PowerOf3Strategy(),
     ]
 
-    # 2026-08-14: disabled — backtested net-negative at every confidence
-    # level, same as VWAPFade below (see the toggles' block in config.py
-    # for the numbers behind each one).
+    # 2026-08-14/15: disabled — backtested net-negative (see the toggles'
+    # block in config.py for the numbers behind each one).
     if VWAP_FADE_ENABLED:
         strategies.append(VWAPFadeStrategy())
     if MOMENTUM_ENABLED:
         strategies.append(MomentumStrategy())
+    if FLOAT_ROTATION_ENABLED:
+        strategies.append(FloatRotationStrategy())
     if TECHNICAL_ENABLED:
         strategies.append(TechnicalStrategy())
     if SENTIMENT_ENABLED:

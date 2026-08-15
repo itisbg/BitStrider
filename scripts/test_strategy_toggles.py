@@ -15,8 +15,12 @@ Below 37% but n<10 -> left enabled, too small a sample to judge:
   PMHighBreakout     n=3   33% win
   Technical          n=3    0% win
 
-FloatRotation (n=35, 37% win) sits exactly AT the threshold, not below
-it -- also left enabled pending an explicit call on that tie.
+2026-08-15: FloatRotation (n=41, 39% win, net -$33.31, second-worst
+dollar loser after VWAPFade) disabled at the user's explicit request
+despite clearing the 37% win-rate line — a fuller loss-attribution pass
+showed its worst trades (DFSC -27%, BNRG -8.6%) were the clearest
+examples of "chasing an already-extended move" across the whole loser
+list.
 
 Run with:
   python scripts/test_strategy_toggles.py
@@ -30,19 +34,22 @@ sys.path.insert(0, str(ROOT))
 from engine.config import (
     VWAP_FADE_ENABLED, MOMENTUM_ENABLED, SENTIMENT_ENABLED, LIQUIDITY_SWEEP_ENABLED,
     PRE_MARKET_MOMENTUM_ENABLED, PM_HIGH_BREAKOUT_ENABLED, TECHNICAL_ENABLED,
+    FLOAT_ROTATION_ENABLED,
 )
 from engine.equity.strategies import get_strategy_instances
 
-# n>=10 and below 37% win rate -> disabled.
+# Disabled — either n>=10 and below 37% win rate, or (FloatRotation) an
+# explicit override despite clearing that line.
 DISABLED = {
     "VWAPFadeStrategy":          VWAP_FADE_ENABLED,
     "MomentumStrategy":          MOMENTUM_ENABLED,
     "PreMarketMomentumStrategy": PRE_MARKET_MOMENTUM_ENABLED,
+    "FloatRotationStrategy":     FLOAT_ROTATION_ENABLED,
 }
 for name, enabled in DISABLED.items():
-    assert enabled is False, f"{name} expected disabled (False) per the 2026-08-14 backtest"
+    assert enabled is False, f"{name} expected disabled (False)"
 
-# n<10 (too early to judge) or at/above the 37% threshold -> stay enabled.
+# n<10 (too early to judge) -> stay enabled.
 STILL_ENABLED_FLAGS = {
     "SentimentStrategy":      SENTIMENT_ENABLED,
     "LiquiditySweepStrategy": LIQUIDITY_SWEEP_ENABLED,
@@ -52,7 +59,7 @@ STILL_ENABLED_FLAGS = {
 for name, enabled in STILL_ENABLED_FLAGS.items():
     assert enabled is True, f"{name} expected enabled (True) — sample too small (n<10) to judge"
 
-STILL_ENABLED_UNCONDITIONAL = {"FloatRotationStrategy", "GapBreakoutStrategy", "ORBStrategy",
+STILL_ENABLED_UNCONDITIONAL = {"GapBreakoutStrategy", "ORBStrategy",
                                 "TrendBreakerStrategy", "VWAPReclaimStrategy"}
 
 for bull in (True, False):
@@ -62,6 +69,6 @@ for bull in (True, False):
     for kept_name in set(STILL_ENABLED_FLAGS) | STILL_ENABLED_UNCONDITIONAL:
         assert kept_name in names, f"{kept_name} must still be active (bull_regime={bull})"
 
-print("OK: Momentum/PreMarketMomentum/VWAPFade are excluded (n>=10, below 37% win rate); "
+print("OK: Momentum/PreMarketMomentum/VWAPFade/FloatRotation are excluded; "
       "Sentiment/LiquiditySweep/PMHighBreakout/Technical stay active (n<10, too early to judge); "
-      "FloatRotation and the rest stay active")
+      "GapBreakout/ORB/TrendBreaker/VWAPReclaim stay active")

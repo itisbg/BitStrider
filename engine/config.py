@@ -782,8 +782,14 @@ BEAR_SHORT_TARGET_RESERVE = 30  # In bear regime, reserve more scan slots for sh
 #   LiquiditySweep     n=4   25% win  -0.80% avg
 #   PMHighBreakout     n=3   33% win  -2.82% avg
 #   Technical          n=3    0% win  -3.33% avg
-# FloatRotation (n=35, 37% win, -1.35% avg) sits exactly AT 37%, not
-# below it — also left enabled pending an explicit call on that tie.
+#
+# 2026-08-15 update: a fuller loss-attribution pass (371 matched trades,
+# all strategies, since inception) put FloatRotation at n=41, 39% win —
+# clear of the 37% line on win rate alone, but still net -$33.31, the
+# second-worst dollar loser after VWAPFade, and its worst trades (DFSC
+# -27%, BNRG -8.6%) were the clearest examples of the "chasing an
+# already-extended move" pattern across the whole loser list. Disabled
+# at the user's explicit request despite clearing the win-rate line.
 # Strategy code and tuning params below are untouched for all of these;
 # flip a flag to True to re-enable / False to disable. See
 # scripts/test_strategy_toggles.py.
@@ -794,6 +800,7 @@ LIQUIDITY_SWEEP_ENABLED     = True
 PRE_MARKET_MOMENTUM_ENABLED = False
 PM_HIGH_BREAKOUT_ENABLED    = True
 TECHNICAL_ENABLED           = True
+FLOAT_ROTATION_ENABLED      = False
 
 TECHNICAL = {
     "rsi_oversold":   30,
