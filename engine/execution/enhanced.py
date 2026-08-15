@@ -45,6 +45,7 @@ from engine.config import (
     GUARDRAIL_EOD_CLOSE_ENABLED, GUARDRAIL_EOD_CLOSE_TIME,
     PRICE_DRIFT_STOP_ENABLED, PRICE_DRIFT_STOP_PCT,
     PRICE_DRIFT_CHECK_INTERVAL_MIN, PRICE_DRIFT_LOOKBACK_MIN,
+    SWING_DRIFT_STOP_ENABLED, SWING_DRIFT_STOP_PCT,
     MIN_AVG_DAILY_VOLUME_REGULAR_HOURS, MIN_FLOAT_SHARES, MIN_MARKET_CAP,
     SWING_STALE_EXIT_ENABLED, SWING_STALE_DAYS, SWING_STALE_MIN_GAIN_PCT,
     NO_GAIN_EXIT_ENABLED, NO_GAIN_EXIT_HOURS, NO_GAIN_EXIT_MIN_PCT, NO_GAIN_EXIT_MAX_LOSS_PCT,
@@ -58,6 +59,8 @@ from engine.config import (
     POSITION_SIZE_PCT, SMALL_ACCOUNT_POSITION_SIZE_PCT,
     CONF_SCALE_MIN_MULT, CONF_SCALE_FULL_CONF,
     MAX_POSITION_SIZE_PCT,
+    STRATEGY_KELLY_MULT, STRATEGY_KELLY_MULT_DEFAULT,
+    THIN_LIQUIDITY_EXCLUDED_STRATEGIES,
     CONF_RATCHET_ENABLED, CONF_RATCHET_TRIGGER_GAIN_PCT, CONF_RATCHET_MAX_TIGHTEN,
     MOMENTUM_FRESHNESS_ENABLED, MOMENTUM_FRESHNESS_STRATEGIES,
     TRADE_STALE_MOMENTUM_REJECTS,
@@ -131,12 +134,16 @@ def _resolve_freshness_reject(signal: Signal, fresh: bool, fade_reason: Optional
     fade_reason) unless TRADE_STALE_MOMENTUM_REJECTS, in which case the
     signal is flagged thin_liquidity=True (same reduced sizing as a
     guardrail admit, see _apply_thin_liquidity_override) and treated as
-    valid so it still trades. Split out for unit-testability without a
-    broker/bars connection — mutates signal in place same as the inline
-    version would, callers pass their own Signal instance."""
+    valid so it still trades -- UNLESS signal.strategy is in
+    THIN_LIQUIDITY_EXCLUDED_STRATEGIES (2026-08-15: ORB/GapBreakout,
+    measured net-negative specifically on their bypass trades), in which
+    case it's hard-blocked regardless of the toggle. Split out for
+    unit-testability without a broker/bars connection — mutates signal in
+    place same as the inline version would, callers pass their own Signal
+    instance."""
     if fresh:
         return True, None
-    if not TRADE_STALE_MOMENTUM_REJECTS:
+    if not TRADE_STALE_MOMENTUM_REJECTS or signal.strategy in THIN_LIQUIDITY_EXCLUDED_STRATEGIES:
         return False, fade_reason
     signal.thin_liquidity = True
     return True, None
@@ -234,6 +241,22 @@ def _apply_confidence_size_ramp(risk_info: Dict, confidence: float, equity: floa
     frac     = min(1.0, (confidence - CONF_SCALE_FULL_CONF) / span)
     ramp_pct = base_pct + (MAX_POSITION_SIZE_PCT - base_pct) * frac
     return dict(risk_info, allocation_pct=ramp_pct, dollar_amount=round(equity * ramp_pct / 100.0, 2))
+
+
+def _apply_strategy_kelly_mult(risk_info: Dict, strategy: str, equity: float) -> Dict:
+    """2026-08-15, user request: per-strategy sizing informed by each
+    strategy's own Kelly % (STRATEGY_KELLY_MULT in config.py -- GapBreakout
+    2.0x, TrendBreaker 0.25x, everything else unchanged at 1.0x). Straight
+    multiplier on whatever allocation_pct the confidence ramp already
+    produced; MAX_POSITION_CONCENTRATION_PCT (the hard per-symbol cap,
+    enforced separately at order-sizing time) is still the ultimate
+    ceiling, so a 2x multiplier can't on its own push a position past that
+    limit. Returns risk_info unchanged for a 1.0x (default) strategy."""
+    mult = STRATEGY_KELLY_MULT.get(strategy, STRATEGY_KELLY_MULT_DEFAULT)
+    if mult == 1.0:
+        return risk_info
+    new_pct = risk_info["allocation_pct"] * mult
+    return dict(risk_info, allocation_pct=new_pct, dollar_amount=round(equity * new_pct / 100.0, 2))
 
 
 def _trail_pct_for(symbol: str, price: float, entry_log: Dict) -> Tuple[float, str]:
@@ -1143,6 +1166,16 @@ class EnhancedExecutor:
             log.debug(
                 f"[SIZE] {signal.symbol} conf={signal.confidence:.0%} > {CONF_SCALE_FULL_CONF:.0%} "
                 f"— confidence size ramp: allocation {_pre_bonus_pct:.1f}% → {risk_info['allocation_pct']:.1f}% "
+                f"(${risk_info['dollar_amount']:,.0f})"
+            )
+
+        _pre_kelly_pct = risk_info["allocation_pct"]
+        risk_info = _apply_strategy_kelly_mult(risk_info, signal.strategy, acct.equity)
+        if risk_info["allocation_pct"] != _pre_kelly_pct:
+            log.debug(
+                f"[SIZE] {signal.symbol} [{signal.strategy}] Kelly mult "
+                f"{STRATEGY_KELLY_MULT.get(signal.strategy, STRATEGY_KELLY_MULT_DEFAULT):.2f}x: "
+                f"allocation {_pre_kelly_pct:.1f}% → {risk_info['allocation_pct']:.1f}% "
                 f"(${risk_info['dollar_amount']:,.0f})"
             )
 
@@ -2734,6 +2767,93 @@ class EnhancedExecutor:
         # Drop history for symbols no longer held or no longer in scope
         for sym in [s for s in self._price_drift_history if s not in live_syms]:
             self._price_drift_history.pop(sym, None)
+
+    @staticmethod
+    def _swing_drift_stop_reason(current: float, entry: Optional[float], is_long: bool, stop_pct: float) -> Optional[str]:
+        """Pure decision function for check_swing_drift_stop() -- entry price
+        only (no 30-min-ago leg; doesn't map across multiple days the way it
+        does intraday). Longs: current below entry by more than stop_pct%.
+        Shorts: mirrored (current above entry)."""
+        if entry is None or entry <= 0:
+            return None
+        adverse_pct = ((entry - current) / entry * 100) if is_long else ((current - entry) / entry * 100)
+        if adverse_pct > stop_pct:
+            return f"${entry:.2f}->${current:.2f} ({adverse_pct:+.1f}%)"
+        return None
+
+    def check_swing_drift_stop(self) -> None:
+        """Wider-threshold sibling of check_price_drift_stop() for positions
+        it doesn't cover -- anything NOT a same-day entry (multi-day swing
+        holds). 2026-08-15, user request: idea #3 of six suggested
+        improvements, built after TrendBreaker's multi-day losers (NWL
+        -5.41% held 55h) sat unwatched between entry and its normal, much
+        wider trailing stop for days at a time. See SWING_DRIFT_STOP_PCT in
+        config.py for the reasoning and which trades this would/wouldn't
+        have caught."""
+        if not SWING_DRIFT_STOP_ENABLED:
+            return
+
+        try:
+            positions = self.client.get_all_positions()
+        except Exception as e:
+            log.warning(f"check_swing_drift_stop: fetch failed: {e}")
+            return
+
+        today = datetime.date.today()
+        for pos in positions:
+            sym = pos.symbol
+            if re.match(r'^[A-Z]+\d{6}[CP]\d{8}$', sym):
+                continue  # options legs — managed separately
+            qty = int(float(pos.qty))
+            if qty == 0:
+                continue
+
+            entry_info = self._entry_log.get(sym)
+            if entry_info and entry_info.get("date") == today:
+                continue  # same-day — covered by check_price_drift_stop() already
+
+            try:
+                current = float(pos.current_price)
+                entry   = float(pos.avg_entry_price)
+            except (TypeError, ValueError):
+                continue
+            if current <= 0:
+                continue
+
+            is_long = qty > 0
+            reason = self._swing_drift_stop_reason(current, entry, is_long, SWING_DRIFT_STOP_PCT)
+            if reason is None:
+                continue
+
+            try:
+                sym_orders = [o for o in (self.client.get_orders() or []) if o.symbol == sym]
+                for _o in sym_orders:
+                    try:
+                        self.client.cancel_order_by_id(str(_o.id))
+                    except Exception:
+                        pass
+                if sym_orders:
+                    time.sleep(0.4)
+            except Exception as e:
+                log.warning(f"check_swing_drift_stop {sym}: order fetch/cancel failed, will retry next cycle: {e}")
+                continue
+
+            side = OrderSide.SELL if is_long else OrderSide.BUY
+            try:
+                self._submit_closing_order(sym, abs(qty), side, current)
+                log.warning(f"SWING DRIFT STOP {sym}: {abs(qty)} shares | {reason}")
+            except Exception as e:
+                log.error(f"SWING DRIFT STOP {sym}: close failed: {e}")
+                try:
+                    trail_pct, _ = _trail_pct_for(sym, current, self._entry_log)
+                    self.client.submit_order(TrailingStopOrderRequest(
+                        symbol=sym, qty=abs(qty), side=side,
+                        type=AlpacaOrderType.TRAILING_STOP, time_in_force=TimeInForce.GTC,
+                        trail_percent=trail_pct,
+                    ))
+                    log.warning(f"check_swing_drift_stop {sym}: re-armed GTC trailing stop after failed close")
+                except Exception as rearm_err:
+                    log.error(f"check_swing_drift_stop {sym}: close failed AND GTC re-arm failed — position may be UNPROTECTED: {rearm_err}")
 
     # ── Kill Mode: Emergency Close All ───────────────────────────────────────
     def emergency_close_all(self, equity: float) -> None:

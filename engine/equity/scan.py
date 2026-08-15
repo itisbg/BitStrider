@@ -64,6 +64,7 @@ from engine.config import (
     HMM_REGIME_LOOKBACK_DAYS,
     HMM_REGIME_CONFIDENCE_BOOST,
     TRADE_THIN_LIQUIDITY_REJECTS,
+    THIN_LIQUIDITY_EXCLUDED_STRATEGIES,
 )
 from engine.utils import MarketState, clear_bar_cache, get_bars, get_daily_volume_bars, is_dead_ticker, get_hmm_regime
 from engine.utils.bars import get_data_client as _get_data_client
@@ -622,6 +623,15 @@ def scan_universe(scan_targets: List[str], sentiment: str, market_state: MarketS
             return None
         best = max(candidates, key=lambda s: s.confidence)
         if thin_liquidity:
+            # 2026-08-15: the guardrail-admit decision above happens before we
+            # know which strategy will actually fire (it's a symbol-level gate,
+            # strategies get scanned after). ORB/GapBreakout measured net-
+            # negative specifically on their bypass trades (see
+            # THIN_LIQUIDITY_EXCLUDED_STRATEGIES in config.py) -- now that
+            # `best` tells us the winning strategy, drop the signal entirely
+            # for those two instead of admitting it at reduced size.
+            if best.strategy in THIN_LIQUIDITY_EXCLUDED_STRATEGIES:
+                return None
             best.thin_liquidity = True
 
         # Per-symbol HMM regime alignment: confidence bonus only, never a gate.

@@ -290,6 +290,16 @@ CORRELATION_GROUPS = {
     },
 }
 
+# 2026-08-15, user request: idea #6 of six suggested improvements.
+# enforce_position_concentration()/enforce_correlation_concentration() used
+# to run inline inside scan_and_trade(), gated behind four separate early-
+# returns above them (market-closed, kill-mode, entry-window, daily-loss-
+# limit/profit-target) despite being risk-REDUCTION actions on existing
+# positions, not new entries. Own fixed clock-grid schedule now (see
+# _concentration_check_job/_schedule_on_clock_grid in orchestrator.py),
+# runs regardless of those gates.
+CONCENTRATION_CHECK_INTERVAL_MIN = 10
+
 # Same-underlying leveraged-ETF pairs (bull+bear on one commodity/index, e.g.
 # BOIL/KOLD both on nat gas — arbitrary product names, no ticker pattern to
 # exploit, must be hand-maintained) — confirmed in production 2026-08-10:
@@ -374,6 +384,30 @@ CONF_SCALE_FULL_CONF = 0.85   # 100% of normal size at this confidence and above
 # 3%, unaffected by confidence). MAX_POSITION_SIZE_PCT (15%) sits safely
 # under MAX_POSITION_CONCENTRATION_PCT (20%, the hard per-symbol cap).
 MAX_POSITION_SIZE_PCT = 15.0
+
+# 2026-08-15, user request: "implement everything except 5" (a set of six
+# suggested improvements; #1 was per-strategy Kelly-informed sizing).
+# Kelly % = W - (1-W)/R computed from each strategy's actual matched
+# entry/exit trades since inception (n in parens):
+#   GapBreakout  (n=18): W=67%, R=1.49 -> Kelly +44% -- real edge, size up
+#   ORB          (n=82): W=51%, R=1.11 -> Kelly  +7% -- thin edge, ~unchanged
+#   TrendBreaker (n=18): W=56%, R=0.70 -> Kelly  -8% -- losers run bigger
+#     than winners despite the >50% win rate; shrink instead of disabling
+#     outright (its multi-day trades still get SWING_DRIFT_STOP_PCT
+#     protection, its same-day trades still get PRICE_DRIFT_STOP_PCT).
+# Applied as a straight multiplier on allocation_pct, after the confidence
+# ramp and before the thin-liquidity override (which still fully
+# overrides, unchanged) -- see _apply_strategy_kelly_mult() in enhanced.py.
+# Every strategy not listed defaults to 1.0 (unchanged) -- most have too
+# few trades (n<10) for a Kelly estimate to mean anything yet. Kept
+# conservative (not full/half-Kelly) given the small samples behind these
+# numbers; MAX_POSITION_CONCENTRATION_PCT (20%) is still the hard ceiling
+# regardless of this multiplier.
+STRATEGY_KELLY_MULT = {
+    "GapBreakout":  2.0,
+    "TrendBreaker": 0.25,
+}
+STRATEGY_KELLY_MULT_DEFAULT = 1.0
 
 # Small account reduction caps (sub-$5k equity)
 SMALL_ACCOUNT_POSITION_SIZE_PCT = 7.5   # same allocation as POSITION_SIZE_PCT for small accounts — reverted 2026-08-11
@@ -640,6 +674,29 @@ PRICE_DRIFT_STOP_ENABLED       = True
 PRICE_DRIFT_STOP_PCT           = 1.0    # % adverse move vs. EITHER entry OR the price PRICE_DRIFT_LOOKBACK_MIN ago that triggers an exit
 PRICE_DRIFT_CHECK_INTERVAL_MIN = 10     # how often the check runs, in step with the TI screener run
 PRICE_DRIFT_LOOKBACK_MIN       = 30     # how far back the comparison price is from ("price from 30 min ago")
+
+# ─────────────────────────────────────────────────────────────────
+# Swing/Multi-Day Drift Stop -- wider sibling of the price drift stop above,
+# for positions NOT covered by it. check_price_drift_stop() only watches
+# same-day entries (entry_log[sym]['date'] == today); anything older is
+# left on its normal (much wider, dynamic-tier) trailing stop alone.
+#
+# 2026-08-15, user request: idea #3 of six suggested improvements, built
+# after TrendBreaker's multi-day losers surfaced (NWL -5.41% held 55h,
+# IMMR -2.71% held 24h, IMAX -1.85% held 21h) with nothing between entry
+# and the wide trailing stop watching them for the days in between. Only
+# NWL would actually have tripped a 3% cap -- IMMR/IMAX stay under it, so
+# this targets tail losses, not every swing drawdown. No 30-min-ago leg
+# here (doesn't map across multiple days the way it does intraday) --
+# entry price alone is the reference. Checked every
+# SWING_DRIFT_STOP_CHECK_INTERVAL_MIN, on the same fixed clock-grid
+# pattern as the price drift stop (see _schedule_on_clock_grid in
+# orchestrator.py) -- 30 min is plenty for a multi-day thesis, no need for
+# 10-min granularity here.
+# ─────────────────────────────────────────────────────────────────
+SWING_DRIFT_STOP_ENABLED             = True
+SWING_DRIFT_STOP_PCT                 = 3.0   # % adverse move vs. entry price alone that trims a MULTI-DAY position
+SWING_DRIFT_STOP_CHECK_INTERVAL_MIN  = 30
 
 # ─────────────────────────────────────────────────────────────────
 # Swing Position Staleness Exit
@@ -1030,6 +1087,25 @@ MIN_FLOAT_SHARES_HARD_FLOOR = 1_000_000
 # close regardless of how it got in.
 TRADE_THIN_LIQUIDITY_REJECTS     = True   # master switch for this path — enabled 2026-08-12 at the user's request
 THIN_LIQUIDITY_POSITION_SIZE_PCT = 3.0
+
+# 2026-08-15, user request: idea #2 of six suggested improvements. Measured
+# (not projected) from actual historical trades, split by guardrail status,
+# for the strategies still active: thin-liquidity-bypass trades net -$13.85
+# combined, while the SAME strategies' normal (guardrail-passing) trades
+# net +$77.73 -- the bypass is a pure drag specifically for these two:
+#   ORB:         normal 57% win/+$34.23 (n=65)  vs bypass 29% win/-$12.25 (n=17)
+#   GapBreakout: normal 77% win/+$45.31 (n=13)  vs bypass 40% win/-$1.80  (n=5)
+# Other still-active strategies (TrendBreaker, LiquiditySweep, PMHighBreakout,
+# Sentiment, Technical, VWAPReclaim) either had too few bypass trades to
+# judge or didn't show the same pattern, so left alone -- this is scoped to
+# the two strategies where the effect was actually measured, not applied
+# blanket. A signal from either strategy that would only qualify via
+# thin-liquidity admit (guardrail rescue or stale-momentum trade-through)
+# is now hard-skipped instead of traded at reduced size -- same as before
+# TRADE_THIN_LIQUIDITY_REJECTS/TRADE_STALE_MOMENTUM_REJECTS existed, but
+# only for these two strategies. See _scan_one() in scan.py and
+# _resolve_freshness_reject() in enhanced.py.
+THIN_LIQUIDITY_EXCLUDED_STRATEGIES = {"ORB", "GapBreakout"}
 
 # 2026-08-14, user request: "I told ones which fail guard will be traded too
 # but with lower portfolio limit" -- extending the same trade-anyway-at-

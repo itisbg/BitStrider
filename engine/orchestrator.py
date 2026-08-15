@@ -549,7 +549,8 @@ def scan_and_trade(ctx: AppContext) -> None:
     if not _within_entry_window(market_state.now):
         log.info(
             f"[SYSTEM] Outside entry window ({cfg.ENTRY_WINDOW_START_ET}-{cfg.ENTRY_WINDOW_END_ET} ET) "
-            f"— skipping discovery/scan this cycle (existing stops/TP/concentration checks still ran above)"
+            f"— skipping discovery/scan this cycle (concentration/correlation checks run on their own "
+            f"schedule now, unaffected by this gate — see _concentration_check_job)"
         )
         return
 
@@ -571,8 +572,6 @@ def scan_and_trade(ctx: AppContext) -> None:
 
     ctx.executor.update_stale_orders()
     ctx.executor.check_tp_targets()
-    ctx.executor.enforce_position_concentration()
-    ctx.executor.enforce_correlation_concentration()
 
     acct = ctx.executor._get_account()
     min_needed = (
@@ -788,6 +787,35 @@ def _price_drift_stop_job(ctx: AppContext) -> None:
         log.error(f"check_price_drift_stop error: {e}", exc_info=True)
 
 
+def _swing_drift_stop_job(ctx: AppContext) -> None:
+    """schedule-driven wrapper for check_swing_drift_stop -- wider-threshold
+    sibling of _price_drift_stop_job for multi-day positions, its own
+    SWING_DRIFT_STOP_CHECK_INTERVAL_MIN cadence (30 min)."""
+    try:
+        ctx.executor.check_swing_drift_stop()
+    except Exception as e:
+        log.error(f"check_swing_drift_stop error: {e}", exc_info=True)
+
+
+def _concentration_check_job(ctx: AppContext) -> None:
+    """schedule-driven wrapper for enforce_position_concentration/
+    enforce_correlation_concentration -- 2026-08-15, user request: idea #6
+    of six suggested improvements. These used to run inline inside
+    scan_and_trade(), which meant they were gated behind FOUR separate
+    early-returns above them (market-closed, kill-mode, entry-window,
+    daily-loss-limit/profit-target) despite being risk-REDUCTION actions on
+    existing positions, not new entries -- on a day the daily-loss-limit
+    trips, concentration trimming stopped right when it mattered most. Own
+    fixed clock-grid schedule now (CONCENTRATION_CHECK_INTERVAL_MIN), same
+    decoupling reasoning as _guardrail_close_job/_price_drift_stop_job,
+    runs regardless of any of those four gates."""
+    try:
+        ctx.executor.enforce_position_concentration()
+        ctx.executor.enforce_correlation_concentration()
+    except Exception as e:
+        log.error(f"concentration check error: {e}", exc_info=True)
+
+
 def _schedule_on_clock_grid(interval_min: int, job, *args) -> None:
     """Register `job` to run at fixed wall-clock marks (:00, :10, :20, ... for
     interval_min=10) instead of schedule.every(N).minutes, which counts N
@@ -980,6 +1008,8 @@ def start() -> None:
     schedule.every(1).minutes.do(_guardrail_close_job, ctx)
     schedule.every(1).minutes.do(_eod_close_job, ctx)
     _schedule_on_clock_grid(cfg.PRICE_DRIFT_CHECK_INTERVAL_MIN, _price_drift_stop_job, ctx)
+    _schedule_on_clock_grid(cfg.SWING_DRIFT_STOP_CHECK_INTERVAL_MIN, _swing_drift_stop_job, ctx)
+    _schedule_on_clock_grid(cfg.CONCENTRATION_CHECK_INTERVAL_MIN, _concentration_check_job, ctx)
 
     try:
         while True:
