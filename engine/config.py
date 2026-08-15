@@ -361,13 +361,19 @@ CONF_SCALE_FULL_CONF = 0.85   # 100% of normal size at this confidence and above
 
 # 2026-08-13, user request: the scaling above plateaus at 1.0x (full
 # POSITION_SIZE_PCT) for anything >= CONF_SCALE_FULL_CONF (85%) -- 85% and
-# 99% confidence get sized identically. This adds one more tier on top: a
-# 1.5x MULTIPLIER (7.5% -> 11.25%, not a flat +1.5-point add -- confirmed
-# with the user, "7.5 to 11% not 9") for genuinely exceptional signals above
-# this threshold. Applied before the thin-liquidity override (still trumps
-# everything with its own flat 3%, unaffected by confidence).
-HIGH_CONFIDENCE_BONUS_THRESHOLD = 0.92
-HIGH_CONFIDENCE_BONUS_MULT      = 1.5   # multiplies allocation_pct
+# 99% confidence get sized identically. Originally patched with a flat
+# 1.5x step above a 92% threshold (7.5% -> 11.25%, nothing in between).
+#
+# 2026-08-15, user request: "increase the percentage progressively maximum
+# to 15% maximum per ticker" -- replaced the flat step with a continuous
+# ramp instead: allocation_pct rises linearly from the base % (at
+# CONF_SCALE_FULL_CONF, 85%) up to MAX_POSITION_SIZE_PCT (100% confidence),
+# so every confidence level above 85% gets its own size, not just two
+# tiers. See _apply_confidence_size_ramp() in enhanced.py. Applied before
+# the thin-liquidity override (still trumps everything with its own flat
+# 3%, unaffected by confidence). MAX_POSITION_SIZE_PCT (15%) sits safely
+# under MAX_POSITION_CONCENTRATION_PCT (20%, the hard per-symbol cap).
+MAX_POSITION_SIZE_PCT = 15.0
 
 # Small account reduction caps (sub-$5k equity)
 SMALL_ACCOUNT_POSITION_SIZE_PCT = 7.5   # same allocation as POSITION_SIZE_PCT for small accounts — reverted 2026-08-11

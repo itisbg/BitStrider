@@ -57,7 +57,7 @@ from engine.config import (
     SMALL_ACCOUNT_MIN_POSITION_DOLLARS,
     POSITION_SIZE_PCT, SMALL_ACCOUNT_POSITION_SIZE_PCT,
     CONF_SCALE_MIN_MULT, CONF_SCALE_FULL_CONF,
-    HIGH_CONFIDENCE_BONUS_THRESHOLD, HIGH_CONFIDENCE_BONUS_MULT,
+    MAX_POSITION_SIZE_PCT,
     CONF_RATCHET_ENABLED, CONF_RATCHET_TRIGGER_GAIN_PCT, CONF_RATCHET_MAX_TIGHTEN,
     MOMENTUM_FRESHNESS_ENABLED, MOMENTUM_FRESHNESS_STRATEGIES,
     TRADE_STALE_MOMENTUM_REJECTS,
@@ -211,20 +211,29 @@ def _apply_thin_liquidity_override(risk_info: Dict, signal: Signal, equity: floa
     return out
 
 
-def _apply_high_confidence_bonus(risk_info: Dict, confidence: float, equity: float) -> Dict:
+def _apply_confidence_size_ramp(risk_info: Dict, confidence: float, equity: float) -> Dict:
     """2026-08-13, user request: confidence-scaling (_execute_entry's
     CONF_SCALE_MIN_MULT..CONF_SCALE_FULL_CONF ramp) plateaus at 1.0x for any
-    confidence >= 85% -- 85% and 99% get sized identically. This adds one
-    more tier: allocation_pct x HIGH_CONFIDENCE_BONUS_MULT (7.5% -> 11.25%
-    at the default 1.5x -- a multiplier, not a flat point-add: "7.5 to 11%
-    not 9") for confidence strictly above HIGH_CONFIDENCE_BONUS_THRESHOLD
-    (92%). Returns risk_info unchanged otherwise. Applied before
-    _apply_thin_liquidity_override in the caller, which fully overrides --
-    not stacks with -- either scaling step."""
-    if confidence <= HIGH_CONFIDENCE_BONUS_THRESHOLD:
+    confidence >= 85% -- 85% and 99% get sized identically. Originally
+    patched with a flat step above 92% confidence.
+
+    2026-08-15, user request: "increase the percentage progressively
+    maximum to 15% maximum per ticker" -- replaced the flat step with a
+    continuous linear ramp: allocation_pct rises from the base %
+    (risk_info['allocation_pct'], i.e. POSITION_SIZE_PCT/SMALL_ACCOUNT_
+    POSITION_SIZE_PCT) at CONF_SCALE_FULL_CONF (85%) up to
+    MAX_POSITION_SIZE_PCT (15%) at 100% confidence -- every confidence
+    level above 85% now gets its own size instead of just two tiers.
+    Returns risk_info unchanged at or below CONF_SCALE_FULL_CONF. Applied
+    before _apply_thin_liquidity_override in the caller, which fully
+    overrides -- not stacks with -- either scaling step."""
+    if confidence <= CONF_SCALE_FULL_CONF:
         return risk_info
-    bonus_pct = risk_info["allocation_pct"] * HIGH_CONFIDENCE_BONUS_MULT
-    return dict(risk_info, allocation_pct=bonus_pct, dollar_amount=round(equity * bonus_pct / 100.0, 2))
+    base_pct = risk_info["allocation_pct"]
+    span     = max(1e-6, 1.0 - CONF_SCALE_FULL_CONF)
+    frac     = min(1.0, (confidence - CONF_SCALE_FULL_CONF) / span)
+    ramp_pct = base_pct + (MAX_POSITION_SIZE_PCT - base_pct) * frac
+    return dict(risk_info, allocation_pct=ramp_pct, dollar_amount=round(equity * ramp_pct / 100.0, 2))
 
 
 def _trail_pct_for(symbol: str, price: float, entry_log: Dict) -> Tuple[float, str]:
@@ -1129,11 +1138,11 @@ class EnhancedExecutor:
         )
 
         _pre_bonus_pct = risk_info["allocation_pct"]
-        risk_info = _apply_high_confidence_bonus(risk_info, signal.confidence, acct.equity)
+        risk_info = _apply_confidence_size_ramp(risk_info, signal.confidence, acct.equity)
         if risk_info["allocation_pct"] != _pre_bonus_pct:
             log.debug(
-                f"[SIZE] {signal.symbol} conf={signal.confidence:.0%} > {HIGH_CONFIDENCE_BONUS_THRESHOLD:.0%} "
-                f"— high-confidence bonus: allocation {_pre_bonus_pct:.1f}% → {risk_info['allocation_pct']:.1f}% "
+                f"[SIZE] {signal.symbol} conf={signal.confidence:.0%} > {CONF_SCALE_FULL_CONF:.0%} "
+                f"— confidence size ramp: allocation {_pre_bonus_pct:.1f}% → {risk_info['allocation_pct']:.1f}% "
                 f"(${risk_info['dollar_amount']:,.0f})"
             )
 

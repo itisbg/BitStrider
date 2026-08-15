@@ -36,11 +36,11 @@ sys.path.insert(0, str(ROOT))
 import engine.equity.scan as scan
 from engine.equity.strategies import Signal
 from engine.execution.enhanced import (
-    _apply_thin_liquidity_override, _apply_high_confidence_bonus, _resolve_freshness_reject,
+    _apply_thin_liquidity_override, _apply_confidence_size_ramp, _resolve_freshness_reject,
 )
 from engine.config import (
     THIN_LIQUIDITY_POSITION_SIZE_PCT, TRADE_STALE_MOMENTUM_REJECTS,
-    HIGH_CONFIDENCE_BONUS_THRESHOLD, HIGH_CONFIDENCE_BONUS_MULT,
+    CONF_SCALE_FULL_CONF, MAX_POSITION_SIZE_PCT,
 )
 
 # NOTE: TRADE_THIN_LIQUIDITY_REJECTS's live value is a deployment decision
@@ -98,31 +98,48 @@ assert out["dollar_amount"] == 60.0, f"expected 3% of $2000 = $60, got {out['dol
 assert out["allocation_pct"] == 3.0
 assert risk_info["dollar_amount"] == 150.0, "original dict must not be mutated in place"
 
-# --- _apply_high_confidence_bonus(): 1.5x multiplier above 92% confidence ---
+# --- _apply_confidence_size_ramp(): continuous ramp from base % to 15% ---
+# (2026-08-15, replaced the old flat 1.5x-above-92% step: "increase the
+# percentage progressively maximum to 15% maximum per ticker")
 
-assert HIGH_CONFIDENCE_BONUS_THRESHOLD == 0.92
-assert HIGH_CONFIDENCE_BONUS_MULT == 1.5
+assert CONF_SCALE_FULL_CONF == 0.85
+assert MAX_POSITION_SIZE_PCT == 15.0
 
 risk_info = {"dollar_amount": 150.0, "allocation_pct": 7.5, "tier": "NORMAL"}
 
-# At or below threshold -> unchanged, same dict (no copy).
-out = _apply_high_confidence_bonus(risk_info, confidence=0.92, equity=2000.0)
-assert out is risk_info, "at the threshold (not above it) must not bonus"
-out = _apply_high_confidence_bonus(risk_info, confidence=0.85, equity=2000.0)
+# At or below the ramp's start point -> unchanged, same dict (no copy).
+out = _apply_confidence_size_ramp(risk_info, confidence=0.85, equity=2000.0)
+assert out is risk_info, "at the ramp start (not above it) must not scale"
+out = _apply_confidence_size_ramp(risk_info, confidence=0.70, equity=2000.0)
 assert out is risk_info
 
-# Above threshold -> allocation_pct x 1.5 (7.5 -> 11.25, a multiplier not a
-# flat point-add), dollar_amount recomputed from equity at the new pct.
-out = _apply_high_confidence_bonus(risk_info, confidence=0.93, equity=2000.0)
-assert out["allocation_pct"] == 11.25, f"expected 7.5 x 1.5 = 11.25, got {out['allocation_pct']}"
-assert out["dollar_amount"] == 225.0, f"expected 11.25% of $2000 = $225, got {out['dollar_amount']}"
+# Exactly at 100% confidence -> exactly MAX_POSITION_SIZE_PCT, regardless
+# of the base %.
+out = _apply_confidence_size_ramp(risk_info, confidence=1.0, equity=2000.0)
+assert out["allocation_pct"] == 15.0, f"expected the 15% ceiling, got {out['allocation_pct']}"
+assert out["dollar_amount"] == 300.0, f"expected 15% of $2000 = $300, got {out['dollar_amount']}"
 assert risk_info["allocation_pct"] == 7.5, "original dict must not be mutated in place"
 
-# Multiplies whatever allocation_pct already is (e.g. a small-account rate),
-# doesn't reset to a fixed value.
+# Halfway between the ramp start (85%) and 100% -> halfway between base and
+# ceiling (7.5 -> 11.25, a continuous point, not a flat step).
+out = _apply_confidence_size_ramp(risk_info, confidence=0.925, equity=2000.0)
+assert round(out["allocation_pct"], 6) == 11.25, f"expected the ramp's midpoint 11.25%, got {out['allocation_pct']}"
+
+# Ramps toward the SAME absolute ceiling (15%) regardless of the base % —
+# e.g. a small-account 5.0% base still reaches 15% at 100% confidence, not
+# 5.0 x some fixed multiplier.
 small_risk_info = {"dollar_amount": 50.0, "allocation_pct": 5.0, "tier": "NORMAL"}
-out = _apply_high_confidence_bonus(small_risk_info, confidence=0.99, equity=1000.0)
-assert out["allocation_pct"] == 7.5, f"expected 5.0 x 1.5 = 7.5, got {out['allocation_pct']}"
+out = _apply_confidence_size_ramp(small_risk_info, confidence=1.0, equity=1000.0)
+assert out["allocation_pct"] == 15.0, f"expected the absolute 15% ceiling, got {out['allocation_pct']}"
+
+# Monotonic: allocation_pct never decreases as confidence rises through the ramp.
+prev = 7.5
+for conf_pct in range(85, 101):
+    out = _apply_confidence_size_ramp(risk_info, confidence=conf_pct / 100, equity=2000.0)
+    cur = out["allocation_pct"]
+    assert cur >= prev, f"conf={conf_pct}%: allocation_pct dropped from {prev} to {cur}"
+    assert cur <= 15.0, f"conf={conf_pct}%: allocation_pct {cur} exceeded the 15% ceiling"
+    prev = cur
 
 # --- _resolve_freshness_reject(): stale-momentum trades anyway at reduced size ---
 
@@ -154,4 +171,5 @@ try:
 finally:
     enhanced.TRADE_STALE_MOMENTUM_REJECTS = _orig_toggle
 
-print("OK: thin-liquidity admit path, high-confidence sizing bonus, and stale-momentum reduced-size trade-through all check out")
+print("OK: thin-liquidity admit path, confidence-based size ramp (base % -> 15% ceiling), "
+      "and stale-momentum reduced-size trade-through all check out")
