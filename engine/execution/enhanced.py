@@ -248,14 +248,25 @@ def _apply_strategy_kelly_mult(risk_info: Dict, strategy: str, equity: float) ->
     strategy's own Kelly % (STRATEGY_KELLY_MULT in config.py -- GapBreakout
     2.0x, TrendBreaker 0.25x, everything else unchanged at 1.0x). Straight
     multiplier on whatever allocation_pct the confidence ramp already
-    produced; MAX_POSITION_CONCENTRATION_PCT (the hard per-symbol cap,
-    enforced separately at order-sizing time) is still the ultimate
-    ceiling, so a 2x multiplier can't on its own push a position past that
-    limit. Returns risk_info unchanged for a 1.0x (default) strategy."""
+    produced, clamped to MAX_POSITION_CONCENTRATION_PCT (the hard
+    per-symbol cap, also enforced independently and more precisely at
+    order-sizing time via signal.price/buying power in
+    _size_with_buying_power -- this clamp is defense-in-depth so risk_info
+    itself never CLAIMS more than the real ceiling allows).
+
+    2026-08-15: found by running the full sizing pipeline against real
+    symbols/confidences -- GapBreakout at 95% confidence ramps to 12.5%
+    BEFORE this multiplier runs, so the unclamped 2.0x pushed
+    allocation_pct/dollar_amount to 25%, past the 20% cap, even though
+    the final executed share count was already correctly capped
+    downstream. Harmless to the actual trade, but risk_info and the debug
+    log line built from it were overstating what would really execute --
+    clamped here so they can't diverge from reality at any pipeline stage.
+    Returns risk_info unchanged for a 1.0x (default) strategy."""
     mult = STRATEGY_KELLY_MULT.get(strategy, STRATEGY_KELLY_MULT_DEFAULT)
     if mult == 1.0:
         return risk_info
-    new_pct = risk_info["allocation_pct"] * mult
+    new_pct = min(risk_info["allocation_pct"] * mult, MAX_POSITION_CONCENTRATION_PCT)
     return dict(risk_info, allocation_pct=new_pct, dollar_amount=round(equity * new_pct / 100.0, 2))
 
 

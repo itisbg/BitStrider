@@ -48,17 +48,23 @@ assert out["dollar_amount"] == 37.5, f"expected 1.875% of $2000 = $37.50, got {o
 out = _apply_strategy_kelly_mult(risk_info, "Sentiment", equity=2000.0)
 assert out is risk_info
 
-# GapBreakout's 2.0x can push allocation_pct above MAX_POSITION_CONCENTRATION_PCT
-# on its own (7.5 x 2.0 = 15%, still under 20% -- but at a higher base %,
-# e.g. after the confidence ramp already pushed it toward 15%, doubling
-# again would exceed it). This function does NOT clamp -- that's
-# _size_with_buying_power's/entry-sizing's job downstream, same hard cap
-# already enforced there regardless of how allocation_pct got so high.
+# 2026-08-15: found by running the full sizing pipeline against a real
+# GapBreakout/95%-confidence combo -- the confidence ramp alone pushes
+# allocation_pct to 12.5%, and the unclamped 2.0x would then push it to
+# 25%, past MAX_POSITION_CONCENTRATION_PCT (20%). The FINAL executed
+# share count was already correctly capped downstream in
+# _size_with_buying_power either way, but risk_info/dollar_amount and the
+# debug log built from them were overstating what would really execute.
+# Clamped here too (defense-in-depth) so risk_info can never claim more
+# than the real ceiling at any pipeline stage.
 high_base = {"dollar_amount": 300.0, "allocation_pct": 15.0, "tier": "NORMAL"}
 out = _apply_strategy_kelly_mult(high_base, "GapBreakout", equity=2000.0)
-assert out["allocation_pct"] == 30.0, "the multiplier itself is unclamped by design -- downstream sizing caps it"
-assert out["allocation_pct"] > MAX_POSITION_CONCENTRATION_PCT, (
-    "confirms downstream clamping is load-bearing here, not optional"
+assert out["allocation_pct"] == MAX_POSITION_CONCENTRATION_PCT, (
+    f"7.5 x 2.0 -> 15 x 2.0 = 30, must be clamped to the {MAX_POSITION_CONCENTRATION_PCT}% cap, "
+    f"got {out['allocation_pct']}"
+)
+assert out["dollar_amount"] == 2000.0 * MAX_POSITION_CONCENTRATION_PCT / 100.0, (
+    "dollar_amount must be recomputed from the CLAMPED pct, not the raw 30%"
 )
 
 print("OK: per-strategy Kelly multiplier sizes GapBreakout up (2.0x), TrendBreaker down (0.25x), "
