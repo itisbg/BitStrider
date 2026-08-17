@@ -300,6 +300,24 @@ CORRELATION_GROUPS = {
 # runs regardless of those gates.
 CONCENTRATION_CHECK_INTERVAL_MIN = 10
 
+# ─────────────────────────────────────────────────────────────────
+# Portfolio-Wide Leverage Cap
+# 2026-08-17, user request: "restrict portfolio value to 1.5x the actual
+# account [equity], [not] the margin account" -- Alpaca's own buying_power
+# already reflects margin (roughly 2x-4x equity depending on account type/
+# PDT status); this is a SEPARATE, stricter ceiling on TOTAL exposure
+# across every open position combined, independent of whatever margin the
+# broker would otherwise extend. MAX_POSITION_CONCENTRATION_PCT (20%) caps
+# one symbol; CORRELATION_GROUPS (25%) caps one correlated basket; this
+# caps the WHOLE book at once. Enforced two ways: at entry-sizing time
+# (_size_with_buying_power in enhanced.py won't size a new position past
+# the remaining headroom under the cap) and as a periodic backstop
+# (enforce_portfolio_leverage, same fixed clock-grid schedule as the other
+# concentration checks — see _concentration_check_job in orchestrator.py)
+# for a position that drifts over it through price appreciation alone.
+# ─────────────────────────────────────────────────────────────────
+MAX_PORTFOLIO_LEVERAGE = 1.5   # total open-position market value <= this x equity
+
 # Same-underlying leveraged-ETF pairs (bull+bear on one commodity/index, e.g.
 # BOIL/KOLD both on nat gas — arbitrary product names, no ticker pattern to
 # exploit, must be hand-maintained) — confirmed in production 2026-08-10:

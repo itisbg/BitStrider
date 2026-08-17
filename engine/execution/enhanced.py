@@ -50,7 +50,7 @@ from engine.config import (
     SWING_STALE_EXIT_ENABLED, SWING_STALE_DAYS, SWING_STALE_MIN_GAIN_PCT,
     NO_GAIN_EXIT_ENABLED, NO_GAIN_EXIT_HOURS, NO_GAIN_EXIT_MIN_PCT, NO_GAIN_EXIT_MAX_LOSS_PCT,
     AFTERHOURS_STOP_CHECK_ENABLED, AFTERHOURS_CHASE_STALE_SECONDS, AFTERHOURS_STOP_COOLDOWN_MIN,
-    MAX_POSITION_CONCENTRATION_PCT, CORRELATION_GROUPS,
+    MAX_POSITION_CONCENTRATION_PCT, CORRELATION_GROUPS, MAX_PORTFOLIO_LEVERAGE,
     LONG_ONLY_MODE,
     STALE_ORDER_MINUTES, STALE_ORDER_MINUTES_INTRADAY,
     KILL_MODE_TRAIL_PCT,
@@ -345,6 +345,20 @@ class PositionInfo:
 
     def is_short(self, symbol: str) -> bool:
         return self.has_position(symbol) and float(self.positions_dict[symbol].qty) < 0
+
+    def total_market_value(self) -> float:
+        """Sum of abs(market_value) across every open equity position
+        (options legs excluded — they're sized/margined separately, same
+        exclusion used throughout this file for concentration checks)."""
+        total = 0.0
+        for sym, pos in self.positions_dict.items():
+            if re.match(r'^[A-Z]+\d{6}[CP]\d{8}$', sym):
+                continue
+            try:
+                total += abs(float(pos.market_value))
+            except (TypeError, ValueError, AttributeError):
+                continue
+        return total
 
 
 @dataclass
@@ -935,11 +949,30 @@ class EnhancedExecutor:
 
         account_snapshot = self._account_cache or self._get_account()  # use cached if available
         max_concentration = int(account_snapshot.equity * MAX_POSITION_CONCENTRATION_PCT / 100.0 / signal.price)
-        shares  = min(desired, max_bp, max_concentration)
+
+        # 2026-08-17, user request: cap TOTAL exposure across every open
+        # position at MAX_PORTFOLIO_LEVERAGE x equity, independent of
+        # whatever margin the broker's own buying_power would otherwise
+        # allow (max_bp above already reflects margin -- this is a
+        # separate, usually-stricter ceiling on the whole book at once,
+        # not per-symbol). See enforce_portfolio_leverage() for the
+        # periodic backstop covering a position that drifts over the cap
+        # through price appreciation alone.
+        current_exposure   = self._get_positions().total_market_value()
+        leverage_cap_value = account_snapshot.equity * MAX_PORTFOLIO_LEVERAGE
+        leverage_headroom  = max(0.0, leverage_cap_value - current_exposure)
+        max_leverage        = int(leverage_headroom / (signal.price * margin))
+
+        shares  = min(desired, max_bp, max_concentration, max_leverage)
 
         min_position = SMALL_ACCOUNT_MIN_POSITION_DOLLARS if account_snapshot.equity < SMALL_ACCOUNT_EQUITY_THRESHOLD else MIN_POSITION_DOLLARS
 
         if shares < 1:
+            if max_leverage < 1:
+                return 0, (
+                    f"Portfolio leverage cap: ${current_exposure:,.0f} exposure already at/above "
+                    f"{MAX_PORTFOLIO_LEVERAGE:.1f}x equity (${leverage_cap_value:,.0f} cap) for {signal.symbol}"
+                )
             return 0, (
                 f"Insufficient BP: ${buying_power:,.0f} usable ${usable:,.0f} "
                 f"for {signal.symbol} @ ${signal.price:.2f} (x{margin:.0f} margin)"
@@ -1898,6 +1931,60 @@ class EnhancedExecutor:
                     excess -= trim_qty * current
                 except Exception as e:
                     log.error(f"enforce_correlation_concentration {sym}: trim failed: {e}")
+
+    def enforce_portfolio_leverage(self) -> None:
+        """Trim the largest position(s) if TOTAL market value across every
+        open position exceeds MAX_PORTFOLIO_LEVERAGE x equity. 2026-08-17,
+        user request: cap total exposure independent of whatever margin the
+        broker's buying_power would otherwise allow -- _size_with_buying_power
+        already blocks a NEW entry from pushing total exposure past this cap;
+        this is the backstop for the book drifting over it through price
+        appreciation alone on positions already held (same relationship
+        enforce_position_concentration has to per-symbol sizing)."""
+        try:
+            acct = self._get_account()
+            positions = self.client.get_all_positions()
+        except Exception as e:
+            log.warning(f"enforce_portfolio_leverage: fetch failed: {e}")
+            return
+        if acct.equity <= 0:
+            return
+
+        equity_positions = [
+            p for p in positions
+            if int(float(p.qty)) != 0 and not re.match(r'^[A-Z]+\d{6}[CP]\d{8}$', p.symbol)
+        ]
+        if not equity_positions:
+            return
+
+        total_value = sum(abs(float(p.market_value)) for p in equity_positions)
+        cap_value = acct.equity * MAX_PORTFOLIO_LEVERAGE
+        if total_value <= cap_value:
+            return
+
+        excess = total_value - cap_value
+        # Trim largest positions first — fewest orders, biggest single
+        # contributor to the breach comes down fastest.
+        for pos in sorted(equity_positions, key=lambda p: abs(float(p.market_value)), reverse=True):
+            if excess <= 0:
+                break
+            sym = pos.symbol
+            qty = int(float(pos.qty))
+            current = float(pos.current_price)
+            pos_value = abs(float(pos.market_value))
+            trim_qty = int(min(excess, pos_value) / current)
+            if trim_qty < 1:
+                continue
+            side = OrderSide.SELL if qty > 0 else OrderSide.BUY  # BUY-to-cover trims a short
+            try:
+                self._submit_closing_order(sym, trim_qty, side, current)
+                log.warning(
+                    f"PORTFOLIO LEVERAGE TRIM {sym}: {trim_qty} shares — book was "
+                    f"${total_value:,.0f} ({total_value / acct.equity:.1f}x equity), cap {MAX_PORTFOLIO_LEVERAGE:.1f}x"
+                )
+                excess -= trim_qty * current
+            except Exception as e:
+                log.error(f"enforce_portfolio_leverage {sym}: trim failed: {e}")
 
     # ── EOD Close ─────────────────────────────────────────────────────────────
     @staticmethod

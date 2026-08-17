@@ -808,10 +808,15 @@ def _concentration_check_job(ctx: AppContext) -> None:
     trips, concentration trimming stopped right when it mattered most. Own
     fixed clock-grid schedule now (CONCENTRATION_CHECK_INTERVAL_MIN), same
     decoupling reasoning as _guardrail_close_job/_price_drift_stop_job,
-    runs regardless of any of those four gates."""
+    runs regardless of any of those four gates.
+
+    2026-08-17: also runs enforce_portfolio_leverage() (caps TOTAL exposure
+    at MAX_PORTFOLIO_LEVERAGE x equity, independent of per-symbol/per-group
+    caps) on the same schedule."""
     try:
         ctx.executor.enforce_position_concentration()
         ctx.executor.enforce_correlation_concentration()
+        ctx.executor.enforce_portfolio_leverage()
     except Exception as e:
         log.error(f"concentration check error: {e}", exc_info=True)
 
