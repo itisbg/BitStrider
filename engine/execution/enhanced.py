@@ -51,6 +51,7 @@ from engine.config import (
     NO_GAIN_EXIT_ENABLED, NO_GAIN_EXIT_HOURS, NO_GAIN_EXIT_MIN_PCT, NO_GAIN_EXIT_MAX_LOSS_PCT,
     AFTERHOURS_STOP_CHECK_ENABLED, AFTERHOURS_CHASE_STALE_SECONDS, AFTERHOURS_STOP_COOLDOWN_MIN,
     MAX_POSITION_CONCENTRATION_PCT, CORRELATION_GROUPS, MAX_PORTFOLIO_LEVERAGE,
+    POSITION_CAP_GROWTH_FACTOR, POSITION_CAP_ABSOLUTE_MAX_PCT,
     LONG_ONLY_MODE,
     STALE_ORDER_MINUTES, STALE_ORDER_MINUTES_INTRADAY,
     KILL_MODE_TRAIL_PCT,
@@ -1838,11 +1839,27 @@ class EnhancedExecutor:
                 log.error(f"check_afterhours_stops {sym}: {e}")
 
     # ── Position Concentration Cap ───────────────────────────────────────────
+    @staticmethod
+    def _effective_concentration_cap_pct(gain_pct: float) -> float:
+        """2026-08-17, user request: "maximum holding as 20% of the
+        portfolio value and growing based on the continued positive
+        returns". A losing/flat position (gain_pct <= 0) keeps the plain
+        MAX_POSITION_CONCENTRATION_PCT (20%) cap. A winning position's cap
+        grows with its gain -- POSITION_CAP_GROWTH_FACTOR points of extra
+        room per point of unrealized gain -- up to
+        POSITION_CAP_ABSOLUTE_MAX_PCT (35%), never below the 20% base."""
+        bonus = max(0.0, gain_pct) * POSITION_CAP_GROWTH_FACTOR
+        return min(MAX_POSITION_CONCENTRATION_PCT + bonus, POSITION_CAP_ABSOLUTE_MAX_PCT)
+
     def enforce_position_concentration(self) -> None:
-        """Trim any position whose market value exceeds MAX_POSITION_CONCENTRATION_PCT
-        of account equity. Entry sizing already caps new buys at this limit (see
-        _size_with_buying_power), but an existing winner can still drift past it
-        through price appreciation alone — this is the backstop for that case."""
+        """Trim any position whose market value exceeds its effective
+        concentration cap (see _effective_concentration_cap_pct — the base
+        MAX_POSITION_CONCENTRATION_PCT for a losing/flat position, growing
+        room for a winner). Entry sizing caps new buys at the plain base
+        cap (see _size_with_buying_power -- a brand-new position has no
+        gain yet to grow from), but an existing winner can drift past its
+        (possibly wider) cap through further price appreciation — this is
+        the backstop for that case."""
         try:
             acct = self._get_account()
             positions = self.client.get_all_positions()
@@ -1851,7 +1868,6 @@ class EnhancedExecutor:
             return
         if acct.equity <= 0:
             return
-        cap_value = acct.equity * MAX_POSITION_CONCENTRATION_PCT / 100.0
         for pos in positions:
             sym = pos.symbol
             if re.match(r'^[A-Z]+\d{6}[CP]\d{8}$', sym):
@@ -1859,6 +1875,12 @@ class EnhancedExecutor:
             qty = int(float(pos.qty))
             if qty == 0:
                 continue
+            try:
+                gain_pct = float(pos.unrealized_plpc) * 100.0
+            except (TypeError, ValueError, AttributeError):
+                gain_pct = 0.0
+            cap_pct   = self._effective_concentration_cap_pct(gain_pct)
+            cap_value = acct.equity * cap_pct / 100.0
             market_value = abs(float(pos.market_value))
             if market_value <= cap_value:
                 continue
@@ -1871,7 +1893,8 @@ class EnhancedExecutor:
                 self._submit_closing_order(sym, trim_qty, side, current)
                 log.warning(
                     f"CONCENTRATION TRIM {sym}: {trim_qty} shares — ${market_value:,.0f} was "
-                    f"{market_value / acct.equity:.0%} of equity, cap {MAX_POSITION_CONCENTRATION_PCT:.0f}%"
+                    f"{market_value / acct.equity:.0%} of equity, cap {cap_pct:.0f}% "
+                    f"(gain {gain_pct:+.1f}%)"
                 )
             except Exception as e:
                 log.error(f"enforce_position_concentration {sym}: trim failed: {e}")

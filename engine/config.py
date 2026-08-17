@@ -276,6 +276,20 @@ POSITION_SIZE_PCT    = 7.5    # 7.5% per position → up to 12 positions within 
 MAX_POSITION_CONCENTRATION_PCT = 20.0  # Hard cap: no single symbol's market value may exceed this % of equity,
                                         # enforced both at entry sizing and by trimming winners that ran past it
 
+# 2026-08-17, user request: "maximum holding as 20% of the portfolio value
+# and growing based on the continued positive returns" -- the base 20% cap
+# above still applies to entry sizing (a brand-new position has no gain yet
+# to grow from) and to any losing/flat HELD position, but a position
+# currently showing an unrealized gain gets a wider personal cap instead of
+# being trimmed straight back to 20%: effective_cap = 20% + gain% x
+# POSITION_CAP_GROWTH_FACTOR, capped at POSITION_CAP_ABSOLUTE_MAX_PCT. A
+# position up 20% gets a 25% cap; up 60%+ gets the 35% ceiling. Never drops
+# BELOW the base 20% (max(0, gain) in the formula) -- this only ever grows
+# room for winners, it doesn't shrink room for anyone. See
+# _effective_concentration_cap_pct() in enhanced.py.
+POSITION_CAP_GROWTH_FACTOR      = 0.25  # cap grows by this many points per point of unrealized gain
+POSITION_CAP_ABSOLUTE_MAX_PCT   = 35.0  # ceiling the growing cap can never exceed, regardless of gain
+
 # Correlated-exposure cap: several DIFFERENT symbols that move together (e.g. the
 # leveraged inverse-market ETF basket) can each stay under MAX_POSITION_CONCENTRATION_PCT
 # individually while still adding up to one oversized directional bet combined —
