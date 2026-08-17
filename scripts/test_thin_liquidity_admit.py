@@ -47,7 +47,7 @@ from engine.config import (
 # (started False 2026-08-12, flipped True same day at the user's request) —
 # not asserted here. Both directions are exercised explicitly below via
 # scan.TRADE_THIN_LIQUIDITY_REJECTS regardless of what's currently live.
-assert THIN_LIQUIDITY_POSITION_SIZE_PCT == 3.0
+assert THIN_LIQUIDITY_POSITION_SIZE_PCT == 4.0
 
 # --- _should_admit_thin_liquidity(): the scan-side gate ---
 
@@ -87,25 +87,28 @@ def _sig(thin=False):
     return Signal("TEST", "buy", 10.0, 0.90, "test reason", "TestStrat", thin_liquidity=thin)
 
 # Not flagged -> risk_info passes through untouched.
-risk_info = {"dollar_amount": 150.0, "allocation_pct": 7.5, "tier": "NORMAL"}
+risk_info = {"dollar_amount": 150.0, "allocation_pct": 10.0, "tier": "NORMAL"}
 out = _apply_thin_liquidity_override(risk_info, _sig(thin=False), equity=2000.0)
 assert out is risk_info, "unflagged signal should return the exact same dict, not a copy"
 
-# Flagged -> flat 3% of equity, overriding whatever dollar_amount/allocation_pct
-# confidence-scaling had already produced (150.0 here), not stacked on top.
+# Flagged -> flat THIN_LIQUIDITY_POSITION_SIZE_PCT of equity, overriding
+# whatever dollar_amount/allocation_pct confidence-scaling had already
+# produced (150.0 here), not stacked on top.
 out = _apply_thin_liquidity_override(risk_info, _sig(thin=True), equity=2000.0)
-assert out["dollar_amount"] == 60.0, f"expected 3% of $2000 = $60, got {out['dollar_amount']}"
-assert out["allocation_pct"] == 3.0
+assert out["dollar_amount"] == 80.0, f"expected 4% of $2000 = $80, got {out['dollar_amount']}"
+assert out["allocation_pct"] == 4.0
 assert risk_info["dollar_amount"] == 150.0, "original dict must not be mutated in place"
 
-# --- _apply_confidence_size_ramp(): continuous ramp from base % to 15% ---
+# --- _apply_confidence_size_ramp(): continuous ramp from base % to MAX_POSITION_SIZE_PCT ---
 # (2026-08-15, replaced the old flat 1.5x-above-92% step: "increase the
-# percentage progressively maximum to 15% maximum per ticker")
+# percentage progressively maximum to 15% maximum per ticker"; base/ceiling
+# scaled again 2026-08-17 with the whole pipeline's 7.5% -> 10% base move)
 
 assert CONF_SCALE_FULL_CONF == 0.85
-assert MAX_POSITION_SIZE_PCT == 15.0
+assert MAX_POSITION_SIZE_PCT == 20.0
 
-risk_info = {"dollar_amount": 150.0, "allocation_pct": 7.5, "tier": "NORMAL"}
+BASE_PCT = 10.0
+risk_info = {"dollar_amount": 150.0, "allocation_pct": BASE_PCT, "tier": "NORMAL"}
 
 # At or below the ramp's start point -> unchanged, same dict (no copy).
 out = _apply_confidence_size_ramp(risk_info, confidence=0.85, equity=2000.0)
@@ -116,29 +119,30 @@ assert out is risk_info
 # Exactly at 100% confidence -> exactly MAX_POSITION_SIZE_PCT, regardless
 # of the base %.
 out = _apply_confidence_size_ramp(risk_info, confidence=1.0, equity=2000.0)
-assert out["allocation_pct"] == 15.0, f"expected the 15% ceiling, got {out['allocation_pct']}"
-assert out["dollar_amount"] == 300.0, f"expected 15% of $2000 = $300, got {out['dollar_amount']}"
-assert risk_info["allocation_pct"] == 7.5, "original dict must not be mutated in place"
+assert out["allocation_pct"] == MAX_POSITION_SIZE_PCT, f"expected the {MAX_POSITION_SIZE_PCT}% ceiling, got {out['allocation_pct']}"
+assert out["dollar_amount"] == 2000.0 * MAX_POSITION_SIZE_PCT / 100.0
+assert risk_info["allocation_pct"] == BASE_PCT, "original dict must not be mutated in place"
 
 # Halfway between the ramp start (85%) and 100% -> halfway between base and
-# ceiling (7.5 -> 11.25, a continuous point, not a flat step).
+# ceiling, a continuous point, not a flat step.
 out = _apply_confidence_size_ramp(risk_info, confidence=0.925, equity=2000.0)
-assert round(out["allocation_pct"], 6) == 11.25, f"expected the ramp's midpoint 11.25%, got {out['allocation_pct']}"
+expected_mid = (BASE_PCT + MAX_POSITION_SIZE_PCT) / 2
+assert round(out["allocation_pct"], 6) == expected_mid, f"expected the ramp's midpoint {expected_mid}%, got {out['allocation_pct']}"
 
-# Ramps toward the SAME absolute ceiling (15%) regardless of the base % —
-# e.g. a small-account 5.0% base still reaches 15% at 100% confidence, not
-# 5.0 x some fixed multiplier.
+# Ramps toward the SAME absolute ceiling regardless of the base % — e.g. a
+# small-account 5.0% base still reaches the ceiling at 100% confidence,
+# not 5.0 x some fixed multiplier.
 small_risk_info = {"dollar_amount": 50.0, "allocation_pct": 5.0, "tier": "NORMAL"}
 out = _apply_confidence_size_ramp(small_risk_info, confidence=1.0, equity=1000.0)
-assert out["allocation_pct"] == 15.0, f"expected the absolute 15% ceiling, got {out['allocation_pct']}"
+assert out["allocation_pct"] == MAX_POSITION_SIZE_PCT, f"expected the absolute {MAX_POSITION_SIZE_PCT}% ceiling, got {out['allocation_pct']}"
 
 # Monotonic: allocation_pct never decreases as confidence rises through the ramp.
-prev = 7.5
+prev = BASE_PCT
 for conf_pct in range(85, 101):
     out = _apply_confidence_size_ramp(risk_info, confidence=conf_pct / 100, equity=2000.0)
     cur = out["allocation_pct"]
     assert cur >= prev, f"conf={conf_pct}%: allocation_pct dropped from {prev} to {cur}"
-    assert cur <= 15.0, f"conf={conf_pct}%: allocation_pct {cur} exceeded the 15% ceiling"
+    assert cur <= MAX_POSITION_SIZE_PCT, f"conf={conf_pct}%: allocation_pct {cur} exceeded the {MAX_POSITION_SIZE_PCT}% ceiling"
     prev = cur
 
 # --- _resolve_freshness_reject(): stale-momentum trades anyway at reduced size ---

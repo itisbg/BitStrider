@@ -1,13 +1,14 @@
 """Self-check for the portfolio-wide leverage cap (2026-08-17, at the
 user's request: "restrict portfolio value to 1.5X the actual account
-[equity, not] margin account").
+[equity, not] margin account"; scaled to 2.0x the same day when the whole
+sizing pipeline moved from a 7.5% to a 10% base -- "change this to 10%
+base instead of 7.5% and scale everything up").
 
 Alpaca's own buying_power already reflects margin (roughly 2x-4x equity
 depending on account type/PDT status). This is a separate, usually-
 stricter ceiling on TOTAL exposure across every open position combined --
-independent of per-symbol (MAX_POSITION_CONCENTRATION_PCT, 20%) and
-per-correlated-group (CORRELATION_GROUPS, 25%) caps, which don't stop the
-WHOLE book from being over-leveraged if spread across enough
+independent of per-symbol and per-correlated-group caps, which don't stop
+the WHOLE book from being over-leveraged if spread across enough
 uncorrelated names.
 
 Run with:
@@ -25,7 +26,7 @@ sys.path.insert(0, str(ROOT))
 from engine.execution.enhanced import PositionInfo
 from engine.config import MAX_PORTFOLIO_LEVERAGE
 
-assert MAX_PORTFOLIO_LEVERAGE == 1.5
+assert MAX_PORTFOLIO_LEVERAGE == 2.0
 
 # --- PositionInfo.total_market_value(): sums abs(market_value), skips options ---
 positions = {
@@ -50,22 +51,25 @@ def max_leverage_shares(equity: float, current_exposure: float, price: float, ma
     headroom  = max(0.0, cap_value - current_exposure)
     return int(headroom / (price * margin))
 
-# $2000 equity -> $3000 cap (1.5x). Already $2500 exposed -> $500 headroom.
-assert max_leverage_shares(equity=2000, current_exposure=2500, price=10.0) == 50, \
-    "500 headroom / $10 = 50 shares"
+EQUITY = 2000.0
+CAP = EQUITY * MAX_PORTFOLIO_LEVERAGE  # 4000 at the current 2.0x
+
+# Partially exposed -> shares sized to exactly the remaining headroom.
+assert max_leverage_shares(equity=EQUITY, current_exposure=2500, price=10.0) == int((CAP - 2500) / 10), \
+    "headroom / price must match exactly"
 
 # Already AT or OVER the cap -> zero headroom, zero shares, not negative.
-assert max_leverage_shares(equity=2000, current_exposure=3000, price=10.0) == 0
-assert max_leverage_shares(equity=2000, current_exposure=5000, price=10.0) == 0, \
+assert max_leverage_shares(equity=EQUITY, current_exposure=CAP, price=10.0) == 0
+assert max_leverage_shares(equity=EQUITY, current_exposure=CAP + 2000, price=10.0) == 0, \
     "over the cap must clamp to 0 headroom, not go negative"
 
-# No existing exposure -> full 1.5x cap is available as headroom.
-assert max_leverage_shares(equity=2000, current_exposure=0, price=10.0) == 300, \
-    "3000 cap / $10 = 300 shares when nothing is held yet"
+# No existing exposure -> the full cap is available as headroom.
+assert max_leverage_shares(equity=EQUITY, current_exposure=0, price=10.0) == int(CAP / 10), \
+    "full cap / price when nothing is held yet"
 
 # Margin (short) uses double the buying-power cost per share, same as max_bp does.
-assert max_leverage_shares(equity=2000, current_exposure=0, price=10.0, margin=2.0) == 150
+assert max_leverage_shares(equity=EQUITY, current_exposure=0, price=10.0, margin=2.0) == int(CAP / 20)
 
-print("OK: portfolio-wide leverage cap sums total exposure correctly (options excluded), "
-      "clamps headroom at zero instead of going negative once already over the 1.5x cap, "
-      "and the entry-sizing headroom math matches what _size_with_buying_power computes")
+print(f"OK: portfolio-wide leverage cap sums total exposure correctly (options excluded), "
+      f"clamps headroom at zero instead of going negative once already over the {MAX_PORTFOLIO_LEVERAGE}x cap, "
+      f"and the entry-sizing headroom math matches what _size_with_buying_power computes")

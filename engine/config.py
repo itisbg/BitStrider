@@ -272,23 +272,39 @@ MAX_POSITIONS        = 12     # 7.5% × 12 = 90% of usable equity (within 10% BP
 # When full, close the weakest position to make room if new signal conf > this threshold
 SWAP_ON_FULL         = True   # enabled — close weakest position for a better signal when full
 SWAP_MIN_CONFIDENCE  = 0.75   # Swap out weakest when new signal >= this confidence (was 0.85)
-POSITION_SIZE_PCT    = 7.5    # 7.5% per position → up to 12 positions within 90% BP utilization — reverted 2026-08-11: smaller per-name risk to offset the same-day guardrail loosening (more, lower-quality-float names now admitted)
-MAX_POSITION_CONCENTRATION_PCT = 20.0  # Hard cap: no single symbol's market value may exceed this % of equity,
+
+# 2026-08-17, user request: "change this to 10% base instead of 7.5% and
+# scale everything up" -- every % below that was originally set as a
+# fixed multiple of the 7.5% base scales by the same 10/7.5 = 4/3 factor,
+# so the whole sizing pipeline's proportions stay exactly as they were,
+# just anchored to a bigger base:
+#   POSITION_SIZE_PCT               7.5  -> 10.0   (the base itself)
+#   MAX_POSITION_SIZE_PCT          15.0  -> 20.0   (2x base, confidence-ramp ceiling)
+#   MAX_POSITION_CONCENTRATION_PCT 20.0  -> 26.7   (2.67x base, hard per-symbol cap)
+#   POSITION_CAP_ABSOLUTE_MAX_PCT  35.0  -> 46.7   (4.67x base, growing-winner ceiling)
+#   THIN_LIQUIDITY_POSITION_SIZE_PCT 3.0 -> 4.0    (0.4x base, guardrail-bypass flat size)
+#   CORRELATION_GROUPS max_pct     25.0  -> 33.3   (correlated-basket cap)
+#   MAX_PORTFOLIO_LEVERAGE          1.5x -> 2.0x   (whole-book cap)
+# STRATEGY_KELLY_MULT (2.0x/0.25x) and POSITION_CAP_GROWTH_FACTOR are
+# rates/multipliers, not base %s -- left as-is, they already scale
+# correctly since they multiply whatever the (now bigger) base produces.
+POSITION_SIZE_PCT    = 10.0
+MAX_POSITION_CONCENTRATION_PCT = 26.7  # Hard cap: no single symbol's market value may exceed this % of equity,
                                         # enforced both at entry sizing and by trimming winners that ran past it
 
 # 2026-08-17, user request: "maximum holding as 20% of the portfolio value
-# and growing based on the continued positive returns" -- the base 20% cap
-# above still applies to entry sizing (a brand-new position has no gain yet
-# to grow from) and to any losing/flat HELD position, but a position
-# currently showing an unrealized gain gets a wider personal cap instead of
-# being trimmed straight back to 20%: effective_cap = 20% + gain% x
-# POSITION_CAP_GROWTH_FACTOR, capped at POSITION_CAP_ABSOLUTE_MAX_PCT. A
-# position up 20% gets a 25% cap; up 60%+ gets the 35% ceiling. Never drops
-# BELOW the base 20% (max(0, gain) in the formula) -- this only ever grows
-# room for winners, it doesn't shrink room for anyone. See
+# and growing based on the continued positive returns" -- the base
+# concentration cap above still applies to entry sizing (a brand-new
+# position has no gain yet to grow from) and to any losing/flat HELD
+# position, but a position currently showing an unrealized gain gets a
+# wider personal cap instead of being trimmed straight back to base:
+# effective_cap = MAX_POSITION_CONCENTRATION_PCT + gain% x
+# POSITION_CAP_GROWTH_FACTOR, capped at POSITION_CAP_ABSOLUTE_MAX_PCT.
+# Never drops BELOW the base (max(0, gain) in the formula) -- this only
+# ever grows room for winners, it doesn't shrink room for anyone. See
 # _effective_concentration_cap_pct() in enhanced.py.
 POSITION_CAP_GROWTH_FACTOR      = 0.25  # cap grows by this many points per point of unrealized gain
-POSITION_CAP_ABSOLUTE_MAX_PCT   = 35.0  # ceiling the growing cap can never exceed, regardless of gain
+POSITION_CAP_ABSOLUTE_MAX_PCT   = 46.7  # ceiling the growing cap can never exceed, regardless of gain
 
 # Correlated-exposure cap: several DIFFERENT symbols that move together (e.g. the
 # leveraged inverse-market ETF basket) can each stay under MAX_POSITION_CONCENTRATION_PCT
@@ -300,7 +316,7 @@ POSITION_CAP_ABSOLUTE_MAX_PCT   = 35.0  # ceiling the growing cap can never exce
 CORRELATION_GROUPS = {
     "leveraged_inverse": {
         "symbols": {"SQQQ", "SPXU", "UVXY", "TZA", "FAZ", "SOXS", "LABD", "DUST"},
-        "max_pct": 25.0,   # combined cap — above the single-symbol 20%, since it's a basket
+        "max_pct": 33.3,   # combined cap — above the single-symbol cap, since it's a basket (scaled 25.0 -> 33.3 2026-08-17)
     },
 }
 
@@ -330,7 +346,7 @@ CONCENTRATION_CHECK_INTERVAL_MIN = 10
 # concentration checks — see _concentration_check_job in orchestrator.py)
 # for a position that drifts over it through price appreciation alone.
 # ─────────────────────────────────────────────────────────────────
-MAX_PORTFOLIO_LEVERAGE = 1.5   # total open-position market value <= this x equity
+MAX_PORTFOLIO_LEVERAGE = 2.0   # total open-position market value <= this x equity (scaled 2026-08-17 with the 7.5->10% base)
 
 # Same-underlying leveraged-ETF pairs (bull+bear on one commodity/index, e.g.
 # BOIL/KOLD both on nat gas — arbitrary product names, no ticker pattern to
@@ -413,9 +429,11 @@ CONF_SCALE_FULL_CONF = 0.85   # 100% of normal size at this confidence and above
 # so every confidence level above 85% gets its own size, not just two
 # tiers. See _apply_confidence_size_ramp() in enhanced.py. Applied before
 # the thin-liquidity override (still trumps everything with its own flat
-# 3%, unaffected by confidence). MAX_POSITION_SIZE_PCT (15%) sits safely
-# under MAX_POSITION_CONCENTRATION_PCT (20%, the hard per-symbol cap).
-MAX_POSITION_SIZE_PCT = 15.0
+# size, unaffected by confidence). MAX_POSITION_SIZE_PCT sits safely
+# under MAX_POSITION_CONCENTRATION_PCT (the hard per-symbol cap).
+# 2026-08-17: scaled 15.0 -> 20.0 along with the 7.5% -> 10% base (see
+# POSITION_SIZE_PCT's comment for the full scaling rationale).
+MAX_POSITION_SIZE_PCT = 20.0
 
 # 2026-08-15, user request: "implement everything except 5" (a set of six
 # suggested improvements; #1 was per-strategy Kelly-informed sizing).
@@ -442,7 +460,7 @@ STRATEGY_KELLY_MULT = {
 STRATEGY_KELLY_MULT_DEFAULT = 1.0
 
 # Small account reduction caps (sub-$5k equity)
-SMALL_ACCOUNT_POSITION_SIZE_PCT = 7.5   # same allocation as POSITION_SIZE_PCT for small accounts — reverted 2026-08-11
+SMALL_ACCOUNT_POSITION_SIZE_PCT = 10.0  # same allocation as POSITION_SIZE_PCT for small accounts — reverted 2026-08-11, scaled 2026-08-17
 SMALL_ACCOUNT_RISK_PER_TRADE_PCT = 0.5 # lower risk per trade for small accounts
 SMALL_ACCOUNT_MIN_POSITION_DOLLARS = 5.0  # lowered to allow ~$5 entry for cheap tickers
 
@@ -1118,7 +1136,7 @@ MIN_FLOAT_SHARES_HARD_FLOOR = 1_000_000
 # than the exit-side one when the position is getting flattened by the
 # close regardless of how it got in.
 TRADE_THIN_LIQUIDITY_REJECTS     = True   # master switch for this path — enabled 2026-08-12 at the user's request
-THIN_LIQUIDITY_POSITION_SIZE_PCT = 3.0
+THIN_LIQUIDITY_POSITION_SIZE_PCT = 4.0    # scaled 3.0 -> 4.0 2026-08-17 with the 7.5->10% base
 
 # 2026-08-15, user request: idea #2 of six suggested improvements. Measured
 # (not projected) from actual historical trades, split by guardrail status,

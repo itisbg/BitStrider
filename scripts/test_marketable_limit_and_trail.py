@@ -86,9 +86,9 @@ def _sig(thin=False):
     return Signal("TEST", "buy", 10.0, 0.90, "test reason", "TestStrat", thin_liquidity=thin)
 
 
-risk_info = {"dollar_amount": 150.0, "allocation_pct": 7.5, "tier": "NORMAL", "stop_loss_pct": 4.0}
+risk_info = {"dollar_amount": 150.0, "allocation_pct": 10.0, "tier": "NORMAL", "stop_loss_pct": 4.0}
 out = _apply_thin_liquidity_override(risk_info, _sig(thin=True), equity=2000.0)
-assert out["dollar_amount"] == 60.0, f"expected 3% of $2000 = $60, got {out['dollar_amount']}"
+assert out["dollar_amount"] == 80.0, f"expected 4% of $2000 = $80, got {out['dollar_amount']}"
 assert out["stop_loss_pct"] == 2.0, f"expected stop_loss_pct halved 4.0 -> 2.0, got {out['stop_loss_pct']}"
 assert risk_info["stop_loss_pct"] == 4.0, "original dict must not be mutated in place"
 
