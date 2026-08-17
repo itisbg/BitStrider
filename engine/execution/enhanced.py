@@ -405,8 +405,8 @@ class EnhancedExecutor:
         self._no_gain_chase_count: Dict[str, int] = {}  # same, for close_no_gain_positions's re-chase
         self._pdt_overnight_forced: set = set()  # symbols where PDT also blocks close — forced overnight, no retries
         self._pdt_violation_alerted: bool = False  # tracks whether the PDT violation email has been sent this session
-        self._eod_close_done: object = None  # date of last completed EOD close (prevents duplicate runs)
         self._force_close_pending: Dict[str, dict] = {}  # {symbol: {"reason": str, "chase_count": int}} — EOD/guardrail closes not yet confirmed flat; swept by _sweep_force_closes until filled
+        self._guardrail_eod_closed: Dict[object, set] = {}  # {date: {symbol, ...}} — symbols already force-closed today by close_guardrail_fail_positions, so its per-minute reruns don't re-cancel/resubmit an order already in flight
         # {symbol: deque of the last N check_price_drift_stop prices, maxlen = PRICE_DRIFT_LOOKBACK_MIN / PRICE_DRIFT_CHECK_INTERVAL_MIN}
         # deque[0] is the oldest sample kept — the ~PRICE_DRIFT_LOOKBACK_MIN-minutes-ago reference once full.
         self._price_drift_history: Dict[str, Deque[float]] = {}
@@ -2004,6 +2004,7 @@ class EnhancedExecutor:
                 continue
             side = OrderSide.SELL if qty > 0 else OrderSide.BUY  # BUY-to-cover trims a short
             try:
+                self._free_shares_for_trim(sym, trim_qty)
                 self._submit_closing_order(sym, trim_qty, side, current)
                 log.warning(
                     f"CONCENTRATION TRIM {sym}: {trim_qty} shares — ${market_value:,.0f} was "
@@ -2012,6 +2013,44 @@ class EnhancedExecutor:
                 )
             except Exception as e:
                 log.error(f"enforce_position_concentration {sym}: trim failed: {e}")
+
+    def _free_shares_for_trim(self, symbol: str, trim_qty: int) -> None:
+        """Shrink symbol's resting GTC protective stop by trim_qty shares
+        BEFORE a trim/close order for that qty gets submitted.
+
+        Alpaca reserves a position's ENTIRE quantity against any open order
+        on it, so a second, competing order for even part of the position
+        always fails with "insufficient qty available" while a full-qty
+        stop rests -- confirmed live, 2026-08-17: TTD's concentration trim
+        failed exactly this way every ~10 min for 6+ hours straight (0/36
+        attempts succeeded, see enforce_position_concentration's ERROR log),
+        because its 8% GTC trailing stop held all 64 shares.
+
+        Resizing the stop down first, instead of cancelling and re-arming
+        it, means the position is never left without stop coverage for even
+        an instant -- there's no gap where a fast move has nothing resting
+        to catch it. Deliberately conservative: no-op (the caller's trim is
+        then left to fail on its own, same as before this fix existed) if
+        no matching resting order is found, or if shrinking it would leave
+        less than 1 share of coverage. Never touches price/trail, never
+        cancels -- qty only."""
+        try:
+            orders = self.client.get_orders() or []
+        except Exception as e:
+            log.warning(f"_free_shares_for_trim {symbol}: order fetch failed: {e}")
+            return
+        stop_order = next(
+            (o for o in orders if o.symbol == symbol and getattr(o, "time_in_force", None) == TimeInForce.GTC),
+            None,
+        )
+        if stop_order is None:
+            return  # nothing resting to shrink -- let the trim attempt itself surface any issue
+        stop_qty = int(float(stop_order.qty))
+        new_qty = stop_qty - trim_qty
+        if new_qty < 1:
+            return  # would zero out (or invert) the stop's coverage -- leave it alone
+        self.client.replace_order_by_id(str(stop_order.id), ReplaceOrderRequest(qty=new_qty))
+        time.sleep(0.4)  # let the reduced hold register before the trim order competes for the freed shares
 
     def enforce_correlation_concentration(self) -> None:
         """Trim a correlated basket (e.g. leveraged inverse-market ETFs) whose
@@ -2143,7 +2182,16 @@ class EnhancedExecutor:
 
     def close_eod_positions(self) -> Optional[dict]:
         """Close all intraday-strategy positions at EOD_CLOSE_TIME.
-        Targets FloatRotation, GapBreakout, ORB, VWAPReclaim opened today."""
+        Targets FloatRotation, GapBreakout, ORB, VWAPReclaim opened today.
+
+        2026-08-17, user request: runs every minute through the window
+        (schedule.every(1).minutes) rather than once per day -- the old
+        once-per-day flag meant a position opened AFTER the first post-
+        15:45 tick (ASST/NUAI, opened 15:57 ET) had already missed its
+        only chance to be flattened. Safe to call repeatedly: a symbol
+        already closed has its _entry_log entry popped below, so the next
+        tick's `if not entry_info: continue` is a no-op for it -- only
+        newly-opened, not-yet-processed positions actually submit an order."""
         if not EOD_CLOSE_ENABLED:
             return None
 
@@ -2155,16 +2203,13 @@ class EnhancedExecutor:
         if now_et.hour >= 16:
             return None  # Market already closed
 
-        today = datetime.date.today()
-        if getattr(self, "_eod_close_done", None) == today:
-            return None  # EOD close already processed for today
-
         try:
             positions = self.client.get_all_positions()
         except Exception as e:
             log.error(f"close_eod_positions: fetch failed: {e}")
             return None
 
+        today = datetime.date.today()
         closed_items = []
         failed_items = []
 
@@ -2227,8 +2272,6 @@ class EnhancedExecutor:
                 failed_items.append({"symbol": sym, "error": str(e)})
                 log.error(f"EOD close failed {sym}: {e}")
 
-        self._eod_close_done = today
-
         summary = {
             "date": today.isoformat(),
             "closed_count": len(closed_items),
@@ -2244,8 +2287,19 @@ class EnhancedExecutor:
         unlike close_eod_positions, not limited to EOD_CLOSE_STRATEGIES) that
         currently fails the standard liquidity/quality guardrails: avg daily
         volume, float shares, or market cap. Only guardrail-passing names get
-        held after-hours/overnight. Runs once/day, gated the same way as
-        close_eod_positions."""
+        held after-hours/overnight.
+
+        2026-08-17, user request: runs every minute through the window
+        (schedule.every(1).minutes) instead of once per day -- the old
+        once-per-day flag meant a position opened AFTER the first post-
+        close-time tick (ASST/NUAI, opened 15:57 ET) had already missed its
+        only chance to be checked. Unlike close_eod_positions, this function
+        has no natural per-symbol idempotency marker (nothing it pops on
+        success), so _guardrail_eod_closed tracks which symbols already had
+        a close attempted today -- without it, a reruns-every-minute version
+        would re-cancel and resubmit a still-unfilled close order on the
+        same illiquid symbol every single minute instead of leaving it to
+        _sweep_force_closes's own re-chase cadence."""
         if not GUARDRAIL_EOD_CLOSE_ENABLED:
             return None
 
@@ -2258,8 +2312,8 @@ class EnhancedExecutor:
             return None  # Market already closed
 
         today = datetime.date.today()
-        if getattr(self, "_guardrail_eod_close_done", None) == today:
-            return None  # Already processed today
+        already_closed = self._guardrail_eod_closed.setdefault(today, set())
+        self._guardrail_eod_closed = {today: already_closed}  # drop any stale prior-day entries
 
         try:
             positions = self.client.get_all_positions()
@@ -2278,6 +2332,8 @@ class EnhancedExecutor:
             qty = int(float(pos.qty))
             if qty == 0:
                 continue
+            if sym in already_closed:
+                continue  # close already attempted today -- _sweep_force_closes chases it if still unfilled
 
             try:
                 daily = get_daily_volume_bars(sym)
@@ -2315,14 +2371,13 @@ class EnhancedExecutor:
                 # unfilled; _sweep_force_closes re-chases it into after-hours.
                 self._submit_closing_order(sym, abs(qty), close_side, float(pos.current_price), force_extended_hours=True)
                 self._force_close_pending[sym] = {"reason": f"guardrail:{fail_reason}", "chase_count": 0}
+                already_closed.add(sym)
                 pnl = float(pos.unrealized_pl)
                 closed_items.append({"symbol": sym, "qty": abs(qty), "reason": fail_reason, "pnl": pnl})
                 log.info(f"GUARDRAIL EOD CLOSE {sym}: {abs(qty)} shares | {fail_reason} | P&L ${pnl:.2f}")
             except Exception as e:
                 failed_items.append({"symbol": sym, "error": str(e)})
                 log.error(f"GUARDRAIL EOD CLOSE failed {sym}: {e}")
-
-        self._guardrail_eod_close_done = today
 
         summary = {
             "date": today.isoformat(),

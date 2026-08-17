@@ -65,6 +65,7 @@ from engine.config import (
     HMM_REGIME_CONFIDENCE_BOOST,
     TRADE_THIN_LIQUIDITY_REJECTS,
     THIN_LIQUIDITY_EXCLUDED_STRATEGIES,
+    EOD_CLOSE_TIME,
 )
 from engine.utils import MarketState, clear_bar_cache, get_bars, get_daily_volume_bars, is_dead_ticker, get_hmm_regime
 from engine.utils.bars import get_data_client as _get_data_client
@@ -202,10 +203,19 @@ def _should_admit_thin_liquidity(reason: Optional[str], market_state: Optional[M
     gate from being stricter than the exit-side one for intraday trades that
     are getting flattened by the close regardless.
     market_state=None (caller didn't pass one) fails closed -- no admit.
+
+    2026-08-17, user request: also cut off at EOD_CLOSE_TIME (15:45 ET).
+    is_regular_hours alone wasn't enough -- ASST and NUAI both got admitted
+    at 15:57 ET, 12 min after close_guardrail_fail_positions' own once-per-
+    day sweep already ran (gated on the same EOD_CLOSE_TIME) and marked
+    itself done for the day. An admit past that point has no same-day
+    guardrail check left to catch it before an overnight hold.
     """
     if not (TRADE_THIN_LIQUIDITY_REJECTS and reason in _ALL_GUARDRAIL_REASONS):
         return False
-    return bool(market_state and market_state.is_regular_hours)
+    if not (market_state and market_state.is_regular_hours):
+        return False
+    return market_state.now.strftime("%H:%M") < EOD_CLOSE_TIME
 
 
 def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Optional[MarketState] = None, return_reason: bool = False) -> bool:
