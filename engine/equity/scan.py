@@ -126,29 +126,34 @@ def _prefetch_snapshots(symbols: List[str]) -> None:
 def _effective_liquidity_floors(market_state: Optional[MarketState], now_et: Optional[datetime.datetime] = None) -> tuple:
     """Return (min_float_shares, min_avg_daily_volume) for the current session.
 
-    The loosened MIN_FLOAT_SHARES_REGULAR_HOURS / MIN_AVG_DAILY_VOLUME_REGULAR_HOURS
-    apply only once REGULAR_HOURS_LOOSE_FLOOR_DELAY_MIN minutes have elapsed
-    since the open — a 7-trading-day backtest (2026-08-03..11) found the first
-    hour of regular trading performs like off-hours across every guardrail
-    reason (avg_volume/low_float/min_price all went from solidly positive to
-    flat-or-negative when restricted to before 09:30 CDT, still within
-    is_regular_hours which starts at 08:30 CDT) — being open isn't enough,
-    the session needs to actually settle in first. Pre-open, the first hour,
-    and after-hours all keep the original, BIOA-driven floors
-    (MIN_FLOAT_SHARES / MIN_AVG_DAILY_VOLUME) unchanged. See engine/config.py
-    for the full reasoning. Split out as its own function so this one
-    decision is unit-testable without driving the rest of
-    _passes_guardrails's snapshot/bar-fetch machinery.
+    2026-08-17, at the user's request ("remove the pre-open/first-hour 200M
+    block only before market hours"): the float floor now loosens to
+    MIN_FLOAT_SHARES_REGULAR_HOURS (20M) as soon as market_state.is_regular_
+    hours is True — no more waiting for REGULAR_HOURS_LOOSE_FLOOR_DELAY_MIN.
+    The strict 200M floor now applies ONLY genuinely before/after market
+    hours, not during the first hour of regular trading (confirmed live:
+    CADL, 60.1M float, was blocked twice at 09:05/09:10 CDT by the old first-
+    hour rule despite regular hours having opened 35+ min earlier at 08:30
+    CDT). The volume floor's delay is UNCHANGED -- the 2026-08-11 backtest
+    finding behind it (avg_volume/low_float/min_price all flat-or-negative
+    before 09:30 CDT) was about the whole guardrail set, but this ask named
+    the float number specifically; leaving MIN_AVG_DAILY_VOLUME_REGULAR_HOURS
+    on its original delay keeps that half of the finding intact.
 
     now_et: inject a specific ET timestamp for testing; defaults to live time.
     """
-    if market_state is not None and market_state.is_regular_hours:
+    is_regular = market_state is not None and market_state.is_regular_hours
+    min_float = MIN_FLOAT_SHARES_REGULAR_HOURS if is_regular else MIN_FLOAT_SHARES
+
+    min_vol = MIN_AVG_DAILY_VOLUME
+    if is_regular:
         now_et = now_et or datetime.datetime.now(_ET)
         mkt_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
         minutes_since_open = (now_et - mkt_open).total_seconds() / 60
         if minutes_since_open >= REGULAR_HOURS_LOOSE_FLOOR_DELAY_MIN:
-            return MIN_FLOAT_SHARES_REGULAR_HOURS, MIN_AVG_DAILY_VOLUME_REGULAR_HOURS
-    return MIN_FLOAT_SHARES, MIN_AVG_DAILY_VOLUME
+            min_vol = MIN_AVG_DAILY_VOLUME_REGULAR_HOURS
+
+    return min_float, min_vol
 
 
 # Every guardrail-rejection reason _passes_guardrails() can return that this

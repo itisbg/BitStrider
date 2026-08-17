@@ -1083,10 +1083,21 @@ MIN_DOLLAR_VOLUME        = 1_000_000   # Skip illiquid setups: price × day_vol 
 # avg_volume/low_float/min_price all went from solidly positive to flat-or-
 # negative when restricted to before 09:30 CDT (still within is_regular_hours,
 # which starts at 08:30 CDT). REGULAR_HOURS_LOOSE_FLOOR_DELAY_MIN gates the
-# loosened floors on elapsed time since the open, not just is_regular_hours.
-REGULAR_HOURS_LOOSE_FLOOR_DELAY_MIN = 60  # minutes after the 9:30 ET open before loosened floors apply
-MIN_FLOAT_SHARES         = 200_000_000 # pre-open / first hour / after-hours — unchanged, this is what BIOA actually needed
-MIN_FLOAT_SHARES_REGULAR_HOURS = 20_000_000  # 60+ min into regular hours — loosened 10x to actually admit TI's low-float movers
+# loosened VOLUME floor on elapsed time since the open, not just
+# is_regular_hours.
+#
+# 2026-08-17, at the user's request ("remove the pre-open/first-hour 200M
+# block only before market hours"): the FLOAT floor no longer waits for this
+# delay — it loosens to MIN_FLOAT_SHARES_REGULAR_HOURS as soon as regular
+# hours open (08:30 CDT), same as is_regular_hours alone. Confirmed live:
+# CADL (60.1M float) got blocked twice at 09:05/09:10 CDT under the old
+# rule despite the session already being 35+ min open. The strict 200M
+# floor now applies only genuinely before/after market hours. The volume
+# floor keeps the original delay -- this ask named the float number
+# specifically, not volume. See _effective_liquidity_floors in scan.py.
+REGULAR_HOURS_LOOSE_FLOOR_DELAY_MIN = 60  # minutes after the 9:30 ET open before the loosened VOLUME floor applies (float no longer waits on this)
+MIN_FLOAT_SHARES         = 200_000_000 # pre-open / after-hours ONLY — this is what BIOA actually needed
+MIN_FLOAT_SHARES_REGULAR_HOURS = 20_000_000  # any time is_regular_hours is True, including the first hour — loosened 10x to actually admit TI's low-float movers
 MIN_AVG_DAILY_VOLUME     = 1_000_000   # pre-open / first hour / after-hours — unchanged
 MIN_AVG_DAILY_VOLUME_REGULAR_HOURS = 700_000  # 60+ min into regular hours — rescues near-misses (BCAX 721K, SEZL 692K)
 
