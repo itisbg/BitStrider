@@ -1700,15 +1700,55 @@ class EnhancedExecutor:
             if sym in self._afterhours_stop_cooldown:
                 continue  # already cooling down from elsewhere
             entry, last, is_long = info["entry_price"], info["last_price"], info["is_long"]
-            was_loss = (last < entry) if is_long else (last > entry)
+            # 2026-08-17, found live: `last` is whatever price the LAST poll
+            # (up to 10s old) happened to see while the position was still
+            # open -- on a fast, violent reversal (a low-float squeeze name
+            # spiking then crashing within a single 1-min candle) that stale
+            # snapshot can still show a GAIN even though the real closing
+            # fill was a loss. Confirmed live: FIEE spiked to $5.95, got
+            # polled near that peak, then its trailing stop fired and closed
+            # it at $5.6751 (a real loss vs $5.73 entry) within the same
+            # ~10s gap -- was_loss against the stale $5.95 snapshot came back
+            # False, no cooldown got set, and the identical signal re-bought
+            # FIEE two minutes later. Look up the ACTUAL closing fill first;
+            # only fall back to the approximate last-known mark if that
+            # lookup fails (network hiccup, order not found yet, etc.) --
+            # same fail-open-to-the-old-approximation pattern used
+            # everywhere else in this file.
+            close_price = self._get_recent_close_price(sym, is_long) or last
+            was_loss = (close_price < entry) if is_long else (close_price > entry)
             if was_loss:
                 self._afterhours_stop_cooldown[sym] = time.monotonic() + AFTERHOURS_STOP_COOLDOWN_MIN * 60
                 log.info(
-                    f"STOP-COOLDOWN {sym}: closed near a loss (last ${last:.2f} vs entry ${entry:.2f}) "
+                    f"STOP-COOLDOWN {sym}: closed near a loss (last ${close_price:.2f} vs entry ${entry:.2f}) "
                     f"— blocking re-entry for {AFTERHOURS_STOP_COOLDOWN_MIN} min"
                 )
 
         self._last_known_positions = current
+
+    def _get_recent_close_price(self, symbol: str, is_long: bool) -> Optional[float]:
+        """Look up the most recent CLOSING fill for symbol via the orders
+        API -- the actual realized exit price, not an approximate poll-cycle
+        mark. A closing order is the OPPOSITE side from the position (SELL
+        closes a long, BUY-to-cover closes a short). Returns None (caller
+        falls back to the approximate mark) if the lookup fails or nothing
+        is found -- same fail-safe pattern as _get_entry_date/_get_entry_datetime."""
+        try:
+            from alpaca.common.enums import Sort
+            from alpaca.trading.requests import GetOrdersRequest
+            from alpaca.trading.enums import QueryOrderStatus
+            close_side = OrderSide.SELL if is_long else OrderSide.BUY
+            req = GetOrdersRequest(
+                status=QueryOrderStatus.CLOSED, symbols=[symbol],
+                side=close_side, direction=Sort.DESC, limit=5,
+            )
+            orders = self.client.get_orders(filter=req) or []
+            for order in orders:
+                if str(getattr(order.status, "value", order.status)).lower() == "filled" and order.filled_avg_price:
+                    return float(order.filled_avg_price)
+        except Exception as e:
+            log.warning(f"_get_recent_close_price {symbol}: lookup failed: {e}")
+        return None
 
     def check_afterhours_stops(self) -> None:
         """Actively watch every open position's loss while the market is NOT in
