@@ -55,6 +55,16 @@ class Signal:
                                    # _validate_trade) — either way sized at THIN_LIQUIDITY_
                                    # POSITION_SIZE_PCT instead of the normal POSITION_SIZE_PCT,
                                    # read by _execute_entry() in engine/execution/enhanced.py
+    stale_entry: bool = False  # narrower than thin_liquidity: True ONLY for the faded/
+                                # stale-momentum reason (_resolve_freshness_reject), never for
+                                # a guardrail-floor admit. 2026-08-17, CDTG: a fresh guardrail-
+                                # rescued signal (e.g. FIEE, thin float) has no "fade" to wait
+                                # out and should still enter at the normal marketable price --
+                                # only a confirmed-faded signal should get the passive/capped
+                                # entry treatment in _create_bracket_order. Confirmed live:
+                                # collapsing this into thin_liquidity would have delayed/risked
+                                # missing CDTG trade 1 (+$1.64) and both FIEE trades (+$0.30,
+                                # -$0.60), none of which were fading.
 
 
 def _calc_atr14(bars: pd.DataFrame, period: int = 14) -> float:

@@ -1202,6 +1202,31 @@ MIN_MARKET_CAP           = 100_000_000 # Skip micro-caps below $100M
 # time-in-force), that itself is a signal the spread was genuinely too wide
 # to trade safely -- no active re-chase added here, that's a separate ask.
 MARKETABLE_LIMIT_BUFFER_PCT = 1.0
+
+# Faded/stale-entry passive limit (2026-08-17, CDTG: bought $2.97 marketable
+# into a signal already flagged "faded 9.8% off its 30-min high", price kept
+# falling to $2.73 before any stop existed at all, eventual stop armed off
+# the already-fallen price -> -11.7% realized vs. the intended 4% trail).
+# ONLY applies to Signal.stale_entry (the freshness-reject path specifically,
+# see strategies.py) -- never to a guardrail-floor thin_liquidity admit,
+# which has no "fade" to wait out (confirmed live: would have delayed/risked
+# missing CDTG trade 1 +$1.64 and both FIEE trades, none of which faded).
+# Design (3 tiers, all in _create_bracket_order/_sweep_pending_entries):
+#   1. Submit a PASSIVE limit at the opposite side of the spread from
+#      today's marketable price (mid -1% for a long) instead of chasing in
+#      -- let the confirmed fade come to the order instead of paying up.
+#   2. If unfilled after FADED_ENTRY_PASSIVE_WINDOW_SECONDS, start chasing,
+#      but capped at what today's code would have paid at decision time
+#      (mid+1% at signal time) -- never worse than today's baseline. If
+#      price reversed and is now above that cap, the order rests and waits
+#      rather than chasing upward into the reversal.
+#   3. If STILL unfilled after FADED_ENTRY_CEILING_TIMEOUT_SECONDS, drop the
+#      cap and fall through to the normal uncapped escalating chase so the
+#      trade doesn't get lost entirely (matches the 2026-08-14 "trade it
+#      anyway, just smaller" rule) -- a rare last resort, not the default.
+FADED_ENTRY_PASSIVE_WINDOW_SECONDS  = 90
+FADED_ENTRY_CEILING_TIMEOUT_SECONDS = 300
+
 MAX_GAP_CHASE_PCT        = 15.0       # Skip if already up >15% without consolidation
 GAP_CHASE_CONSOL_BARS    = 5          # Number of 1-min bars to check for tight base
 # ponytail: suppressed 2026-08-03 to observe a month of live impact (log data showed

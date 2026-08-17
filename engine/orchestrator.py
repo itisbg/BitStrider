@@ -894,13 +894,17 @@ def scan_top3_only(ctx: AppContext) -> None:
 # makes a broker call when _pdt_stop_blocked is non-empty.
 
 def _start_software_stop_thread(ctx: AppContext) -> None:
-    """Spawn a daemon thread that polls check_software_stops(),
-    check_afterhours_stops(), _sweep_force_closes(), and
-    _sweep_pending_entries() every 10 seconds."""
+    """Spawn a daemon thread that polls _cover_naked_positions(),
+    check_software_stops(), check_afterhours_stops(), _sweep_force_closes(),
+    and _sweep_pending_entries() every 10 seconds."""
     import threading
 
     def _loop() -> None:
         while True:
+            try:
+                ctx.executor._cover_naked_positions()
+            except Exception as e:
+                log.error(f"[STOP-THREAD] _cover_naked_positions error: {e}", exc_info=True)
             try:
                 if ctx.executor._pdt_stop_blocked:
                     ctx.executor.check_software_stops()

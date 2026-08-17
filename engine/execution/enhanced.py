@@ -69,6 +69,7 @@ from engine.config import (
     THIN_LIQUIDITY_POSITION_SIZE_PCT,
     THIN_LIQUIDITY_TRAILING_STOP_MULT,
     MARKETABLE_LIMIT_BUFFER_PCT,
+    FADED_ENTRY_PASSIVE_WINDOW_SECONDS, FADED_ENTRY_CEILING_TIMEOUT_SECONDS,
     LIVE,
 )
 from engine.equity.strategies import Signal, _get_float_shares, _get_market_cap
@@ -147,6 +148,9 @@ def _resolve_freshness_reject(signal: Signal, fresh: bool, fade_reason: Optional
     if not TRADE_STALE_MOMENTUM_REJECTS or signal.strategy in THIN_LIQUIDITY_EXCLUDED_STRATEGIES:
         return False, fade_reason
     signal.thin_liquidity = True
+    signal.stale_entry = True  # narrower flag -- see Signal.stale_entry docstring in
+                                # strategies.py. Only THIS path sets it; the guardrail-
+                                # floor admit in scan.py sets thin_liquidity alone.
     return True, None
 
 
@@ -1052,8 +1056,17 @@ class EnhancedExecutor:
 
         # ── Step 1: Entry order (failure aborts the whole bracket) ──────────
         try:
+            is_long_entry = order_type == OrderType.LONG
             mid = _live_quote_mid(self.client, signal.symbol, signal.price)
-            entry_limit = _marketable_limit_price(mid, is_long=(order_type == OrderType.LONG))
+            baseline_limit = _marketable_limit_price(mid, is_long=is_long_entry)  # today's price, always computed as the never-worse-than ceiling
+            if signal.stale_entry:
+                # Passive: rest on the OPPOSITE side of the spread from a
+                # normal chase-in (mid -1% for a long) instead of paying up
+                # into a signal already confirmed fading -- see
+                # FADED_ENTRY_PASSIVE_WINDOW_SECONDS in config.py.
+                entry_limit = _marketable_limit_price(mid, is_long=not is_long_entry)
+            else:
+                entry_limit = baseline_limit
             entry_req = LimitOrderRequest(
                 symbol          = signal.symbol,
                 qty             = shares,
@@ -1066,8 +1079,15 @@ class EnhancedExecutor:
             self.order_cache[signal.symbol] = order.id
             self._entry_pending[signal.symbol] = {
                 "order_id": str(order.id), "qty": shares,
-                "is_long": order_type == OrderType.LONG, "chase_count": 0,
+                "is_long": is_long_entry, "chase_count": 0,
             }
+            if signal.stale_entry:
+                self._entry_pending[signal.symbol]["price_ceiling"] = baseline_limit
+                self._entry_pending[signal.symbol]["first_submitted_at"] = datetime.datetime.now(datetime.timezone.utc)
+                log.info(
+                    f"{signal.symbol}: faded entry -- passive limit ${entry_limit:.2f} "
+                    f"(vs ${baseline_limit:.2f} marketable), {FADED_ENTRY_PASSIVE_WINDOW_SECONDS}s to fill"
+                )
 
             # Store ATR-based TP target — checked each scan cycle by check_tp_targets()
             if signal.atr_stop and signal.atr_stop > 0:
@@ -1472,6 +1492,11 @@ class EnhancedExecutor:
                 ))
                 direction = "LONG" if is_long_pos else "SHORT"
                 log.info(f"PROTECT {direction} {sym} [{tier_label}]: trailing stop {trail_pct:.1f}% GTC")
+                # A real broker-side GTC now covers this symbol -- drop any
+                # software-stop fallback (from _cover_naked_positions or an
+                # earlier 40310100 rejection) so check_software_stops() stops
+                # watching a position that's already covered for real.
+                self._pdt_stop_blocked.pop(sym, None)
             except Exception as e:
                 err_str = str(e)
                 if "40310100" in err_str:
@@ -1594,6 +1619,55 @@ class EnhancedExecutor:
             extended_hours=force_extended_hours or not MarketState.from_now().is_regular_hours,
         )
         self.client.submit_order(req)
+
+    def _cover_naked_positions(self) -> None:
+        """Fast-thread companion to protect_positions(): the moment a
+        position exists with no resting order and no software-stop coverage
+        yet, register a software stop off the REAL pos.avg_entry_price --
+        pure bookkeeping (a dict write), never a broker order attempt. The
+        actual broker-side GTC attempt frequency is untouched, still only on
+        protect_positions()'s normal (slower) cadence -- this can't turn
+        into a submit_order retry storm for a genuinely PDT-blocked symbol.
+
+        2026-08-17, CDTG: the bracket-order trailing stop is deliberately
+        deferred for every live same-day entry (PDT), and protect_positions()
+        only runs on the adaptive scan cadence -- CDTG sat with literally
+        zero stop coverage for 3+ minutes while it fell from $2.97 to $2.73,
+        and by the time a stop was finally armed it anchored to the already-
+        fallen price instead of the entry. Called from the same 10s thread
+        as check_software_stops(), which is what actually watches and closes
+        whatever this registers -- see that method for the poll side."""
+        try:
+            positions   = self.client.get_all_positions()
+            open_orders = self.client.get_orders()
+            covered     = {o.symbol for o in open_orders}
+        except Exception as e:
+            log.warning(f"_cover_naked_positions: fetch failed: {e}")
+            return
+        for pos in positions:
+            sym = pos.symbol
+            if re.match(r'^[A-Z]+\d{6}[CP]\d{8}$', sym):
+                continue  # options legs — managed separately
+            if sym in covered or sym in self._pdt_stop_blocked:
+                continue
+            try:
+                qty = int(float(pos.qty))
+                if qty == 0:
+                    continue
+                entry_price = float(pos.avg_entry_price or pos.current_price)
+                stop_pct    = _trail_pct_for(sym, float(pos.current_price), self._entry_log)[0]
+                stop_price  = round(
+                    entry_price * (1 - stop_pct / 100) if qty > 0
+                    else entry_price * (1 + stop_pct / 100),
+                    2,
+                )
+                self._pdt_stop_blocked[sym] = stop_price
+                log.warning(
+                    f"_cover_naked_positions {sym}: no order coverage yet — "
+                    f"software SL set at ${stop_price:.2f} ({stop_pct:.1f}% from ${entry_price:.2f})"
+                )
+            except Exception:
+                continue  # best-effort — next 10s tick tries again
 
     def check_software_stops(self) -> None:
         """Close any position whose broker-rejected PDT stop has been breached.
@@ -2363,7 +2437,26 @@ class EnhancedExecutor:
         is silently never entered, no matter how good the signal was --
         every close path already re-chases, entries never did.
         ponytail: no cap on total re-chase attempts (only slip% is capped,
-        at 3%) -- same known ceiling as _sweep_force_closes."""
+        at 3%) -- same known ceiling as _sweep_force_closes.
+
+        2026-08-17, faded/stale entries (info["price_ceiling"] present, see
+        _create_bracket_order): the FIRST wait uses
+        FADED_ENTRY_PASSIVE_WINDOW_SECONDS instead of the normal (shorter)
+        AFTERHOURS_CHASE_STALE_SECONDS -- give the passive limit its full
+        window before touching it at all. Every chase after that is capped
+        at price_ceiling (today's baseline price) until
+        FADED_ENTRY_CEILING_TIMEOUT_SECONDS have passed since the ORIGINAL
+        submission, so a reversal makes the fix wait, never chase upward
+        into it -- only after that timeout does it fall through to the
+        normal uncapped escalation, as a last resort so the trade isn't
+        lost entirely (2026-08-14 "trade it anyway" rule).
+
+        2026-08-17: also only ever re-chases the QUANTITY STILL UNFILLED,
+        not the original full size -- a partial fill (routine on the thin/
+        illiquid names this mostly applies to, and far more likely now that
+        faded entries can rest for minutes instead of filling near-
+        instantly) used to get topped up with a second full-size order on
+        cancel+resubmit, silently over-buying the position."""
         if not self._entry_pending:
             return
         try:
@@ -2383,10 +2476,22 @@ class EnhancedExecutor:
                 self._entry_pending.pop(sym, None)
                 continue
 
+            is_faded = "price_ceiling" in info
             submitted_at = getattr(pending, "submitted_at", None) or getattr(pending, "created_at", None)
             age_s = (now_utc - submitted_at).total_seconds() if submitted_at else 0.0
-            if age_s < AFTERHOURS_CHASE_STALE_SECONDS:
+            stale_threshold = (
+                FADED_ENTRY_PASSIVE_WINDOW_SECONDS
+                if is_faded and info.get("chase_count", 0) == 0
+                else AFTERHOURS_CHASE_STALE_SECONDS
+            )
+            if age_s < stale_threshold:
                 continue  # still fresh — give it time to fill
+
+            filled_so_far = int(float(getattr(pending, "filled_qty", 0) or 0))
+            remaining = info["qty"] - filled_so_far
+            if remaining <= 0:
+                self._entry_pending.pop(sym, None)  # fully filled already, nothing left to chase
+                continue
 
             try:
                 self.client.cancel_order_by_id(str(pending.id))
@@ -2402,18 +2507,28 @@ class EnhancedExecutor:
                 slip_pct = _entry_rechase_slip_pct(chase_n)
                 mid = _live_quote_mid(self.client, sym, float(pending.limit_price or 0) or 0.01)
                 fresh_limit = _marketable_limit_price(mid, is_long=is_long, buffer_pct=slip_pct)
+
+                ceiling = info.get("price_ceiling")
+                if ceiling is not None:
+                    first_at = info.get("first_submitted_at")
+                    ceiling_age_s = (now_utc - first_at).total_seconds() if first_at else float("inf")
+                    if ceiling_age_s < FADED_ENTRY_CEILING_TIMEOUT_SECONDS:
+                        fresh_limit = min(fresh_limit, ceiling) if is_long else max(fresh_limit, ceiling)
+
                 req = LimitOrderRequest(
-                    symbol=sym, qty=info["qty"], side=side, time_in_force=TimeInForce.DAY,
+                    symbol=sym, qty=remaining, side=side, time_in_force=TimeInForce.DAY,
                     limit_price=fresh_limit,
                     client_order_id=f"apex-rechase-{sym}-{int(time.time())}",
                 )
                 new_order = self.client.submit_order(req)
                 self.order_cache[sym] = new_order.id
                 info["order_id"] = str(new_order.id)
+                info["qty"] = remaining
                 info["chase_count"] = chase_n + 1
                 log.warning(
                     f"ENTRY RE-CHASE {sym}: unfilled after prior attempt "
-                    f"— resubmitted @ ${fresh_limit:.2f} ({slip_pct:.1f}% off mid, attempt {chase_n + 1})"
+                    f"— resubmitted {remaining} @ ${fresh_limit:.2f} ({slip_pct:.1f}% off mid, attempt {chase_n + 1})"
+                    + (f" [capped @ ${ceiling:.2f}]" if ceiling is not None and ceiling_age_s < FADED_ENTRY_CEILING_TIMEOUT_SECONDS else "")
                 )
             except Exception as e:
                 log.error(f"_sweep_pending_entries {sym}: re-chase failed: {e}")
