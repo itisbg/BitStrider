@@ -983,10 +983,20 @@ class EnhancedExecutor:
         self, buying_power: float, signal: Signal,
         risk_info: Dict, order_type: OrderType
     ) -> Tuple[int, Optional[str]]:
-        """Returns (shares, skip_reason). Downsizes if BP constrained, skips if below min."""
+        """Returns (shares, skip_reason). Downsizes if BP constrained, skips if below min.
+
+        2026-08-18, user request: "prioritize the full number than dollar
+        value... 10% limit puts 1.8 stock then round to 2 stocks if there is
+        cash available" -- `desired` rounds to the NEAREST share instead of
+        always truncating down, so a 1.8-share target becomes 2 rather than
+        1 (silently using only 56% of the intended allocation). The caps
+        below (max_bp, max_concentration, max_leverage) stay floored with
+        int() -- those are hard capacity ceilings, not targets, so "if
+        there is cash available" is enforced by the min() below: rounding
+        desired up only sticks when a cap doesn't clamp it back down."""
         margin  = 2.0 if order_type == OrderType.SHORT else 1.0
         usable  = buying_power * (1.0 - MIN_BUYING_POWER_PCT / 100.0)
-        desired = int(risk_info["dollar_amount"] / signal.price)
+        desired = round(risk_info["dollar_amount"] / signal.price)
         max_bp  = int(usable / (signal.price * margin))
 
         account_snapshot = self._account_cache or self._get_account()  # use cached if available

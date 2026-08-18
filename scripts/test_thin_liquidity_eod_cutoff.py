@@ -19,7 +19,7 @@ sys.path.insert(0, str(ROOT))
 
 import pytz
 
-from engine.config import TRADE_THIN_LIQUIDITY_REJECTS
+from engine.config import TRADE_THIN_LIQUIDITY_REJECTS, EOD_CLOSE_TIME
 from engine.equity.scan import _should_admit_thin_liquidity
 from engine.utils.market import MarketState
 
@@ -36,8 +36,11 @@ if TRADE_THIN_LIQUIDITY_REJECTS:
     # Before the EOD cutoff, a real guardrail reason is still admitted (existing behavior).
     assert _should_admit_thin_liquidity("rvol", _state("14:00")) is True
 
-    # At/after EOD_CLOSE_TIME (15:45 ET), no more admits -- this is the fix.
-    assert _should_admit_thin_liquidity("rvol", _state("15:45")) is False
+    # At/after EOD_CLOSE_TIME, no more admits -- this is the fix. Reads the
+    # live config value (now 15:50, was 15:45) rather than a hardcoded
+    # literal so this doesn't silently go stale the next time it moves --
+    # see scripts/test_entry_window.py for the incident that taught this.
+    assert _should_admit_thin_liquidity("rvol", _state(EOD_CLOSE_TIME)) is False
     assert _should_admit_thin_liquidity("rvol", _state("15:57")) is False  # the ASST/NUAI repro
 
 # Non-guardrail reasons (min_price, catch-all "other") are never admitted, cutoff or not.

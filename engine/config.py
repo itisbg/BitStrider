@@ -621,7 +621,19 @@ DAILY_PROFIT_TARGET       = 3500.0
 # is_market_open also drives allocation-split and options-lull-hours logic
 # that isn't part of this ask.
 ENTRY_WINDOW_START_ET = "09:30"
-ENTRY_WINDOW_END_ET   = "16:00"
+# 2026-08-18, user request ("no new buys after 2:45" -- 2:45 PM CDT = 15:45
+# ET -- then same day, refined to "change the eod close time and no trades
+# time to 3:50pm ET... after this no new entry positions only keep the
+# existing positions overnight if they meet guardrails, and exit only"):
+# was "16:00", which left a window AFTER EOD_CLOSE_TIME started flattening
+# positions where entries still fired anyway -- confirmed live, AXTI got
+# shorted fresh at 15:55 ET while close_guardrail_fail_positions was
+# actively closing OTHER names down for the same session, opening brand-new
+# risk in the exact window the bot should only be winding down. Must never
+# be later than EOD_CLOSE_TIME again -- see the assert next to
+# EOD_CLOSE_TIME below, which enforces this at import time instead of
+# trusting the two literals to stay in sync by hand.
+ENTRY_WINDOW_END_ET   = "15:50"
 
 # Quarterly Profit Target
 USE_QUARTERLY_TARGET        = True
@@ -658,7 +670,16 @@ FORCE_SCAN = os.getenv("FORCE_SCAN", "false").lower() in ("1", "true", "yes")
 # Intraday strategies should never be held overnight — close by EOD_CLOSE_TIME
 # ─────────────────────────────────────────────────────────────────
 EOD_CLOSE_ENABLED    = True
-EOD_CLOSE_TIME       = "15:45"   # Close intraday positions 15 min before market close (was 10 min/15:50, widened 2026-08-12)
+# 2026-08-18, user request: "change the eod close time and no trades time to
+# 3:50pm ET" -- was 15:45 (10 min/15:50 before that, widened 2026-08-12,
+# tightened back same day as this ask). Only 10 min before the 16:00 close now.
+EOD_CLOSE_TIME       = "15:50"
+# 2026-08-18: entries must never still be allowed once the EOD close sweep has
+# started -- see ENTRY_WINDOW_END_ET above (the AXTI-at-15:55-ET incident this
+# guards against). Fails loudly at import time instead of silently drifting.
+assert ENTRY_WINDOW_END_ET <= EOD_CLOSE_TIME, (
+    f"ENTRY_WINDOW_END_ET ({ENTRY_WINDOW_END_ET}) must be <= EOD_CLOSE_TIME ({EOD_CLOSE_TIME})"
+)
 EOD_CLOSE_STRATEGIES = {         # Strategy names that must be closed same day
     "FloatRotation",
     "GapBreakout",
@@ -1099,7 +1120,19 @@ MIN_DOLLAR_VOLUME        = 1_000_000   # Skip illiquid setups: price × day_vol 
 # floor keeps the original delay -- this ask named the float number
 # specifically, not volume. See _effective_liquidity_floors in scan.py.
 REGULAR_HOURS_LOOSE_FLOOR_DELAY_MIN = 60  # minutes after the 9:30 ET open before the loosened VOLUME floor applies (float no longer waits on this)
-MIN_FLOAT_SHARES         = 200_000_000 # pre-open / after-hours ONLY — this is what BIOA actually needed
+# 2026-08-18, user request: 200M (the BIOA-driven pre-open/after-hours floor)
+# was inconsistent with the two OTHER floors already gating the same names --
+# MIN_MARKET_CAP ($100M) and MIN_STOCK_PRICE ($2). At the boundary of both
+# (mcap exactly $100M, price exactly $2), shares outstanding = $100M / $2 =
+# 50M -- so 200M float demanded a name be ~4x bigger than the mcap floor
+# alone would require at that price. Lowered to 50M, consistent with the
+# floors already in place. Also now the sole real-world consumer:
+# ENTRY_WINDOW_START/END_ET restricts every entry to regular hours already
+# (see enhanced.py), so the pre-open/after-hours case this constant was
+# originally sized for can no longer actually execute a trade -- today this
+# only gates close_guardrail_fail_positions' overnight-hold check (is this
+# name still worth carrying past the close), where 50M is the right bar.
+MIN_FLOAT_SHARES         = 50_000_000  # pre-open / after-hours scan-time float floor; also close_guardrail_fail_positions' overnight-hold bar
 MIN_FLOAT_SHARES_REGULAR_HOURS = 20_000_000  # any time is_regular_hours is True, including the first hour — loosened 10x to actually admit TI's low-float movers
 MIN_AVG_DAILY_VOLUME     = 1_000_000   # pre-open / first hour / after-hours — unchanged
 MIN_AVG_DAILY_VOLUME_REGULAR_HOURS = 700_000  # 60+ min into regular hours — rescues near-misses (BCAX 721K, SEZL 692K)
