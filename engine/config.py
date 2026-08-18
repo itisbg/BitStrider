@@ -608,17 +608,20 @@ DAILY_LOSS_LIMIT_BULL_PCT = 1.0   # Halt if down >1% of start equity in bull reg
 DAILY_LOSS_LIMIT_BEAR_PCT = 2.0   # Halt if down >2% of start equity in bear regime (wider room)
 DAILY_PROFIT_TARGET       = 3500.0
 
-# 2026-08-14, user request: "restrict trading to 7.30am ET to 8pm ET for
-# buying" -- new entries (either direction) only submitted within this ET
-# window. Existing positions are completely unaffected: protect_positions,
-# every close_*/check_*_stop path, and detect_stopped_out_positions all run
-# from the orchestrator main loop regardless of this window, same as they
-# already ignore is_market_open. Deliberately a separate, narrower gate from
-# MarketState.is_market_open (07:00-20:00) rather than tightening that shared
-# flag in place -- is_market_open also drives allocation-split and options-
-# lull-hours logic that isn't part of this ask.
-ENTRY_WINDOW_START_ET = "07:30"
-ENTRY_WINDOW_END_ET   = "20:00"
+# 2026-08-18, user request: restrict new entries to regular hours only
+# (09:30-16:00 ET, was 07:30-20:00) -- pre/post-market LiquiditySweep fires
+# were walking the entry re-chase price 20-30% in thin extended-hours books
+# (KEEL/TTD, 2026-08-17) before ever getting filled. New entries (either
+# direction) only submitted within this ET window. Existing positions are
+# completely unaffected: protect_positions, every close_*/check_*_stop path,
+# and detect_stopped_out_positions all run from the orchestrator main loop
+# regardless of this window, same as they already ignore is_market_open.
+# Deliberately a separate, narrower gate from MarketState.is_market_open
+# (07:00-20:00) rather than tightening that shared flag in place --
+# is_market_open also drives allocation-split and options-lull-hours logic
+# that isn't part of this ask.
+ENTRY_WINDOW_START_ET = "09:30"
+ENTRY_WINDOW_END_ET   = "16:00"
 
 # Quarterly Profit Target
 USE_QUARTERLY_TARGET        = True
@@ -1167,6 +1170,17 @@ THIN_LIQUIDITY_POSITION_SIZE_PCT = 4.0    # scaled 3.0 -> 4.0 2026-08-17 with th
 # only for these two strategies. See _scan_one() in scan.py and
 # _resolve_freshness_reject() in enhanced.py.
 THIN_LIQUIDITY_EXCLUDED_STRATEGIES = {"ORB", "GapBreakout"}
+
+# 2026-08-18, user request: a 2nd+ same-day entry into a symbol already traded
+# today submits a trailing-stop BUY/SELL (trails the adverse move, fires only
+# once price reverses REENTRY_TRAIL_PCT% off the extreme) instead of chasing a
+# marketable limit straight into a still-moving price. PFSA that day: 2nd
+# EarlySqueeze entry chased in at $13.52 while fading 15% off its 30-min high,
+# filled $12.50 (still falling), stopped out $11.72 eight minutes later -- a
+# trailing buy would never have filled while it kept dropping. Costs giving up
+# the first REENTRY_TRAIL_PCT% of any real reversal in exchange for not
+# catching the falling knife. See _entries_today in enhanced.py.
+REENTRY_TRAIL_PCT = 1.0
 
 # 2026-08-14, user request: "I told ones which fail guard will be traded too
 # but with lower portfolio limit" -- extending the same trade-anyway-at-

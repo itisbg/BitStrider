@@ -92,6 +92,11 @@ def _executor(quote):
     ex.order_cache = {}
     ex._entry_pending = {}
     ex._tp_targets = {}
+    ex._entries_today = {}       # 2026-08-18: _create_bracket_order now checks
+    ex._entries_today_date = None  # is_reentry -- empty here, these are all first entries
+    ex._afterhours_stop_cooldown = {}
+    ex._no_history_cache = set()
+    ex._entry_log = {}
     return ex
 
 

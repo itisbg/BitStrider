@@ -47,7 +47,30 @@ from .equity.universe import filter_universe_by_positions
 from .equity import discovery as _discovery
 from .notifications import notify_scan_results, notify_eod
 from .predictions import save_day_picks
-from . import session as _session
+
+# 2026-08-18, user request (daily P&L stuck at $0.00 all session despite real
+# trades/losses): `from . import session as _session` bound _session to the
+# PACKAGE (engine/session/__init__.py), which does `from .session import
+# daily_pnl, daily_start_equity, ...` -- a one-time VALUE COPY at first
+# import, frozen at whatever the submodule's globals held at that instant
+# (0.0/0.0/None, before load_daily_state()/reset_daily() ever ran). Every
+# later refresh_daily_pnl()/reset_daily() call still only mutates the
+# SUBMODULE's own globals (that's where `global daily_pnl` resolves, since
+# that's where the function is defined) -- invisible through the package's
+# already-frozen copy. Reproduced: mutating engine.session.session.daily_pnl
+# left engine.session.daily_pnl at 0.0. Importing the submodule object
+# itself instead of the package makes every _session.X read/write live.
+#
+# Same bug silently disabled the daily loss-limit halt: daily_loss_limit at
+# line ~558 is `-(_session.daily_start_equity * loss_pct/100) if
+# _session.daily_start_equity > 0 else -999_999` -- daily_start_equity was
+# always 0.0 through this alias, so the guard always fell to -999_999 and
+# could never trip regardless of real drawdown. Also silently suppressed
+# log_status()'s "Quarterly:" line (same `_session.quarterly_start_equity >
+# 0` pattern) even though session.py's OWN check_quarterly() printed a
+# correct "Quarterly P&L:" line right next to it all along, using its local
+# global instead of this alias.
+from .session import session as _session
 from engine.broker.broker_factory import BrokerFactory
 from engine.execution.enhanced import EnhancedExecutor
 from engine.options.executor import OptionsExecutor
@@ -246,7 +269,12 @@ def _resolve_market_regime(ctx: AppContext, market_state: MarketState) -> Tuple[
 def _build_scan_targets(ctx: AppContext) -> Tuple[List[str], set]:
     """Return (scan_targets, excluded) after universe assembly and position filtering."""
     _, _, excluded = get_live_holdings(ctx.client)
-    excluded = excluded | ctx.executor.get_afterhours_cooldown_symbols()
+    # 2026-08-18, user request: a post-loss cooldown symbol is no longer kept
+    # out of the scan entirely -- _create_bracket_order now routes any signal
+    # for it through a trailing buy (see is_reentry) instead of the normal
+    # marketable chase, so it's safe to let it be re-scanned/re-signaled.
+    # _validate_trade's cooldown check was removed the same way -- see there
+    # for the SOXS precedent (22 rapid re-entries, -$605) this replaces.
     targets = filter_universe_by_positions(get_scan_targets(), excluded)
     log.info(
         f"[SCAN] {len(targets)} symbols (filtered, {cfg.SCAN_WORKERS} workers): "

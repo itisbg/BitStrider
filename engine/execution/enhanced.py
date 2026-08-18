@@ -70,6 +70,7 @@ from engine.config import (
     THIN_LIQUIDITY_TRAILING_STOP_MULT,
     MARKETABLE_LIMIT_BUFFER_PCT,
     FADED_ENTRY_PASSIVE_WINDOW_SECONDS, FADED_ENTRY_CEILING_TIMEOUT_SECONDS,
+    REENTRY_TRAIL_PCT,
     LIVE,
 )
 from engine.equity.strategies import Signal, _get_float_shares, _get_market_cap
@@ -305,6 +306,21 @@ def _demo() -> None:
     assert ratchet_scale(0.90) < ratchet_scale(0.80), "higher confidence must tighten more"
     print("ratchet_scale: all checks passed")
 
+    # _entries_today_count: needs only the two bare attrs, no live client --
+    # build a stub rather than a full EnhancedExecutor().
+    class _Stub:
+        _entries_today: Dict[str, int] = {}
+        _entries_today_date = None
+    stub = _Stub()
+    count = EnhancedExecutor._entries_today_count
+    assert count(stub, "PFSA") == 0, "first entry today must not look like a re-entry"
+    stub._entries_today["PFSA"] = 1  # what _create_bracket_order does after that first entry fills
+    assert count(stub, "PFSA") == 1, "second same-day entry must be flagged a re-entry"
+    assert count(stub, "OTHER") == 0, "a different symbol is unaffected"
+    stub._entries_today_date = datetime.date(2000, 1, 1)  # force a date rollover
+    assert count(stub, "PFSA") == 0, "a new day must reset the count"
+    print("_entries_today_count: all checks passed")
+
 
 if __name__ == "__main__":
     _demo()
@@ -414,6 +430,20 @@ class EnhancedExecutor:
         # — resting entry orders not yet confirmed filled; swept by _sweep_pending_entries
         self._entry_pending: Dict[str, dict] = {}
         self._stale_exit_done: object = None  # date of last completed swing stale-exit check
+        # {symbol: count} — how many times a symbol has been entered today, reset
+        # on a date rollover (_entries_today_date). 2026-08-18, user request: a
+        # 2nd+ same-day entry uses a trailing BUY (see REENTRY_TRAIL_PCT) instead
+        # of chasing a marketable limit -- PFSA that day, 2nd EarlySqueeze entry
+        # chased in at $13.52 while fading 15% off its high, filled $12.50,
+        # stopped $11.72 eight minutes later. Deliberately independent of
+        # _afterhours_stop_cooldown -- that only fires after a LOSING exit, so it
+        # missed this case entirely (PFSA's first exit was a ratcheted win).
+        self._entries_today: Dict[str, int] = {}
+        self._entries_today_date: Optional[datetime.date] = None
+        # symbols confirmed to have zero prior broker fill history -- lets
+        # _is_reentry_signal's broker fallback (_get_entry_datetime) skip the
+        # round-trip on every future entry attempt for a genuinely new name.
+        self._no_history_cache: set = set()
         self.market_state: Optional[MarketState] = None
         self._rebuild_entry_log_from_orders()
 
@@ -800,18 +830,25 @@ class EnhancedExecutor:
         if order_type == OrderType.SHORT and signal.symbol in self._htb_cache:
             return False, f"{signal.symbol} hard-to-borrow (cached)"
 
-        # Post-loss re-entry cooldown (long or short) — checked live here, not just
-        # at scan-target build time (_build_scan_targets), which only excludes a
-        # cooling-down symbol from that cycle's scan universe as a one-time snapshot.
-        # The cooldown itself is set by a background thread polling every 10s
-        # (detect_stopped_out_positions), so a symbol that closes at a loss and gets
-        # rescanned within that ~10s window was slipping through — confirmed
-        # 2026-08-11: PLUG closed at a loss, STOP-COOLDOWN logged, then EXECUTE: BUY
-        # PLUG fired 6 seconds later anyway, on into a second, bigger loss. This is
-        # the actual backstop; the scan-target filter is just an optimization to
-        # avoid wastefully re-scanning a symbol we already know is blocked.
-        if signal.symbol in self.get_afterhours_cooldown_symbols():
-            return False, f"{signal.symbol} in post-loss re-entry cooldown"
+        # Post-loss re-entry cooldown (long or short) — no longer a hard block.
+        # 2026-08-18, user request: "instead of blocking the trade enter it
+        # with trail buy" -- a symbol still in AFTERHOURS_STOP_COOLDOWN_MIN
+        # now falls through to _create_bracket_order, which checks
+        # get_afterhours_cooldown_symbols() itself and routes it through the
+        # same trailing-buy path as a same-day re-entry (is_reentry) instead
+        # of the normal marketable chase -- it can't fill while the name is
+        # still actively falling.
+        #
+        # Original hard-block rationale, still worth keeping in mind: SOXS
+        # (2026-08-05) got stopped out and immediately re-bought the IDENTICAL
+        # VWAPFade signal repeatedly -- 22 trades, -$605 net -- because
+        # nothing throttled re-firing the same losing signal. A trailing buy
+        # can't fill mid-fall the way that chase could, but it does NOT cap
+        # how many times a symbol can be re-entered in a day -- if the same
+        # strategy keeps re-signaling and each trail-buy keeps getting stopped
+        # on the next leg down, this only slows the bleed, doesn't prevent
+        # repeated small losses stacking up the way SOXS did. No attempt-cap
+        # added here; revisit if that pattern shows up live.
 
         # Momentum entry freshness (long only — a short entry isn't chasing a
         # gap up) — reject a gap/momentum signal that's already faded off its
@@ -1045,49 +1082,123 @@ class EnhancedExecutor:
         self._htb_cache.add(signal.symbol)
         log.warning(f"Short blocked {signal.symbol} (not shortable/insufficient BP): {e}")
 
+    def _entries_today_count(self, symbol: str) -> int:
+        """How many times `symbol` has already been entered today -- resets
+        on a date rollover. Read BEFORE submitting a new entry (0 = first
+        entry today, so a return value > 0 means the one about to be
+        submitted is a re-entry). See _entries_today in __init__."""
+        today = datetime.date.today()
+        if self._entries_today_date != today:
+            self._entries_today.clear()
+            self._entries_today_date = today
+        return self._entries_today.get(symbol, 0)
+
+    def _is_reentry_signal(self, symbol: str, is_long: bool = True) -> bool:
+        """True if `symbol` should use the trailing-buy entry path instead of
+        the normal marketable chase: a 2nd+ same-day entry, one still inside
+        its post-loss cooldown window, OR any symbol with SOME prior fill
+        history at all -- broker-confirmed via _get_entry_datetime, since
+        _entry_log alone doesn't survive this bot's frequent restarts.
+
+        2026-08-18, user request: "the re entry to trail buy doesn't have to
+        come from cool down list only... even if the non cool down reentry to
+        a prior traded stock is entering put in a trail buy order" -- SNDQ
+        that day: stopped 09:02 (no cooldown block issue, still same-day/
+        cooldown-covered), but the general case is a symbol that WON its last
+        trade (no cooldown ever set) or was traded days ago (cooldown long
+        expired) -- neither same-day count nor cooldown catches that, and it
+        deserves the same falling-knife protection on re-entry.
+
+        Broker lookup only runs once per symbol per process lifetime -- a
+        confirmed "never traded" result is cached in _no_history_cache so a
+        genuinely new symbol doesn't pay a broker round-trip on every single
+        entry attempt forever."""
+        if self._entries_today_count(symbol) > 0:
+            return True
+        if symbol in self.get_afterhours_cooldown_symbols():
+            return True
+        if symbol in self._no_history_cache:
+            return False
+        has_history = self._get_entry_datetime(symbol, is_long) is not None
+        if not has_history:
+            self._no_history_cache.add(symbol)
+        return has_history
+
     def _create_bracket_order(self, signal: Signal, shares: int, risk_info: Dict, order_type: OrderType) -> bool:
         """Submit a bounded-limit entry (see _marketable_limit_price) then a
         GTC trailing stop at risk_info['stop_loss_pct']%. TP bracket leg is
         intentionally dropped — the trailing stop locks in gains
-        automatically; swap logic and EOD close handle opportunity exits."""
-        side      = OrderSide.BUY  if order_type == OrderType.LONG else OrderSide.SELL
-        stop_side = OrderSide.SELL if order_type == OrderType.LONG else OrderSide.BUY
-        trail_pct = risk_info["stop_loss_pct"]  # tiered: NORMAL=3%, MEDIUM=4%, HIGH=5%, EXTREME=7%
+        automatically; swap logic and EOD close handle opportunity exits.
+
+        2026-08-18, user request: a 2nd+ same-day entry into `signal.symbol`,
+        OR one still inside its post-loss cooldown (is_reentry either way),
+        submits a TrailingStopOrderRequest instead -- it trails the adverse
+        move (down for a long, up for a short) and only fires once price
+        reverses REENTRY_TRAIL_PCT% off the extreme it reached, so a
+        re-entry can't fill while the name is still actively falling (or
+        squeezing, for a short). See REENTRY_TRAIL_PCT in config.py for the
+        PFSA incident this covers, and _validate_trade's docstring for why
+        the cooldown itself no longer blocks the trade outright. It's a
+        resting order the broker adjusts itself, so it bypasses
+        _entry_pending/_sweep_pending_entries entirely -- nothing for that
+        re-chase loop to do."""
+        side          = OrderSide.BUY  if order_type == OrderType.LONG else OrderSide.SELL
+        stop_side     = OrderSide.SELL if order_type == OrderType.LONG else OrderSide.BUY
+        trail_pct     = risk_info["stop_loss_pct"]  # tiered: NORMAL=3%, MEDIUM=4%, HIGH=5%, EXTREME=7%
+        is_long_entry = order_type == OrderType.LONG
+        is_reentry    = self._is_reentry_signal(signal.symbol, is_long_entry)
 
         # ── Step 1: Entry order (failure aborts the whole bracket) ──────────
         try:
-            is_long_entry = order_type == OrderType.LONG
-            mid = _live_quote_mid(self.client, signal.symbol, signal.price)
-            baseline_limit = _marketable_limit_price(mid, is_long=is_long_entry)  # today's price, always computed as the never-worse-than ceiling
-            if signal.stale_entry:
-                # Passive: rest on the OPPOSITE side of the spread from a
-                # normal chase-in (mid -1% for a long) instead of paying up
-                # into a signal already confirmed fading -- see
-                # FADED_ENTRY_PASSIVE_WINDOW_SECONDS in config.py.
-                entry_limit = _marketable_limit_price(mid, is_long=not is_long_entry)
-            else:
-                entry_limit = baseline_limit
-            entry_req = LimitOrderRequest(
-                symbol          = signal.symbol,
-                qty             = shares,
-                side            = side,
-                time_in_force   = TimeInForce.DAY,
-                limit_price     = entry_limit,
-                client_order_id = f"apex-{signal.strategy}-{signal.symbol}-{int(time.time())}",
-            )
-            order = self.client.submit_order(entry_req)
-            self.order_cache[signal.symbol] = order.id
-            self._entry_pending[signal.symbol] = {
-                "order_id": str(order.id), "qty": shares,
-                "is_long": is_long_entry, "chase_count": 0,
-            }
-            if signal.stale_entry:
-                self._entry_pending[signal.symbol]["price_ceiling"] = baseline_limit
-                self._entry_pending[signal.symbol]["first_submitted_at"] = datetime.datetime.now(datetime.timezone.utc)
-                log.info(
-                    f"{signal.symbol}: faded entry -- passive limit ${entry_limit:.2f} "
-                    f"(vs ${baseline_limit:.2f} marketable), {FADED_ENTRY_PASSIVE_WINDOW_SECONDS}s to fill"
+            if is_reentry and REENTRY_TRAIL_PCT > 0:
+                entry_req = TrailingStopOrderRequest(
+                    symbol          = signal.symbol,
+                    qty             = shares,
+                    side            = side,
+                    type            = AlpacaOrderType.TRAILING_STOP,
+                    time_in_force   = TimeInForce.DAY,
+                    trail_percent   = REENTRY_TRAIL_PCT,
+                    client_order_id = f"apex-reentry-{signal.strategy}-{signal.symbol}-{int(time.time())}",
                 )
+                order = self.client.submit_order(entry_req)
+                self.order_cache[signal.symbol] = order.id
+                log.info(
+                    f"{signal.symbol}: re-entry (already traded today) -- trailing "
+                    f"{'BUY' if is_long_entry else 'SELL'} {REENTRY_TRAIL_PCT:.1f}% instead of chasing in"
+                )
+            else:
+                mid = _live_quote_mid(self.client, signal.symbol, signal.price)
+                baseline_limit = _marketable_limit_price(mid, is_long=is_long_entry)  # today's price, always computed as the never-worse-than ceiling
+                if signal.stale_entry:
+                    # Passive: rest on the OPPOSITE side of the spread from a
+                    # normal chase-in (mid -1% for a long) instead of paying up
+                    # into a signal already confirmed fading -- see
+                    # FADED_ENTRY_PASSIVE_WINDOW_SECONDS in config.py.
+                    entry_limit = _marketable_limit_price(mid, is_long=not is_long_entry)
+                else:
+                    entry_limit = baseline_limit
+                entry_req = LimitOrderRequest(
+                    symbol          = signal.symbol,
+                    qty             = shares,
+                    side            = side,
+                    time_in_force   = TimeInForce.DAY,
+                    limit_price     = entry_limit,
+                    client_order_id = f"apex-{signal.strategy}-{signal.symbol}-{int(time.time())}",
+                )
+                order = self.client.submit_order(entry_req)
+                self.order_cache[signal.symbol] = order.id
+                self._entry_pending[signal.symbol] = {
+                    "order_id": str(order.id), "qty": shares,
+                    "is_long": is_long_entry, "chase_count": 0,
+                }
+                if signal.stale_entry:
+                    self._entry_pending[signal.symbol]["price_ceiling"] = baseline_limit
+                    self._entry_pending[signal.symbol]["first_submitted_at"] = datetime.datetime.now(datetime.timezone.utc)
+                    log.info(
+                        f"{signal.symbol}: faded entry -- passive limit ${entry_limit:.2f} "
+                        f"(vs ${baseline_limit:.2f} marketable), {FADED_ENTRY_PASSIVE_WINDOW_SECONDS}s to fill"
+                    )
+            self._entries_today[signal.symbol] = self._entries_today.get(signal.symbol, 0) + 1
 
             # Store ATR-based TP target — checked each scan cycle by check_tp_targets()
             if signal.atr_stop and signal.atr_stop > 0:
@@ -1156,17 +1267,23 @@ class EnhancedExecutor:
     # ΓöÇΓöÇ Simple Order ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
     def _create_simple_order(self, signal: Signal, shares: int, order_type: OrderType) -> bool:
         """Non-bracket entry path. Always a bounded limit off the live bid/ask
-        mid (see _marketable_limit_price/_live_quote_mid) -- extended hours
-        needs extended_hours=True to be eligible to fill at all; regular
-        hours used to be a plain MarketOrderRequest with no price bound,
-        same NBIL-class risk _create_bracket_order had (see
-        MARKETABLE_LIMIT_BUFFER_PCT in config.py)."""
+        mid (see _marketable_limit_price/_live_quote_mid) -- regular hours
+        used to be a plain MarketOrderRequest with no price bound, same
+        NBIL-class risk _create_bracket_order had (see
+        MARKETABLE_LIMIT_BUFFER_PCT in config.py).
+
+        2026-08-18, user request: entries never use extended hours -- EXTENDED_HOURS
+        now only governs exit paths (a stop-loss must be able to fire outside
+        regular hours; a new position never needs to open outside them). In
+        practice this is already unreachable -- ENTRY_WINDOW_START/END_ET now
+        match regular hours -- but hardcoded here too rather than relying
+        solely on that window (FORCE_SCAN bypasses it)."""
         side   = OrderSide.BUY if order_type == OrderType.LONG else OrderSide.SELL
         action = "BUY"         if order_type == OrderType.LONG else "SHORT"
 
         try:
             coid     = f"apex-{signal.strategy}-{signal.symbol}-{int(time.time())}"
-            extended = EXTENDED_HOURS and not self._current_market_state().is_regular_hours
+            extended = False
             mid      = _live_quote_mid(self.client, signal.symbol, signal.price)
             limit    = _marketable_limit_price(mid, is_long=(order_type == OrderType.LONG))
             req = LimitOrderRequest(
@@ -1597,6 +1714,7 @@ class EnhancedExecutor:
     def _submit_closing_order(
         self, symbol: str, qty: int, side: OrderSide, current_price: float,
         slip_pct: float = 0.5, force_extended_hours: bool = False,
+        no_extended_hours: bool = False,
     ) -> None:
         """Submit a position-closing order as a marketable limit crossing the
         spread by slip_pct off the LIVE bid/ask mid (see _live_quote_mid) --
@@ -1606,17 +1724,23 @@ class EnhancedExecutor:
         extended_hours is set whenever we're actually outside regular hours,
         since Alpaca rejects market orders (and non-extended limits) then --
         force_extended_hours=True overrides that for callers submitted DURING
-        regular hours that still need to survive past the close if unfilled
-        (EOD/guardrail force-closes at 15:45 ET: a plain DAY order expires
-        worthless at 16:00 instead of carrying into the after-hours session).
+        regular hours that still need to survive past the close if unfilled.
+        no_extended_hours=True is the opposite override -- 2026-08-18, user
+        request: EOD/guardrail force-closes (_sweep_force_closes' regular-
+        hours branch) must NEVER be extended_hours even if this call happens
+        to land right at the regular/extended boundary and MarketState.from_now()
+        has already flipped to after-hours by the time this fires; those two
+        reasons aren't "price moved against the position" and don't get to
+        trade in extended hours at all anymore (see _sweep_force_closes).
         Callers that keep missing the fill (fast-moving book) should widen
         slip_pct on retry rather than resubmitting at the same price forever."""
         mid  = _live_quote_mid(self.client, symbol, current_price)
         slip = (1.0 - slip_pct / 100.0) if side == OrderSide.SELL else (1.0 + slip_pct / 100.0)
+        extended = False if no_extended_hours else (force_extended_hours or not MarketState.from_now().is_regular_hours)
         req = LimitOrderRequest(
             symbol=symbol, qty=qty, side=side, time_in_force=TimeInForce.DAY,
             limit_price=round(mid * slip, 2),
-            extended_hours=force_extended_hours or not MarketState.from_now().is_regular_hours,
+            extended_hours=extended,
         )
         self.client.submit_order(req)
 
@@ -2249,10 +2373,12 @@ class EnhancedExecutor:
                     pass
 
                 side = OrderSide.SELL if qty > 0 else OrderSide.BUY
-                # force_extended_hours=True: submitted during regular hours (15:45 ET)
-                # but must survive past the 16:00 close if unfilled, not expire worthless
-                # -- _sweep_force_closes (below) re-chases it into after-hours if needed.
-                self._submit_closing_order(sym, abs(qty), side, float(pos.current_price), force_extended_hours=True)
+                # 2026-08-18, user request: no force_extended_hours -- EOD closes
+                # never chase into after-hours anymore. Unfilled by the 16:00 close,
+                # this expires worthless and the position carries overnight under its
+                # existing GTC trailing stop; _sweep_force_closes (below) gives up
+                # the same way once regular hours end instead of re-chasing.
+                self._submit_closing_order(sym, abs(qty), side, float(pos.current_price), no_extended_hours=True)
                 self._entry_log.pop(sym, None)
                 self._force_close_pending[sym] = {"reason": f"eod:{entry_info.get('strategy', 'unknown')}", "chase_count": 0}
 
@@ -2366,10 +2492,10 @@ class EnhancedExecutor:
 
             close_side = OrderSide.SELL if qty > 0 else OrderSide.BUY
             try:
-                # force_extended_hours=True: same reasoning as close_eod_positions --
-                # submitted during regular hours but must survive past 16:00 if
-                # unfilled; _sweep_force_closes re-chases it into after-hours.
-                self._submit_closing_order(sym, abs(qty), close_side, float(pos.current_price), force_extended_hours=True)
+                # 2026-08-18, user request: same as close_eod_positions -- no
+                # force_extended_hours, no after-hours chase. Carries overnight
+                # under its GTC trailing stop if unfilled by the 16:00 close.
+                self._submit_closing_order(sym, abs(qty), close_side, float(pos.current_price), no_extended_hours=True)
                 self._force_close_pending[sym] = {"reason": f"guardrail:{fail_reason}", "chase_count": 0}
                 already_closed.add(sym)
                 pnl = float(pos.unrealized_pl)
@@ -2398,11 +2524,20 @@ class EnhancedExecutor:
         force-close it was supposed to get. Re-chases with a fresh live-bid/ask
         limit at escalating slip (same shape as check_afterhours_stops) until
         it's actually flat. Meant to be polled frequently (the 10s software-stop
-        thread) so it catches a stale order quickly, including after the initial
-        close's regular-hours submit rolls into the after-hours session.
-        ponytail: no cap on total re-chase attempts (only slip% is capped, at
-        3%) -- a genuinely halted/no-bid symbol would retry indefinitely. Add a
-        max-attempts giveup (with an alert) if that's ever observed live."""
+        thread) so it catches a stale order quickly.
+        ponytail: no cap on total re-chase attempts within regular hours (only
+        slip% is capped, at 3%) -- a genuinely halted/no-bid symbol would retry
+        indefinitely. Add a max-attempts giveup (with an alert) if that's ever
+        observed live.
+
+        2026-08-18, user request: the only two reasons that land in
+        _force_close_pending (close_eod_positions/close_guardrail_fail_positions,
+        "eod:..."/"guardrail:...") are deadline/liquidity driven, not "price
+        moved against the position" -- so neither chases into extended hours
+        anymore. Gives up the instant regular hours end and leaves the position
+        to carry overnight under its GTC trailing stop; check_afterhours_stops
+        is the only path allowed to actually exit a position outside regular
+        hours."""
         if not self._force_close_pending:
             return
         try:
@@ -2425,6 +2560,47 @@ class EnhancedExecutor:
                 continue
 
             sym_orders = orders_by_sym.get(sym, [])
+
+            if not self._current_market_state().is_regular_hours:
+                # Give up -- EOD/guardrail closes don't chase into extended hours
+                # (see docstring). Carries overnight under its GTC trailing stop,
+                # re-arming one only if a still-regular-hours chase attempt above
+                # already cancelled it and never got a replacement order in.
+                has_gtc = any(getattr(o, "time_in_force", None) == TimeInForce.GTC for o in sym_orders)
+                if has_gtc:
+                    self._force_close_pending.pop(sym, None)
+                    log.warning(f"_sweep_force_closes {sym} [{info.get('reason')}]: market closed — giving up chase, carrying overnight under existing GTC stop")
+                    continue
+
+                # No GTC resting -- cancel any stale non-GTC close order first (it
+                # still reserves the qty against a new order, same reservation
+                # issue _free_shares_for_trim exists for) before re-arming.
+                # Deliberately NOT popped from _force_close_pending on failure --
+                # left for the next 10s poll to retry rather than silently giving
+                # up with the position unprotected.
+                stale = next((o for o in sym_orders if getattr(o, "time_in_force", None) != TimeInForce.GTC), None)
+                if stale is not None:
+                    try:
+                        self.client.cancel_order_by_id(str(stale.id))
+                        time.sleep(0.4)
+                    except Exception as e:
+                        log.warning(f"_sweep_force_closes {sym} [{info.get('reason')}]: market closed, stale-close cancel failed before GTC re-arm, will retry next poll: {e}")
+                        continue
+
+                side = OrderSide.SELL if qty > 0 else OrderSide.BUY
+                try:
+                    trail_pct, _ = _trail_pct_for(sym, float(pos.current_price), self._entry_log)
+                    self.client.submit_order(TrailingStopOrderRequest(
+                        symbol=sym, qty=abs(qty), side=side,
+                        type=AlpacaOrderType.TRAILING_STOP,
+                        time_in_force=TimeInForce.GTC, trail_percent=trail_pct,
+                    ))
+                    self._force_close_pending.pop(sym, None)
+                    log.warning(f"_sweep_force_closes {sym} [{info.get('reason')}]: market closed — giving up chase, re-armed GTC trailing stop, carrying overnight")
+                except Exception as e:
+                    log.error(f"_sweep_force_closes {sym} [{info.get('reason')}]: market closed, giving up chase, GTC re-arm failed, will retry next poll — position may be UNPROTECTED overnight in the meantime: {e}")
+                continue
+
             pending = next((o for o in sym_orders if getattr(o, "time_in_force", None) != TimeInForce.GTC), None)
             if pending is not None:
                 submitted_at = getattr(pending, "submitted_at", None) or getattr(pending, "created_at", None)
@@ -2455,7 +2631,11 @@ class EnhancedExecutor:
             try:
                 chase_n  = info.get("chase_count", 0)
                 slip_pct = min(0.5 * (chase_n + 1), 3.0)
-                self._submit_closing_order(sym, abs(qty), side, float(pos.current_price), slip_pct=slip_pct, force_extended_hours=True)
+                # no_extended_hours=True -- still regular hours here (checked above),
+                # and this reason (eod/guardrail) must never spill into extended
+                # hours, even if MarketState.from_now() has already flipped by the
+                # time this fires (right at the 16:00 boundary).
+                self._submit_closing_order(sym, abs(qty), side, float(pos.current_price), slip_pct=slip_pct, no_extended_hours=True)
                 info["chase_count"] = chase_n + 1
                 log.warning(
                     f"FORCE-CLOSE RE-CHASE {sym} [{info.get('reason')}]: unfilled after prior attempt "
@@ -3052,7 +3232,28 @@ class EnhancedExecutor:
             # zero drift protection past an hour while down -2.8%) -- backfill
             # an approximate reference from real 1-min bar data instead of
             # leaving the position unwatched until history rebuilds on its own.
-            reference = history[0] if len(history) == lookback_ticks else self._backfill_drift_reference(sym)
+            #
+            # 2026-08-18, user request: that backfill is only valid once the
+            # POSITION ITSELF is at least PRICE_DRIFT_LOOKBACK_MIN old -- for
+            # anything younger, "PRICE_DRIFT_LOOKBACK_MIN minutes ago" lands
+            # BEFORE entry, in bars that have nothing to do with this trade
+            # (e.g. a LiquiditySweep long entered right after a sweep-low: the
+            # 30 min before entry routinely include a HIGH above the entry
+            # price, so a since-entry-flat position could "drift" >1% against
+            # that stale pre-entry high and get stopped for a move that never
+            # happened after we were even in the trade). Force reference=None
+            # (drops that leg, per _drift_stop_reason) until the position has
+            # actually been held that long -- the entry-price leg alone still
+            # covers it in the meantime.
+            entry_dt = self._get_entry_datetime(sym, is_long)
+            age_min  = (
+                (datetime.datetime.now(datetime.timezone.utc) - entry_dt).total_seconds() / 60
+                if entry_dt else None
+            )
+            if age_min is not None and age_min < PRICE_DRIFT_LOOKBACK_MIN:
+                reference = None
+            else:
+                reference = history[0] if len(history) == lookback_ticks else self._backfill_drift_reference(sym)
             reason = self._drift_stop_reason(current, entry, reference, is_long, PRICE_DRIFT_STOP_PCT)
 
             # Record this check's price regardless of outcome — the deque
