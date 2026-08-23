@@ -369,21 +369,6 @@ def _demo() -> None:
     assert reason(10.05, 10.00, False) is not None, "close above EMA15 while short -> exit"
     print("_ema15_exit_reason: all checks passed")
 
-    # api_blackout_minutes / _note_protection_fetch: the API-blackout
-    # guardrail's clock. 2026-08-22, user request.
-    class _BlackoutStub:
-        _protection_fail_since = None
-    bstub = _BlackoutStub()
-    assert EnhancedExecutor.api_blackout_minutes(bstub) == 0.0, "no failure yet -> 0"
-    EnhancedExecutor._note_protection_fetch(bstub, False)
-    assert bstub._protection_fail_since is not None, "a failure must start the clock"
-    bstub._protection_fail_since = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=6)
-    assert EnhancedExecutor.api_blackout_minutes(bstub) >= 5.99, "6 min old failure must read as ~6 min"
-    EnhancedExecutor._note_protection_fetch(bstub, True)
-    assert bstub._protection_fail_since is None, "a success must clear the clock"
-    assert EnhancedExecutor.api_blackout_minutes(bstub) == 0.0
-    print("api_blackout_minutes: all checks passed")
-
     # _check_ema_trend_alignment: EMA9's own slope (this minute vs last)
     # must confirm the trade direction, fail-open on missing/insufficient
     # data. 2026-08-22, user request.
@@ -523,26 +508,9 @@ class EnhancedExecutor:
         self._pdt_violation_alerted: bool = False  # tracks whether the PDT violation email has been sent this session
         self._force_close_pending: Dict[str, dict] = {}  # {symbol: {"reason": str, "chase_count": int}} — EOD/guardrail closes not yet confirmed flat; swept by _sweep_force_closes until filled
         self._guardrail_eod_closed: Dict[object, set] = {}  # {date: {symbol, ...}} — symbols already force-closed today by close_guardrail_fail_positions, so its per-minute reruns don't re-cancel/resubmit an order already in flight
-        # Same idempotency shape, for close_eod_positions() -- 2026-08-22,
-        # user request ("all the positions exit at 3.50pm et") dropped that
-        # function's strategy/date/entry_info filters, which used to double
-        # as its "already handled" marker (an entry_info.pop() on close).
-        # With no entry_info required at all now, an explicit tracked set is
-        # the only idempotency signal left.
-        self._eod_closed: Dict[object, set] = {}
         # {symbol: deque of the last N check_price_drift_stop prices, maxlen = PRICE_DRIFT_LOOKBACK_MIN / PRICE_DRIFT_CHECK_INTERVAL_MIN}
         # deque[0] is the oldest sample kept — the ~PRICE_DRIFT_LOOKBACK_MIN-minutes-ago reference once full.
         self._price_drift_history: Dict[str, Deque[float]] = {}
-        # 2026-08-22, user request (non-negotiable guardrail, after the
-        # 2026-08-21 incident: Alpaca API auth broke mid-session and every
-        # position-protection check silently failed for 32+ hours straight
-        # while the bot kept trading blind) -- earliest UTC timestamp of the
-        # CURRENT unbroken run of fetch failures across detect_stopped_out_
-        # positions/_cover_naked_positions/check_afterhours_stops/
-        # check_ema15_exit, cleared the moment any of them succeeds. See
-        # _note_protection_fetch() and
-        # api_blackout_minutes().
-        self._protection_fail_since: Optional[datetime.datetime] = None
         # {symbol: {"order_id": str, "qty": int, "is_long": bool, "chase_count": int}}
         # — resting entry orders not yet confirmed filled; swept by _sweep_pending_entries
         self._entry_pending: Dict[str, dict] = {}
@@ -1875,9 +1843,7 @@ class EnhancedExecutor:
             covered     = {o.symbol for o in open_orders}
         except Exception as e:
             log.warning(f"_cover_naked_positions: fetch failed: {e}")
-            self._note_protection_fetch(False)
             return
-        self._note_protection_fetch(True)
         for pos in positions:
             sym = pos.symbol
             if re.match(r'^[A-Z]+\d{6}[CP]\d{8}$', sym):
@@ -1958,31 +1924,6 @@ class EnhancedExecutor:
             self._afterhours_stop_cooldown.pop(s, None)
         return set(self._afterhours_stop_cooldown.keys())
 
-    def _note_protection_fetch(self, ok: bool) -> None:
-        """Track consecutive Alpaca fetch failures across the position-
-        protection checks (detect_stopped_out_positions, _cover_naked_
-        positions, check_afterhours_stops, check_ema15_exit). 2026-08-22,
-        user request: a non-negotiable guardrail after 2026-08-21 --
-        account auth broke at 09:20 CT and these functions logged nothing
-        but "fetch failed: unauthorized" every cycle for 32+ hours with no
-        halt and no alert; the bot kept submitting entries the whole time
-        with zero ability to see or protect what it already held.
-        `ok=False` starts (or continues) the blackout clock; any `ok=True`
-        clears it."""
-        if ok:
-            self._protection_fail_since = None
-        elif self._protection_fail_since is None:
-            self._protection_fail_since = datetime.datetime.now(datetime.timezone.utc)
-
-    def api_blackout_minutes(self) -> float:
-        """Minutes since the current unbroken run of protection-fetch
-        failures began, or 0.0 if not in a blackout. See
-        _note_protection_fetch(); checked by the orchestrator before
-        allowing new entries -- API_BLACKOUT_HALT_MIN in config.py."""
-        if self._protection_fail_since is None:
-            return 0.0
-        return (datetime.datetime.now(datetime.timezone.utc) - self._protection_fail_since).total_seconds() / 60
-
     def detect_stopped_out_positions(self) -> None:
         """Catch a position closing via ANY route — most commonly a normal
         broker-side GTC trailing stop filling on its own — and apply the same
@@ -2005,9 +1946,7 @@ class EnhancedExecutor:
             positions = self.client.get_all_positions()
         except Exception as e:
             log.warning(f"detect_stopped_out_positions: fetch failed: {e}")
-            self._note_protection_fetch(False)
             return
-        self._note_protection_fetch(True)
 
         current: Dict[str, dict] = {}
         for p in positions:
@@ -2117,9 +2056,7 @@ class EnhancedExecutor:
             open_orders = self.client.get_orders()
         except Exception as e:
             log.warning(f"check_afterhours_stops: fetch failed: {e}")
-            self._note_protection_fetch(False)
             return
-        self._note_protection_fetch(True)
 
         # Position closed since the last poll — its re-chase count is stale, drop it
         # so a future breach of the same symbol starts back at the base slip.
@@ -2444,31 +2381,25 @@ class EnhancedExecutor:
         return None
 
     def close_eod_positions(self) -> Optional[dict]:
-        """Close EVERY open equity position at EOD_CLOSE_TIME, no exceptions.
+        """Close all intraday-strategy positions at EOD_CLOSE_TIME.
+        Targets FloatRotation, GapBreakout, ORB, VWAPReclaim opened today.
 
-        2026-08-22, user request ("all the positions exit at 3.50pm et"):
-        dropped the EOD_CLOSE_STRATEGIES filter and the same-day-only
-        filter -- previously this only targeted specific intraday
-        strategies (FloatRotation/GapBreakout/ORB/etc.) entered THAT day,
-        leaving any other strategy, or a multi-day swing hold, to survive
-        overnight as long as it passed close_guardrail_fail_positions'
-        liquidity/quality check. That guardrail-based carve-out is now
-        moot -- nothing carries overnight regardless of strategy or
-        guardrail status. close_guardrail_fail_positions still runs too
-        (harmlessly redundant, just closes guardrail-failures a moment
-        earlier in the same window); EOD_CLOSE_STRATEGIES is kept for
-        anything else that still reads it (see MODULARIZATION_PLAN.md/
-        engine/config.py) but no longer gates this function.
+        2026-08-23, user request: reverted the 2026-08-22 "close EVERY
+        position, no exceptions" change -- back to gating on
+        EOD_CLOSE_STRATEGIES and same-day entry only. Anything else (a
+        different strategy, or a multi-day swing hold) is left alone here;
+        close_guardrail_fail_positions is the other half of the overnight
+        picture but is itself disabled as of the same request (see
+        GUARDRAIL_EOD_CLOSE_ENABLED in config.py).
 
-        2026-08-17, user request (still true): runs every minute through
-        the window (schedule.every(1).minutes) rather than once per day --
-        the old once-per-day flag meant a position opened AFTER the first
-        post-15:45 tick (ASST/NUAI, opened 15:57 ET) had already missed its
+        2026-08-17, user request: runs every minute through the window
+        (schedule.every(1).minutes) rather than once per day -- the old
+        once-per-day flag meant a position opened AFTER the first post-
+        15:45 tick (ASST/NUAI, opened 15:57 ET) had already missed its
         only chance to be flattened. Safe to call repeatedly: a symbol
-        already closed has its _entry_log entry popped below, and qty==0
-        (or the position is simply gone) makes the next tick a no-op for
-        it -- only newly-opened, not-yet-closed positions actually submit
-        an order."""
+        already closed has its _entry_log entry popped below, so the next
+        tick's `if not entry_info: continue` is a no-op for it -- only
+        newly-opened, not-yet-processed positions actually submit an order."""
         if not EOD_CLOSE_ENABLED:
             return None
 
@@ -2480,32 +2411,29 @@ class EnhancedExecutor:
         if now_et.hour >= 16:
             return None  # Market already closed
 
-        today = datetime.date.today()
-        already_closed = self._eod_closed.setdefault(today, set())
-        self._eod_closed = {today: already_closed}  # drop any stale prior-day entries
-
         try:
             positions = self.client.get_all_positions()
         except Exception as e:
             log.error(f"close_eod_positions: fetch failed: {e}")
             return None
 
+        today = datetime.date.today()
         closed_items = []
         failed_items = []
 
         for pos in positions:
             sym = pos.symbol
-            if re.match(r'^[A-Z]+\d{6}[CP]\d{8}$', sym):
-                continue  # options legs — managed separately by OptionsExecutor
             qty = int(float(pos.qty))
             if qty == 0:
                 continue
-            if sym in already_closed:
-                continue  # close already attempted today -- _sweep_force_closes chases it if still unfilled
 
-            # No entry_log record (e.g. restored after a restart) still gets
-            # closed -- just without a strategy label for the log line.
-            entry_info = self._entry_log.get(sym) or {}
+            entry_info = self._entry_log.get(sym)
+            if not entry_info:
+                continue
+            if entry_info.get("date") != today:
+                continue
+            if entry_info.get("strategy") not in EOD_CLOSE_STRATEGIES:
+                continue
 
             try:
                 # Cancel only DAY-TIF orders holding shares for this symbol before
@@ -2536,7 +2464,6 @@ class EnhancedExecutor:
                 # the same way once regular hours end instead of re-chasing.
                 self._submit_closing_order(sym, abs(qty), side, float(pos.current_price), no_extended_hours=True)
                 self._entry_log.pop(sym, None)
-                already_closed.add(sym)
                 self._force_close_pending[sym] = {"reason": f"eod:{entry_info.get('strategy', 'unknown')}", "chase_count": 0}
 
                 pnl = float(pos.unrealized_pl)
@@ -3504,9 +3431,7 @@ class EnhancedExecutor:
             positions = self.client.get_all_positions()
         except Exception as e:
             log.warning(f"check_ema15_exit: fetch failed: {e}")
-            self._note_protection_fetch(False)
             return
-        self._note_protection_fetch(True)
 
         today = datetime.date.today()
 

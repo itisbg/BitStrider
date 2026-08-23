@@ -47,10 +47,8 @@ from engine.config import (
     SCAN_WORKERS,
     SCAN_SYMBOL_TIMEOUT,
     MIN_DOLLAR_VOLUME,
-    MIN_FLOAT_SHARES, MIN_FLOAT_SHARES_REGULAR_HOURS,
-    MIN_AVG_DAILY_VOLUME, MIN_AVG_DAILY_VOLUME_REGULAR_HOURS, MIN_AVG_DAILY_VOLUME_HARD_FLOOR,
-    MIN_FLOAT_SHARES_HARD_FLOOR,
-    REGULAR_HOURS_LOOSE_FLOOR_DELAY_MIN,
+    MIN_FLOAT_SHARES_REGULAR_HOURS,
+    MIN_AVG_DAILY_VOLUME_REGULAR_HOURS,
     MIN_MARKET_CAP,
     MIN_STOCK_PRICE,
     LONG_ONLY_MODE,
@@ -122,39 +120,6 @@ def _prefetch_snapshots(symbols: List[str]) -> None:
             _snapshot_cache = snaps
     except Exception:
         pass  # fall back to per-symbol get_bars in _passes_guardrails
-
-
-def _effective_liquidity_floors(market_state: Optional[MarketState], now_et: Optional[datetime.datetime] = None) -> tuple:
-    """Return (min_float_shares, min_avg_daily_volume) for the current session.
-
-    2026-08-17, at the user's request ("remove the pre-open/first-hour 200M
-    block only before market hours"): the float floor now loosens to
-    MIN_FLOAT_SHARES_REGULAR_HOURS (20M) as soon as market_state.is_regular_
-    hours is True — no more waiting for REGULAR_HOURS_LOOSE_FLOOR_DELAY_MIN.
-    The strict 200M floor now applies ONLY genuinely before/after market
-    hours, not during the first hour of regular trading (confirmed live:
-    CADL, 60.1M float, was blocked twice at 09:05/09:10 CDT by the old first-
-    hour rule despite regular hours having opened 35+ min earlier at 08:30
-    CDT). The volume floor's delay is UNCHANGED -- the 2026-08-11 backtest
-    finding behind it (avg_volume/low_float/min_price all flat-or-negative
-    before 09:30 CDT) was about the whole guardrail set, but this ask named
-    the float number specifically; leaving MIN_AVG_DAILY_VOLUME_REGULAR_HOURS
-    on its original delay keeps that half of the finding intact.
-
-    now_et: inject a specific ET timestamp for testing; defaults to live time.
-    """
-    is_regular = market_state is not None and market_state.is_regular_hours
-    min_float = MIN_FLOAT_SHARES_REGULAR_HOURS if is_regular else MIN_FLOAT_SHARES
-
-    min_vol = MIN_AVG_DAILY_VOLUME
-    if is_regular:
-        now_et = now_et or datetime.datetime.now(_ET)
-        mkt_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
-        minutes_since_open = (now_et - mkt_open).total_seconds() / 60
-        if minutes_since_open >= REGULAR_HOURS_LOOSE_FLOOR_DELAY_MIN:
-            min_vol = MIN_AVG_DAILY_VOLUME_REGULAR_HOURS
-
-    return min_float, min_vol
 
 
 # Every guardrail-rejection reason _passes_guardrails() can return that this
@@ -361,47 +326,29 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
             return False
 
         # Liquidity / quality floor — skip thin, low-float, micro-cap names prone to
-        # violent, illiquid moves after hours (see BIOA 2026-07-31: repeated overnight
-        # buy-then-stop cycles on a low-float, thinly traded ticker). Loosened for
-        # regular hours 2026-08-11 — the BIOA risk this was built for is specifically
-        # an overnight/pre-market one (thin book, no market-maker presence); during
-        # the regular session the same float/volume floor was also blocking real,
-        # liquid names (HTZ, BTDR, IHRT) and most of what a mover-scanner like TI
-        # flags in the first place, since low float is exactly what makes a name
-        # move hard on modest volume. Pre/after-market keep the original floors.
-        effective_min_float, effective_min_avg_vol = _effective_liquidity_floors(market_state)
-
+        # violent, illiquid moves. 2026-08-23, user request: combined the old
+        # two-layer system (an absolute hard floor plus a separate, session-
+        # gated regular/pre-after-hours floor) into one flat set, applied the
+        # same regardless of time of day or session: float > 10M, avg daily
+        # volume >= 700K. See MIN_FLOAT_SHARES_REGULAR_HOURS/
+        # MIN_AVG_DAILY_VOLUME_REGULAR_HOURS in config.py (names kept for the
+        # overnight guardrail-fail check in enhanced.py, which still uses
+        # them independently).
         daily = get_daily_volume_bars(symbol)
         if not daily.empty and len(daily) >= 2:
             avg_daily_vol = float(daily["volume"].iloc[:-1].mean())
-            # Absolute floor -- never rescued by the thin-liquidity/stale-
-            # momentum trade-anyway paths, unlike the session-based check
-            # below. See MIN_AVG_DAILY_VOLUME_HARD_FLOOR in config.py.
-            if avg_daily_vol < MIN_AVG_DAILY_VOLUME_HARD_FLOOR:
-                _log.warning(f"[GUARDRAIL] {symbol} blocked: avg daily volume {avg_daily_vol:.0f} < hard floor {MIN_AVG_DAILY_VOLUME_HARD_FLOOR:.0f} (never bypassed)")
-                if return_reason:
-                    return False, 'avg_volume_hard_floor'
-                return False
-            if avg_daily_vol < effective_min_avg_vol:
-                _log.warning(f"[GUARDRAIL] {symbol} blocked: avg daily volume {avg_daily_vol:.0f} < {effective_min_avg_vol:.0f}")
+            if avg_daily_vol < MIN_AVG_DAILY_VOLUME_REGULAR_HOURS:
+                _log.warning(f"[GUARDRAIL] {symbol} blocked: avg daily volume {avg_daily_vol:.0f} < {MIN_AVG_DAILY_VOLUME_REGULAR_HOURS:.0f}")
                 if return_reason:
                     return False, 'avg_volume'
                 return False
 
         shares_float = _get_float_shares(symbol)
-        if shares_float is not None:
-            # Absolute floor -- never rescued, unlike the session-based check
-            # below. See MIN_FLOAT_SHARES_HARD_FLOOR in config.py.
-            if shares_float < MIN_FLOAT_SHARES_HARD_FLOOR:
-                _log.warning(f"[GUARDRAIL] {symbol} blocked: float {shares_float/1e6:.2f}M < hard floor {MIN_FLOAT_SHARES_HARD_FLOOR/1e6:.1f}M (never bypassed)")
-                if return_reason:
-                    return False, 'low_float_hard_floor'
-                return False
-            if shares_float < effective_min_float:
-                _log.warning(f"[GUARDRAIL] {symbol} blocked: float {shares_float/1e6:.1f}M < {effective_min_float/1e6:.0f}M")
-                if return_reason:
-                    return False, 'low_float'
-                return False
+        if shares_float is not None and shares_float <= MIN_FLOAT_SHARES_REGULAR_HOURS:
+            _log.warning(f"[GUARDRAIL] {symbol} blocked: float {shares_float/1e6:.1f}M <= {MIN_FLOAT_SHARES_REGULAR_HOURS/1e6:.0f}M")
+            if return_reason:
+                return False, 'low_float'
+            return False
 
         market_cap = _get_market_cap(symbol)
         if market_cap is not None and market_cap < MIN_MARKET_CAP:
@@ -588,9 +535,7 @@ def scan_universe(scan_targets: List[str], sentiment: str, market_state: MarketS
         'gap_chase': 0,
         'min_price': 0,
         'avg_volume': 0,
-        'avg_volume_hard_floor': 0,
         'low_float': 0,
-        'low_float_hard_floor': 0,
         'low_mcap': 0,
         'other': 0
     }
@@ -682,9 +627,7 @@ def scan_universe(scan_targets: List[str], sentiment: str, market_state: MarketS
             f"[GUARDRAIL SUMMARY] Rejected: {total_rejected} | DollarVol: {guardrail_rejections['dollar_vol']} | "
             f"RVOL: {guardrail_rejections['rvol']} | GapChase: {guardrail_rejections['gap_chase']} | "
             f"MinPrice: {guardrail_rejections['min_price']} | AvgVolume: {guardrail_rejections['avg_volume']} | "
-            f"AvgVolHardFloor: {guardrail_rejections['avg_volume_hard_floor']} | "
             f"LowFloat: {guardrail_rejections['low_float']} | "
-            f"LowFloatHardFloor: {guardrail_rejections['low_float_hard_floor']} | "
             f"LowMcap: {guardrail_rejections['low_mcap']} | "
             f"Other: {guardrail_rejections['other']}"
             + (f" | ThinLiquidityAdmitted: {thin_liquidity_stats['admitted']}" if thin_liquidity_stats['admitted'] else "")

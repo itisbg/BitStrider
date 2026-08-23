@@ -80,6 +80,11 @@ with patch("engine.execution.enhanced.datetime.datetime", _FixedDateTime):
     assert client.submitted == ["FOO", "BAR"], client.submitted
 
     # ---- close_guardrail_fail_positions: same rerun contract, via the per-symbol _guardrail_eod_closed set ----
+    # 2026-08-23, user request: GUARDRAIL_EOD_CLOSE_ENABLED now defaults False
+    # (disabled, no longer relevant) -- the rerun-idempotency logic under
+    # test still lives in the function and stays correct if it's ever
+    # re-enabled, so force it on for this test rather than deleting coverage
+    # for working code.
     client2 = FakeClient()
     ex2 = enhanced.EnhancedExecutor(client2)
     client2.positions = [FakePosition("THIN1", 10), FakePosition("GOOD1", 10)]
@@ -91,7 +96,8 @@ with patch("engine.execution.enhanced.datetime.datetime", _FixedDateTime):
 
     with patch.object(enhanced, "get_daily_volume_bars", fake_daily_bars), \
          patch.object(enhanced, "_get_float_shares", lambda sym: 500_000_000), \
-         patch.object(enhanced, "_get_market_cap", lambda sym: 500_000_000):
+         patch.object(enhanced, "_get_market_cap", lambda sym: 500_000_000), \
+         patch.object(enhanced, "GUARDRAIL_EOD_CLOSE_ENABLED", True):
 
         ex2.close_guardrail_fail_positions()
         assert client2.submitted == ["THIN1"], client2.submitted  # GOOD1 passes guardrails, left alone

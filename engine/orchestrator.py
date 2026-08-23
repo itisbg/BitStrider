@@ -79,12 +79,6 @@ from engine.risk import kill_mode as _kill_mode
 
 log = setup_logging()
 
-# 2026-08-22, user request: one-shot flag for the API blackout guardrail's
-# alert email -- set once the halt first fires so _run_cycle's every-few-
-# seconds gate doesn't re-send it every cycle; cleared the moment the
-# blackout clears (see api_blackout_minutes()).
-_blackout_alert_sent = False
-
 import logging as _logging
 _logging.getLogger("WDM").setLevel(_logging.ERROR)
 _logging.getLogger("webdriver_manager").setLevel(_logging.ERROR)
@@ -579,40 +573,6 @@ def scan_and_trade(ctx: AppContext) -> None:
     if _check_kill_mode(ctx):
         log.info("[SYSTEM] Kill mode active — aborting cycle")
         return
-
-    # Non-negotiable guardrail, 2026-08-22 user request: if the position-
-    # protection checks (detect_stopped_out_positions/_cover_naked_positions/
-    # check_afterhours_stops) have been failing continuously for
-    # API_BLACKOUT_HALT_MIN minutes, the bot can't see or protect anything it
-    # already holds -- stop taking NEW entries until the API recovers.
-    # Existing GTC trailing stops on already-open positions are untouched.
-    global _blackout_alert_sent
-    blackout_min = ctx.executor.api_blackout_minutes()
-    if blackout_min >= cfg.API_BLACKOUT_HALT_MIN:
-        log.warning(
-            f"[SYSTEM] API blackout guardrail: position-protection checks have failed "
-            f"continuously for {blackout_min:.1f} min (>= {cfg.API_BLACKOUT_HALT_MIN}) — "
-            "halting new entries until they recover"
-        )
-        if not _blackout_alert_sent:
-            try:
-                from engine.notifications.notifications import send_email
-                send_email(
-                    "ApexTrader: API blackout — new entries halted",
-                    f"Position-protection checks (detect_stopped_out_positions / "
-                    f"_cover_naked_positions / check_afterhours_stops / "
-                    f"check_ema15_exit) have failed continuously for {blackout_min:.1f} minutes. New entries are "
-                    f"halted until they recover. Existing positions' broker-side "
-                    f"trailing stops are unaffected, but the bot cannot currently "
-                    f"see or protect them. Check the Alpaca dashboard and API "
-                    f"credentials.",
-                )
-            except Exception as e:
-                log.error(f"API blackout guardrail: alert email failed: {e}")
-            _blackout_alert_sent = True
-        return
-    elif _blackout_alert_sent:
-        _blackout_alert_sent = False  # blackout cleared -- re-arm the one-shot alert
 
     if not _within_entry_window(market_state.now):
         log.info(

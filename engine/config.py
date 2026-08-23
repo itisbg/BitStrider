@@ -730,7 +730,7 @@ EOD_CLOSE_STRATEGIES = {         # Strategy names that must be closed same day
 # close); aligned to EOD_CLOSE_TIME same day at the user's request so both
 # EOD closes fire together.
 # ─────────────────────────────────────────────────────────────────
-GUARDRAIL_EOD_CLOSE_ENABLED = True
+GUARDRAIL_EOD_CLOSE_ENABLED = False  # 2026-08-23, user request: disabled, no longer relevant
 GUARDRAIL_EOD_CLOSE_TIME    = EOD_CLOSE_TIME   # fires alongside close_eod_positions
 
 # ─────────────────────────────────────────────────────────────────
@@ -790,24 +790,6 @@ PRICE_DRIFT_LOOKBACK_MIN       = 30     # how far back the comparison price is f
 STAGNANT_STOP_ENABLED             = True
 STAGNANT_STOP_CHECK_INTERVAL_MIN  = 1
 EMA15_EXIT_MIN_BARS               = 15  # need at least this many 1-min bars before trusting EMA15
-
-# ─────────────────────────────────────────────────────────────────
-# API Blackout Guardrail (non-negotiable) -- 2026-08-22, user request, built
-# from the 2026-08-21 incident: the Alpaca API started returning
-# "unauthorized" at 09:20 CT (an API key rotated mid-session) and every
-# position-protection check (detect_stopped_out_positions,
-# _cover_naked_positions, check_afterhours_stops) silently failed every
-# cycle for 32+ hours straight -- no halt, no alert, entries kept firing
-# (check_ema15_exit added to this same watch list 2026-08-22, since it's
-# now the primary same-day exit check and its outages matter just as much)
-# with zero ability to see or protect anything already held. Once those
-# checks have failed continuously for API_BLACKOUT_HALT_MIN minutes, the
-# main scan cycle stops taking new entries and sends one alert email (not
-# repeated every cycle -- see EnhancedExecutor.api_blackout_minutes() and
-# _run_cycle in orchestrator.py). Existing positions' broker-side GTC
-# trailing stops are unaffected -- this only blocks NEW entries, since
-# that's the one thing definitely safe to stop doing blind.
-API_BLACKOUT_HALT_MIN = 5
 
 # ─────────────────────────────────────────────────────────────────
 # EMA Trend Alignment Filter -- 2026-08-22, user request: "ensure the trend
@@ -1153,81 +1135,28 @@ RVOL_MIN                 = 1.5         # Require relative volume ≥ 1.5x before
 MIN_STOCK_PRICE          = 2.0         # Skip penny stocks below $2 (poor fill quality, high spread)
 ALPACA_MOVER_SCAN_INTERVAL_MIN = 10   # Re-poll Alpaca screener every 10 min (resets at market open)
 MIN_DOLLAR_VOLUME        = 1_000_000   # Skip illiquid setups: price × day_vol < $1M
-# Low-float / thin-volume floors — split by session 2026-08-11 at the user's request.
-# The original values were justified entirely by an AFTER-HOURS incident (BIOA
-# 2026-07-31: repeated overnight buy-then-stop cycles on a low-float, thinly
-# traded ticker) but were applied around the clock, which was also silently
-# excluding real, liquid, actively-traded names during regular hours — HTZ
-# (161.9M float), BTDR (145.6M), IHRT (136.4M) all got rejected today despite
-# not being remotely BIOA-like. The daytime session has exchange-wide
-# liquidity and market-maker presence the overnight/pre-market session
-# doesn't, so the same float/volume floor doesn't carry the same risk at both
-# times. Regular hours use the loosened *_REGULAR_HOURS values below;
-# pre/after-market keep the original, BIOA-driven floors unchanged.
-#
-# 7-trading-day backtest (2026-08-03..11, 1,644 blocked symbol-days) validated
-# both loosened numbers as-is — checked specific candidate floats (20M/50M/
-# 200M) and volumes (400K..1M) directly rather than trusting a greedy
-# threshold sweep (which is biased toward "admit everything" on a
-# net-positive population): tighter floats actually had the BEST average
-# return (<20M: +25.9% avg vs <200M: +4.2%), and avg-volume was flat across
-# the whole 400K-1M range either way. Neither number moved.
-#
-# What the same backtest DID find: the first hour of regular trading behaves
-# like off-hours regardless of which guardrail would catch a symbol —
-# avg_volume/low_float/min_price all went from solidly positive to flat-or-
-# negative when restricted to before 09:30 CDT (still within is_regular_hours,
-# which starts at 08:30 CDT). REGULAR_HOURS_LOOSE_FLOOR_DELAY_MIN gates the
-# loosened VOLUME floor on elapsed time since the open, not just
-# is_regular_hours.
-#
-# 2026-08-17, at the user's request ("remove the pre-open/first-hour 200M
-# block only before market hours"): the FLOAT floor no longer waits for this
-# delay — it loosens to MIN_FLOAT_SHARES_REGULAR_HOURS as soon as regular
-# hours open (08:30 CDT), same as is_regular_hours alone. Confirmed live:
-# CADL (60.1M float) got blocked twice at 09:05/09:10 CDT under the old
-# rule despite the session already being 35+ min open. The strict 200M
-# floor now applies only genuinely before/after market hours. The volume
-# floor keeps the original delay -- this ask named the float number
-# specifically, not volume. See _effective_liquidity_floors in scan.py.
-REGULAR_HOURS_LOOSE_FLOOR_DELAY_MIN = 60  # minutes after the 9:30 ET open before the loosened VOLUME floor applies (float no longer waits on this)
+# Low-float / thin-volume floors for scan-time entry eligibility.
+# 2026-08-23, user request: collapsed the old two-layer system (a separate
+# absolute "hard floor" plus a session-gated regular/pre-after-hours floor,
+# with a first-hour delay on top) into one flat rule applied the same
+# regardless of time of day: float > 10M, avg daily volume >= 700K. See
+# _passes_guardrails in scan.py.
+MIN_FLOAT_SHARES_REGULAR_HOURS = 10_000_000  # single flat float floor now, no session/time gating
+MIN_AVG_DAILY_VOLUME_REGULAR_HOURS = 700_000  # single flat volume floor now, no session/time gating
+
 # 2026-08-18, user request: 200M (the BIOA-driven pre-open/after-hours floor)
 # was inconsistent with the two OTHER floors already gating the same names --
 # MIN_MARKET_CAP ($100M) and MIN_STOCK_PRICE ($2). At the boundary of both
 # (mcap exactly $100M, price exactly $2), shares outstanding = $100M / $2 =
 # 50M -- so 200M float demanded a name be ~4x bigger than the mcap floor
 # alone would require at that price. Lowered to 50M, consistent with the
-# floors already in place. Also now the sole real-world consumer:
-# ENTRY_WINDOW_START/END_ET restricts every entry to regular hours already
-# (see enhanced.py), so the pre-open/after-hours case this constant was
-# originally sized for can no longer actually execute a trade -- today this
-# only gates close_guardrail_fail_positions' overnight-hold check (is this
-# name still worth carrying past the close), where 50M is the right bar.
-MIN_FLOAT_SHARES         = 50_000_000  # pre-open / after-hours scan-time float floor; also close_guardrail_fail_positions' overnight-hold bar
-MIN_FLOAT_SHARES_REGULAR_HOURS = 20_000_000  # any time is_regular_hours is True, including the first hour — loosened 10x to actually admit TI's low-float movers
-MIN_AVG_DAILY_VOLUME     = 1_000_000   # pre-open / first hour / after-hours — unchanged
-MIN_AVG_DAILY_VOLUME_REGULAR_HOURS = 700_000  # 60+ min into regular hours — rescues near-misses (BCAX 721K, SEZL 692K)
-
-# 2026-08-14, user request ("avoid average daily volume below 200K stocks"):
-# an ABSOLUTE floor, never bypassed by TRADE_THIN_LIQUIDITY_REJECTS or
-# TRADE_STALE_MOMENTUM_REJECTS -- unlike MIN_AVG_DAILY_VOLUME_REGULAR_HOURS
-# above (700K, which IS rescuable at reduced size), a symbol below this
-# floor is excluded outright, full stop. Confirmed live same day: AEHL
-# (0.2M float, already down 25.5% off its 30-min high before entry, no
-# protective stop for the first 30 min after a same-day fill) is exactly
-# the profile this exists to keep out. reason 'avg_volume_hard_floor' is
-# deliberately excluded from _ALL_GUARDRAIL_REASONS in scan.py, same as
-# min_price -- never eligible for the reduced-size rescue path.
-MIN_AVG_DAILY_VOLUME_HARD_FLOOR = 200_000
-
-# 2026-08-14, user request ("seems pump and dump easy to manipulate stocks,
-# find some rules that are absolutely not touched"): same treatment for
-# float -- an ABSOLUTE floor, never bypassed by TRADE_THIN_LIQUIDITY_REJECTS,
-# unlike MIN_FLOAT_SHARES_REGULAR_HOURS above (20M, which IS rescuable at
-# reduced size). AEHL (0.2M float) is exactly the profile this excludes.
-# reason 'low_float_hard_floor' deliberately excluded from
-# _ALL_GUARDRAIL_REASONS in scan.py, same as avg_volume_hard_floor/min_price.
-MIN_FLOAT_SHARES_HARD_FLOOR = 1_000_000
+# floors already in place. Not read by the entry-side scan-time guardrails
+# any more (see MIN_FLOAT_SHARES_REGULAR_HOURS above) -- close_guardrail_
+# fail_positions' overnight-hold check is this constant's only remaining
+# consumer, and that function itself is disabled (GUARDRAIL_EOD_CLOSE_ENABLED
+# = False) as of the same 2026-08-23 request. Kept defined since the
+# function body still references it.
+MIN_FLOAT_SHARES         = 50_000_000  # close_guardrail_fail_positions' overnight-hold bar (function currently disabled)
 
 # 2026-08-12, user request: the guardrails above are UNCHANGED and still
 # reject these symbols exactly as before (counted in [GUARDRAIL SUMMARY] same
