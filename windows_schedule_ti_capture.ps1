@@ -2,33 +2,49 @@
 # Run in PowerShell as Administrator.
 
 $taskName = 'ApexTraderTICapture'
-$taskDescription = 'Refresh data/ti_primary.json every 10 min, Mon-Fri 06:00-20:00 — single-shot runs owned by Task Scheduler'
+$taskDescription = 'Refresh data/ti_primary.json: every 5 min 08:25-09:30 (9:25-10:30am ET), then every 10 min until 14:50 (3:50pm ET, matches ENTRY_WINDOW_END_ET), Mon-Fri — single-shot runs owned by Task Scheduler'
 $BaseDir = $PSScriptRoot
 
 $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$BaseDir\scripts\run_ti_capture_task.ps1`""
 
-# Starts immediately at log on (needs your real, already-logged-in Edge/TI session)...
-$logonTrigger = New-ScheduledTaskTrigger -AtLogOn
+# 2026-08-22, user request: the FIRST trade-ideas.com call of the day must land
+# at 08:30 (market open, this machine's Central clock) — not earlier. Dropped
+# the old AtLogOn trigger: it fired an immediate scrape at whatever time the
+# user happened to log into Windows, which could be well before 08:30 and made
+# "first call" unpredictable. The weekly trigger below is Task-Scheduler-owned
+# (not an internal Python loop), so it re-arms every cycle on its own even
+# after a crashed run — no logon-trigger safety net needed for that anymore.
+$repetitionClass = Get-CimClass -ClassName MSFT_TaskRepetitionPattern -Namespace Root/Microsoft/Windows/TaskScheduler
 
-# ...then re-fires every 10 min, Mon-Fri, independent of whether the previous run
-# crashed. Task Scheduler owns the cadence instead of an internal Python loop —
-# that loop crashed once (2026-08-03, locked Edge profile) and stayed dead for
-# 30+ hours because AtLogOn was the only trigger and nothing re-armed it.
-# 20 min -> 10 min 2026-08-12 at the user's request, to match
-# TRADEIDEAS_SCAN_INTERVAL_MIN (config.py) which this task's cadence had
-# silently drifted away from since the Task-Scheduler-owned cadence was
-# introduced 2026-08-06.
-$weekdayTrigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday,Tuesday,Wednesday,Thursday,Friday -At 06:00
+# 2026-08-22, user request: "trade ideas scrapping for the time 9.25am to
+# 10.30 am will be every 5minutes" -- single trigger covering the whole
+# 08:25-09:30 Central window (9:25-10:30am ET), every 5 min, first fire
+# doubling as the old separate kickstart run (was a one-shot 08:25 trigger
+# plus a separate 08:30-09:30 repeating one; merged since the kickstart
+# time is now just this block's first tick).
+$openingTrigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday,Tuesday,Wednesday,Thursday,Friday -At 08:25
 # .Repetition isn't settable in place (returns a fresh, disconnected CIM instance
 # each access) — build the repetition pattern separately and assign it whole.
-$repetitionClass = Get-CimClass -ClassName MSFT_TaskRepetitionPattern -Namespace Root/Microsoft/Windows/TaskScheduler
+$openingRepetition = New-CimInstance -CimClass $repetitionClass -ClientOnly
+$openingRepetition.Interval = 'PT5M'
+$openingRepetition.Duration = 'PT1H5M'   # 08:25 -> 09:30 (9:25-10:30am ET)
+$openingRepetition.StopAtDurationEnd = $false
+$openingTrigger.Repetition = $openingRepetition
+
+# Rest of the session: back to every 10 min, 09:30 -> 14:50 Central (3:50pm
+# ET, matches ENTRY_WINDOW_END_ET/EOD_CLOSE_TIME in config.py -- no new
+# entries fire after that, so fresh universe data past that point is
+# pointless). 2026-08-22, user request: "even the webscrapping for universe
+# should stop at 3.50ET" -- was PT5H30M out to 15:00 Central (market close,
+# 4:00pm ET), which ran 10 min past the point entries actually stop.
+$weekdayTrigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday,Tuesday,Wednesday,Thursday,Friday -At 09:30
 $repetition = New-CimInstance -CimClass $repetitionClass -ClientOnly
 $repetition.Interval = 'PT10M'
-$repetition.Duration = 'PT14H'   # 06:00 -> 20:00, covers pre-market through after-hours
+$repetition.Duration = 'PT5H20M'   # 09:30 -> 14:50 (3:50pm ET)
 $repetition.StopAtDurationEnd = $false
 $weekdayTrigger.Repetition = $repetition
 
-$trigger = @($logonTrigger, $weekdayTrigger)
+$trigger = @($openingTrigger, $weekdayTrigger)
 
 # 2026-08-13: RunLevel Highest (elevated) with no documented reason -- this
 # task only browses a public website and writes to files under the user's

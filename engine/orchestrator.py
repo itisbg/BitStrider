@@ -79,6 +79,12 @@ from engine.risk import kill_mode as _kill_mode
 
 log = setup_logging()
 
+# 2026-08-22, user request: one-shot flag for the API blackout guardrail's
+# alert email -- set once the halt first fires so _run_cycle's every-few-
+# seconds gate doesn't re-send it every cycle; cleared the moment the
+# blackout clears (see api_blackout_minutes()).
+_blackout_alert_sent = False
+
 import logging as _logging
 _logging.getLogger("WDM").setLevel(_logging.ERROR)
 _logging.getLogger("webdriver_manager").setLevel(_logging.ERROR)
@@ -574,6 +580,40 @@ def scan_and_trade(ctx: AppContext) -> None:
         log.info("[SYSTEM] Kill mode active — aborting cycle")
         return
 
+    # Non-negotiable guardrail, 2026-08-22 user request: if the position-
+    # protection checks (detect_stopped_out_positions/_cover_naked_positions/
+    # check_afterhours_stops) have been failing continuously for
+    # API_BLACKOUT_HALT_MIN minutes, the bot can't see or protect anything it
+    # already holds -- stop taking NEW entries until the API recovers.
+    # Existing GTC trailing stops on already-open positions are untouched.
+    global _blackout_alert_sent
+    blackout_min = ctx.executor.api_blackout_minutes()
+    if blackout_min >= cfg.API_BLACKOUT_HALT_MIN:
+        log.warning(
+            f"[SYSTEM] API blackout guardrail: position-protection checks have failed "
+            f"continuously for {blackout_min:.1f} min (>= {cfg.API_BLACKOUT_HALT_MIN}) — "
+            "halting new entries until they recover"
+        )
+        if not _blackout_alert_sent:
+            try:
+                from engine.notifications.notifications import send_email
+                send_email(
+                    "ApexTrader: API blackout — new entries halted",
+                    f"Position-protection checks (detect_stopped_out_positions / "
+                    f"_cover_naked_positions / check_afterhours_stops) have failed "
+                    f"continuously for {blackout_min:.1f} minutes. New entries are "
+                    f"halted until they recover. Existing positions' broker-side "
+                    f"trailing stops are unaffected, but the bot cannot currently "
+                    f"see or protect them. Check the Alpaca dashboard and API "
+                    f"credentials.",
+                )
+            except Exception as e:
+                log.error(f"API blackout guardrail: alert email failed: {e}")
+            _blackout_alert_sent = True
+        return
+    elif _blackout_alert_sent:
+        _blackout_alert_sent = False  # blackout cleared -- re-arm the one-shot alert
+
     if not _within_entry_window(market_state.now):
         log.info(
             f"[SYSTEM] Outside entry window ({cfg.ENTRY_WINDOW_START_ET}-{cfg.ENTRY_WINDOW_END_ET} ET) "
@@ -652,7 +692,7 @@ def scan_and_trade(ctx: AppContext) -> None:
         else:
             log.info("[SCAN] No signals — market likely in downtrend or momentum gates not met")
 
-    for idx, s in enumerate(sorted(signals, key=lambda s: s.confidence, reverse=True)[:5], 1):
+    for idx, s in enumerate(sorted(signals, key=lambda s: s.confidence, reverse=True)[:cfg.TOP_N_SIGNALS], 1):
         log.info(f"[SCAN] TOP5_RAW #{idx}: {s.symbol} {s.action.upper()} ${s.price:.2f} conf={s.confidence:.0%} [{s.strategy}] — {s.reason}")
 
     if not signals:
@@ -666,11 +706,11 @@ def scan_and_trade(ctx: AppContext) -> None:
     eligible = _filter_eligible(ctx, signals, fresh_held, regime)
     _log_skipped(signals, eligible, fresh_held, regime, ctx.executor)
 
-    for idx, s in enumerate(eligible[:5], 1):
+    for idx, s in enumerate(eligible[:cfg.TOP_N_SIGNALS], 1):
         log.info(f"[TRADE] TOP5_ELIGIBLE #{idx}: {s.symbol} {s.action.upper()} ${s.price:.2f} conf={s.confidence:.0%} [{s.strategy}] — {s.reason}")
 
-    save_day_picks(eligible[:5], regime)
-    notify_scan_results(eligible[:5], datetime.date.today(), sentiment, regime)
+    save_day_picks(eligible[:cfg.TOP_N_SIGNALS], regime)
+    notify_scan_results(eligible[:cfg.TOP_N_SIGNALS], datetime.date.today(), sentiment, regime)
 
     if not eligible:
         log.info("[SCAN] No eligible signals after filtering")
@@ -823,6 +863,17 @@ def _swing_drift_stop_job(ctx: AppContext) -> None:
         ctx.executor.check_swing_drift_stop()
     except Exception as e:
         log.error(f"check_swing_drift_stop error: {e}", exc_info=True)
+
+
+def _ema15_exit_job(ctx: AppContext) -> None:
+    """schedule-driven wrapper for check_ema15_exit -- 2026-08-22, user
+    request: fast (1-min) close-crosses-EMA15-against-the-position
+    replacement for the disabled price-drift stop, its own
+    STAGNANT_STOP_CHECK_INTERVAL_MIN cadence."""
+    try:
+        ctx.executor.check_ema15_exit()
+    except Exception as e:
+        log.error(f"check_ema15_exit error: {e}", exc_info=True)
 
 
 def _concentration_check_job(ctx: AppContext) -> None:
@@ -1046,6 +1097,7 @@ def start() -> None:
     schedule.every(1).minutes.do(_eod_close_job, ctx)
     _schedule_on_clock_grid(cfg.PRICE_DRIFT_CHECK_INTERVAL_MIN, _price_drift_stop_job, ctx)
     _schedule_on_clock_grid(cfg.SWING_DRIFT_STOP_CHECK_INTERVAL_MIN, _swing_drift_stop_job, ctx)
+    _schedule_on_clock_grid(cfg.STAGNANT_STOP_CHECK_INTERVAL_MIN, _ema15_exit_job, ctx)
     _schedule_on_clock_grid(cfg.CONCENTRATION_CHECK_INTERVAL_MIN, _concentration_check_job, ctx)
 
     try:

@@ -22,8 +22,7 @@ sys.path.insert(0, str(ROOT))
 
 import engine.execution.enhanced as enhanced
 from engine.execution.enhanced import EnhancedExecutor
-
-enhanced.get_dynamic_tier = lambda sym, price: {"ts": 8.0, "tier": "NORMAL", "tp": None, "atr_pct": 0}
+from engine.config import TRAIL_STOP_PCT
 
 
 class _FakeClient:
@@ -63,7 +62,7 @@ positions = [
     _pos("LONG_RESV",  qty=100, qty_available=0),     # long, fully reserved -> skip
     _pos("SHORT_FREE", qty=-26, qty_available=-26),   # short, free -> protect (this was the bug)
     _pos("SHORT_RESV", qty=-26, qty_available=0),      # short, fully reserved -> skip
-    _pos("THIN_FREE",  qty=50, qty_available=50),     # long, free, thin-liquidity admit -> half stop
+    _pos("THIN_FREE",  qty=50, qty_available=50),     # long, free -- thin_liquidity flag no longer changes the stop
 ]
 ex = _make_executor(positions, entry_log={"THIN_FREE": {"thin_liquidity": True}})
 ex.protect_positions()
@@ -73,10 +72,12 @@ assert "LONG_RESV" not in ex.client.submitted, "fully-reserved long should be sk
 assert "SHORT_FREE" in ex.client.submitted, "free short should get a trailing stop -- this was skipped unconditionally before the fix"
 assert "SHORT_RESV" not in ex.client.submitted, "fully-reserved short should be skipped"
 
-# 2026-08-12: thin-liquidity admits get HALF the normal trail% for their whole
-# life, via _trail_pct_for() -- exercised here end-to-end through the real
+# 2026-08-22, user request: tiers + thin-liquidity halving removed from
+# _trail_pct_for() -- every position gets the same flat TRAIL_STOP_PCT floor
+# now (these stub positions carry no unrealized_plpc, so the profit-widening
+# leg never engages either). Exercised here end-to-end through the real
 # protect_positions() method, not just the pure helper in isolation.
-assert ex.client.trail_pct_used["LONG_FREE"] == 8.0, "normal position keeps the plain 8% tier value"
-assert ex.client.trail_pct_used["THIN_FREE"] == 4.0, "thin-liquidity admit should get half (4%), not the plain 8% tier value"
+assert ex.client.trail_pct_used["LONG_FREE"] == TRAIL_STOP_PCT, "normal position gets the flat floor"
+assert ex.client.trail_pct_used["THIN_FREE"] == TRAIL_STOP_PCT, "thin_liquidity flag no longer halves the stop"
 
-print("OK: protect_positions() arms trailing stops for free shorts, not just longs, and halves the stop for thin-liquidity admits")
+print("OK: protect_positions() arms trailing stops for free shorts, not just longs, and uses the flat TRAIL_STOP_PCT floor for every position")

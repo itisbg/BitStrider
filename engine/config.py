@@ -269,6 +269,13 @@ STOCKS = {
 # Trading Parameters ΓÇö Swing Trading Optimized
 # ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 MAX_POSITIONS        = 12     # 7.5% × 12 = 90% of usable equity (within 10% BP reserve) — reverted 2026-08-11 (was briefly 9 @ 10%)
+# 2026-08-22, user request ("top 15 will be picked"): how many ranked
+# candidates the scan cycle logs/tracks per cycle (TOP5_RAW/TOP5_ELIGIBLE
+# log lines, day_picks.json, the scan-results notification) -- was a
+# hardcoded 5. This is a watchlist/visibility breadth, not an execution cap:
+# _execute_bull_plan already ranks and tries every eligible signal, not just
+# the top 5/15, until MAX_POSITIONS-driven capacity fills.
+TOP_N_SIGNALS        = 15
 # When full, close the weakest position to make room if new signal conf > this threshold
 SWAP_ON_FULL         = True   # enabled — close weakest position for a better signal when full
 SWAP_MIN_CONFIDENCE  = 0.75   # Swap out weakest when new signal >= this confidence (was 0.85)
@@ -471,10 +478,26 @@ TAKE_PROFIT_MEDIUM   = 33.0   # was 18 (+15pp, 2026-08-06)
 TAKE_PROFIT_NORMAL   = 27.0   # was 12 (+15pp, 2026-08-06)
 
 # Tiered Trailing Stops — tighter: lock in gains quickly
+# 2026-08-22, user request: replaced by a single flat TRAIL_STOP_PCT below
+# (tiers + THIN_LIQUIDITY_TRAILING_STOP_MULT halving were the "variable trail
+# stop protections" removed). Constants kept, now unused by _trail_pct_for(),
+# in case a future tier-based feature wants them back.
 TRAILING_STOP_EXTREME = 12.0  # more room for extreme movers
 TRAILING_STOP_HIGH    = 10.0  # high momentum
 TRAILING_STOP_MEDIUM  =  8.0  # medium momentum
 TRAILING_STOP_NORMAL  =  8.0  # default trailing stop
+
+# 2026-08-22, user request: flat trailing-stop floor for every position,
+# replacing the tiered/thin-liquidity system above. See _trail_pct_for()
+# in enhanced.py -- single source of truth for every trailing-stop placement.
+TRAIL_STOP_PCT = 1.5
+
+# Once a position is profitable, widen the trailing stop to give back only
+# this fraction of the unrealized gain -- e.g. +10% unrealized -> stop at
+# 10 * 0.20 = 2.0% (wider than the 1.5% floor, so the trade gets more room
+# as it proves itself). Only takes effect when it computes wider than
+# TRAIL_STOP_PCT; a small or negative gain still uses the flat floor.
+PROFIT_TRAIL_GIVEBACK_PCT = 20.0
 
 # Confidence ratchet: once a position is up CONF_RATCHET_TRIGGER_GAIN_PCT or
 # more, tighten its trailing stop to lock in the gain sooner — scaled by how
@@ -620,7 +643,12 @@ DAILY_PROFIT_TARGET       = 3500.0
 # (07:00-20:00) rather than tightening that shared flag in place --
 # is_market_open also drives allocation-split and options-lull-hours logic
 # that isn't part of this ask.
-ENTRY_WINDOW_START_ET = "09:30"
+# 2026-08-22, user request ("Trading hours 9.25am ET to 3.50PM ET"): was
+# "09:30" -- moved 5 min earlier to line up with the TI-scraper's own 09:25
+# ET kickstart run (windows_schedule_ti_capture.ps1), so fresh universe data
+# is already available the moment the entry window opens instead of trading
+# blind for the scraper's first 5 min.
+ENTRY_WINDOW_START_ET = "09:25"
 # 2026-08-18, user request ("no new buys after 2:45" -- 2:45 PM CDT = 15:45
 # ET -- then same day, refined to "change the eod close time and no trades
 # time to 3:50pm ET... after this no new entry positions only keep the
@@ -744,10 +772,51 @@ GUARDRAIL_EOD_CLOSE_TIME    = EOD_CLOSE_TIME   # fires alongside close_eod_posit
 # and scoping by entry date, not strategy, survives the strategy-name loss a
 # process restart causes (see _rebuild_entry_log_from_orders).
 # ─────────────────────────────────────────────────────────────────
-PRICE_DRIFT_STOP_ENABLED       = True
+PRICE_DRIFT_STOP_ENABLED       = False  # 2026-08-22, user request: disabled -- replaced by the flat/profit-scaled trailing stop (TRAIL_STOP_PCT) and a separate 1-min "isn't moving" check
 PRICE_DRIFT_STOP_PCT           = 1.0    # % adverse move vs. EITHER entry OR the price PRICE_DRIFT_LOOKBACK_MIN ago that triggers an exit
 PRICE_DRIFT_CHECK_INTERVAL_MIN = 10     # how often the check runs, in step with the TI screener run
 PRICE_DRIFT_LOOKBACK_MIN       = 30     # how far back the comparison price is from ("price from 30 min ago")
+
+# ─────────────────────────────────────────────────────────────────
+# EMA15 Close-Cross Exit ("Stagnant Position Stop") -- 2026-08-22, user
+# request: independent fast-loop replacement for the disabled
+# PRICE_DRIFT_STOP above, polled every STAGNANT_STOP_CHECK_INTERVAL_MIN
+# (1 min, vs the old 10). Two earlier same-day versions: first a flat/
+# negative-vs-reference-price check, then an EMA9-slope check; superseded by
+# "check price close below ema15 to exit a long position, and price above
+# ema15 to exit short position" -- the 1-min close crossing EMA15 against
+# the position triggers an exit. See check_ema15_exit() in enhanced.py.
+# Scoped to same-day entries only, same reasoning as PRICE_DRIFT_STOP.
+STAGNANT_STOP_ENABLED             = True
+STAGNANT_STOP_CHECK_INTERVAL_MIN  = 1
+EMA15_EXIT_MIN_BARS               = 15  # need at least this many 1-min bars before trusting EMA15
+
+# ─────────────────────────────────────────────────────────────────
+# API Blackout Guardrail (non-negotiable) -- 2026-08-22, user request, built
+# from the 2026-08-21 incident: the Alpaca API started returning
+# "unauthorized" at 09:20 CT (an API key rotated mid-session) and every
+# position-protection check (detect_stopped_out_positions,
+# _cover_naked_positions, check_afterhours_stops) silently failed every
+# cycle for 32+ hours straight -- no halt, no alert, entries kept firing
+# with zero ability to see or protect anything already held. Once those
+# checks have failed continuously for API_BLACKOUT_HALT_MIN minutes, the
+# main scan cycle stops taking new entries and sends one alert email (not
+# repeated every cycle -- see EnhancedExecutor.api_blackout_minutes() and
+# _run_cycle in orchestrator.py). Existing positions' broker-side GTC
+# trailing stops are unaffected -- this only blocks NEW entries, since
+# that's the one thing definitely safe to stop doing blind.
+API_BLACKOUT_HALT_MIN = 5
+
+# ─────────────────────────────────────────────────────────────────
+# EMA Trend Alignment Filter -- 2026-08-22, user request: "ensure the trend
+# is in the way trade is intended" before entering, checked alongside the
+# trail-buy entry. Simplified to EMA9's own slope on 1-min bars: this
+# minute's EMA9 minus last minute's EMA9 must be positive for a long,
+# negative for a short -- rejects the entry outright otherwise. Fail-open on
+# missing/insufficient bar data, same philosophy as MOMENTUM_FRESHNESS_* --
+# never blocks on data the bot doesn't have.
+EMA_TREND_FILTER_ENABLED = True
+EMA_TREND_MIN_BARS       = 10  # need at least this many 1-min bars before trusting EMA9's slope
 
 # ─────────────────────────────────────────────────────────────────
 # Swing/Multi-Day Drift Stop -- wider sibling of the price drift stop above,
@@ -1213,7 +1282,14 @@ THIN_LIQUIDITY_EXCLUDED_STRATEGIES = {"ORB", "GapBreakout"}
 # trailing buy would never have filled while it kept dropping. Costs giving up
 # the first REENTRY_TRAIL_PCT% of any real reversal in exchange for not
 # catching the falling knife. See _entries_today in enhanced.py.
-REENTRY_TRAIL_PCT = 1.0
+# 2026-08-22, user request: "every entry trail orders percentage is 0.5%
+# along with the ema slope instead of 1%" -- tightened 1.0 -> 0.5. Confirms
+# the reversal with a smaller bounce now, but leans harder on
+# _check_ema_trend_alignment (EMA9 slope must already be moving in the
+# trade's direction) to keep this from just catching noise -- the two
+# conditions apply together, not as alternatives: EMA slope gates entry
+# eligibility at signal time, this trail % gates the actual fill price.
+REENTRY_TRAIL_PCT = 0.5
 
 # 2026-08-14, user request: "I told ones which fail guard will be traded too
 # but with lower portfolio limit" -- extending the same trade-anyway-at-

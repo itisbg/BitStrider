@@ -67,18 +67,18 @@ assert _live_quote_mid(_QuoteClient(_Quote(0, 10.02)), "TEST", fallback=42.0) ==
 assert _live_quote_mid(_QuoteClient(_Quote(9.98, 0)), "TEST", fallback=42.0) == 42.0, "missing ask falls back"
 
 
-# --- _trail_pct_for(): thin-liquidity halves the tier value, everything else doesn't ---
-_orig_get_dynamic_tier = ee.get_dynamic_tier
-ee.get_dynamic_tier = lambda symbol, price: {"tier": "NORMAL", "ts": 8.0}  # stub out the ATR/bars lookup
-try:
-    pct, label = _trail_pct_for("AAA", 10.0, entry_log={})
-    assert (pct, label) == (8.0, "NORMAL"), f"no entry_log record -> plain tier value, got {(pct, label)}"
-    pct, label = _trail_pct_for("BBB", 10.0, entry_log={"BBB": {"thin_liquidity": False}})
-    assert (pct, label) == (8.0, "NORMAL"), f"flagged False -> plain tier value, got {(pct, label)}"
-    pct, label = _trail_pct_for("CCC", 10.0, entry_log={"CCC": {"thin_liquidity": True}})
-    assert (pct, label) == (4.0, "NORMAL/THIN"), f"flagged True -> half the tier value, got {(pct, label)}"
-finally:
-    ee.get_dynamic_tier = _orig_get_dynamic_tier
+# --- _trail_pct_for(): 2026-08-22, user request -- tiers/thin-liquidity
+#     halving removed, replaced by a flat floor that widens to
+#     PROFIT_TRAIL_GIVEBACK_PCT of unrealized gain once that's wider ---
+from engine.config import TRAIL_STOP_PCT, PROFIT_TRAIL_GIVEBACK_PCT
+
+pct, label = _trail_pct_for("AAA", 10.0, entry_log={})
+assert (pct, label) == (TRAIL_STOP_PCT, "FLAT"), f"no gain info -> flat floor, got {(pct, label)}"
+pct, label = _trail_pct_for("BBB", 10.0, entry_log={}, gain_pct=-3.0)
+assert (pct, label) == (TRAIL_STOP_PCT, "FLAT"), f"losing position -> flat floor, got {(pct, label)}"
+pct, label = _trail_pct_for("CCC", 10.0, entry_log={}, gain_pct=10.0)
+expected = round(10.0 * PROFIT_TRAIL_GIVEBACK_PCT / 100.0, 2)
+assert (pct, label) == (expected, "PROFIT"), f"+10% gain -> {expected}% widened stop, got {(pct, label)}"
 
 
 # --- _apply_thin_liquidity_override(): sizing AND (when present) stop_loss_pct both halve ---
@@ -127,7 +127,10 @@ assert isinstance(req, ee.LimitOrderRequest), f"regular-hours entry must be a bo
 assert req.limit_price == 10.10, f"expected 1% over the LIVE mid (10.00 -> 10.10), not off stale signal.price 10.50; got {req.limit_price}"
 assert req.extended_hours is False
 
-# Extended-hours branch still flows through correctly after the refactor.
+# 2026-08-18, user request: entries never use extended hours anymore, even
+# outside regular hours and even with EXTENDED_HOURS=True (that flag now only
+# governs exit paths) -- confirm the outside-regular-hours branch still
+# submits a bounded limit, just never marked extended_hours.
 _orig_extended = ee.EXTENDED_HOURS
 ee.EXTENDED_HOURS = True
 try:
@@ -137,7 +140,7 @@ try:
     assert ex._create_simple_order(sig_short, 5, ee.OrderType.SHORT) is True
     req = ex.client.orders[-1]
     assert isinstance(req, ee.LimitOrderRequest)
-    assert req.extended_hours is True
+    assert req.extended_hours is False, "entries must never be extended_hours, even outside regular hours"
     assert req.limit_price == 9.90, f"short/sell rounds DOWN 1% off the 10.00 mid, got {req.limit_price}"
 finally:
     ee.EXTENDED_HOURS = _orig_extended

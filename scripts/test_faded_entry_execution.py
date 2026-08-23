@@ -10,10 +10,12 @@ admits on fresh signals -- confirmed live 2026-08-17: CDTG trade 1 +$1.64
 and both FIEE trades were thin_liquidity but NOT faded, and would have been
 needlessly delayed/risked by a fix scoped to the wider flag):
 
-1. _create_bracket_order: a stale_entry signal gets a PASSIVE limit (mid
-   -1% for a long) instead of today's marketable (mid +1%), and stores a
-   price_ceiling (= today's baseline) + first_submitted_at for the sweep to
-   use. A non-stale_entry signal (even if thin_liquidity) is untouched.
+1. _create_bracket_order: 2026-08-22, user request -- ALL entries (faded,
+   thin, fresh) now submit the same TrailingStopOrderRequest at
+   REENTRY_TRAIL_PCT regardless of stale_entry, and never touch
+   _entry_pending at all. The passive-limit/price_ceiling behavior this
+   point used to describe is gone from this function; still covered below
+   for _sweep_pending_entries via the (untouched) SWAP path.
 2. _sweep_pending_entries: a faded pending entry gets FADED_ENTRY_
    PASSIVE_WINDOW_SECONDS before any chase, then a chase capped at
    price_ceiling until FADED_ENTRY_CEILING_TIMEOUT_SECONDS, then uncapped.
@@ -35,11 +37,11 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 import engine.execution.enhanced as ee
-from engine.execution.enhanced import EnhancedExecutor, OrderType, LimitOrderRequest
+from engine.execution.enhanced import EnhancedExecutor, OrderType, LimitOrderRequest, TrailingStopOrderRequest
 from engine.equity.strategies import Signal
 from engine.config import (
     FADED_ENTRY_PASSIVE_WINDOW_SECONDS, FADED_ENTRY_CEILING_TIMEOUT_SECONDS,
-    AFTERHOURS_CHASE_STALE_SECONDS, MARKETABLE_LIMIT_BUFFER_PCT,
+    AFTERHOURS_CHASE_STALE_SECONDS, MARKETABLE_LIMIT_BUFFER_PCT, REENTRY_TRAIL_PCT,
 )
 
 assert FADED_ENTRY_PASSIVE_WINDOW_SECONDS == 90
@@ -66,7 +68,12 @@ valid, reason = ee._resolve_freshness_reject(sig_fresh, fresh=True, fade_reason=
 assert sig_fresh.thin_liquidity is False and sig_fresh.stale_entry is False, "fresh signal untouched"
 
 
-# --- _create_bracket_order: passive pricing + ceiling storage ---
+# --- _create_bracket_order: 2026-08-22, user request -- ALL entries (faded,
+#     thin, fresh, long, short) now submit the same TrailingStopOrderRequest
+#     at REENTRY_TRAIL_PCT; the passive-limit/ceiling path this section used
+#     to check no longer exists in _create_bracket_order (still exercised by
+#     _sweep_pending_entries below, via the SWAP path's _create_simple_order,
+#     which is untouched). ---
 
 class _Quote:
     def __init__(self, bid, ask):
@@ -104,36 +111,35 @@ risk_info = {"dollar_amount": 63.0, "allocation_pct": 4.0, "tier": "NORMAL", "st
 _orig_live = ee.LIVE
 ee.LIVE = True  # matches production: defer the broker-side stop, no 2nd submit_order to stub
 try:
-    # Faded (stale_entry=True): passive limit BELOW mid, ceiling = today's baseline stored.
-    ex = _executor(_Quote(2.93, 2.95))  # mid = 2.94
+    # Faded (stale_entry=True): same trailing-buy as any other entry now, no ceiling stored.
+    ex = _executor(_Quote(2.93, 2.95))  # mid = 2.94 -- irrelevant to a trailing entry
     sig = _sig(stale=True)
     ok = ex._create_bracket_order(sig, 21, risk_info, OrderType.LONG)
     assert ok is True
     req = ex.client.orders[-1]
-    assert isinstance(req, LimitOrderRequest)
-    assert req.limit_price == 2.91, f"expected passive mid-1% = 2.91, got {req.limit_price}"
-    pending = ex._entry_pending["CDTG"]
-    assert pending["price_ceiling"] == 2.97, f"expected baseline ceiling 2.97, got {pending['price_ceiling']}"
-    assert isinstance(pending["first_submitted_at"], datetime.datetime)
+    assert isinstance(req, TrailingStopOrderRequest), f"expected a trailing-buy entry, got {type(req).__name__}"
+    assert req.trail_percent == REENTRY_TRAIL_PCT
+    assert req.side == ee.OrderSide.BUY
+    assert ex._entry_pending == {}, "_create_bracket_order must never populate _entry_pending anymore"
 
-    # Not faded (stale_entry=False, even if thin_liquidity=True): today's normal marketable price, no ceiling.
+    # Not faded, even thin_liquidity=True: identical trailing-buy, flags don't change the entry order.
     ex2 = _executor(_Quote(2.93, 2.95))
     sig2 = _sig(strategy="GapBreakout", thin=True, stale=False)
     ok = ex2._create_bracket_order(sig2, 21, risk_info, OrderType.LONG)
     assert ok is True
     req2 = ex2.client.orders[-1]
-    assert req2.limit_price == 2.97, f"non-faded thin_liquidity must use the normal marketable price, got {req2.limit_price}"
-    assert "price_ceiling" not in ex2._entry_pending["CDTG"], "must not add a ceiling for a non-faded signal"
+    assert isinstance(req2, TrailingStopOrderRequest) and req2.trail_percent == REENTRY_TRAIL_PCT
+    assert ex2._entry_pending == {}
 
-    # Short direction: passive is ABOVE mid (wait for a bounce before shorting into a fade).
-    ex3 = _executor(_Quote(9.98, 10.02))  # mid = 10.00
+    # Short direction: same trailing mechanism, SELL side.
+    ex3 = _executor(_Quote(9.98, 10.02))  # mid = 10.00 -- irrelevant to a trailing entry
     sig3 = _sig(stale=True)
     sig3.action = "short"
     ok = ex3._create_bracket_order(sig3, 5, risk_info, OrderType.SHORT)
     assert ok is True
     req3 = ex3.client.orders[-1]
-    assert req3.limit_price == 10.10, f"short passive should rest 1% ABOVE mid, got {req3.limit_price}"
-    assert ex3._entry_pending["CDTG"]["price_ceiling"] == 9.90, "short baseline ceiling should be mid -1%"
+    assert isinstance(req3, TrailingStopOrderRequest) and req3.side == ee.OrderSide.SELL
+    assert req3.trail_percent == REENTRY_TRAIL_PCT
 finally:
     ee.LIVE = _orig_live
 
@@ -295,5 +301,5 @@ try:
 finally:
     ee._trail_pct_for = _orig_trail
 
-print("OK: Signal.stale_entry scoping, passive/capped faded-entry pricing (long + short), "
-      "partial-fill-safe re-chase, and _cover_naked_positions all check out")
+print("OK: Signal.stale_entry scoping, flat trailing-buy entry (faded/thin/fresh, long + short), "
+      "partial-fill-safe re-chase (SWAP path via _create_simple_order), and _cover_naked_positions all check out")

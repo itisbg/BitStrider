@@ -45,6 +45,9 @@ from engine.config import (
     GUARDRAIL_EOD_CLOSE_ENABLED, GUARDRAIL_EOD_CLOSE_TIME,
     PRICE_DRIFT_STOP_ENABLED, PRICE_DRIFT_STOP_PCT,
     PRICE_DRIFT_CHECK_INTERVAL_MIN, PRICE_DRIFT_LOOKBACK_MIN,
+    TRAIL_STOP_PCT, PROFIT_TRAIL_GIVEBACK_PCT,
+    STAGNANT_STOP_ENABLED, STAGNANT_STOP_CHECK_INTERVAL_MIN, EMA15_EXIT_MIN_BARS,
+    EMA_TREND_FILTER_ENABLED, EMA_TREND_MIN_BARS,
     SWING_DRIFT_STOP_ENABLED, SWING_DRIFT_STOP_PCT,
     MIN_AVG_DAILY_VOLUME_REGULAR_HOURS, MIN_FLOAT_SHARES, MIN_MARKET_CAP,
     SWING_STALE_EXIT_ENABLED, SWING_STALE_DAYS, SWING_STALE_MIN_GAIN_PCT,
@@ -74,6 +77,7 @@ from engine.config import (
     LIVE,
 )
 from engine.equity.strategies import Signal, _get_float_shares, _get_market_cap
+from engine.equity.universe import get_ti_primary
 from engine.utils import MarketState, calculate_risk_adjusted_size, check_vix_roc_filter, get_dynamic_tier
 from engine.utils.bars import get_bars, get_daily_volume_bars
 from engine.never_trade import is_never_trade
@@ -126,6 +130,36 @@ def _check_momentum_freshness(signal: Signal) -> Tuple[bool, Optional[str]]:
         return False, (
             f"{signal.symbol}: faded {pullback_pct:.1f}% off its {MOMENTUM_FRESHNESS_LOOKBACK_MIN}-min "
             f"high (${recent_high:.2f} -> ${current_price:.2f}) — {signal.strategy} entry not fresh"
+        )
+    return True, None
+
+
+def _check_ema_trend_alignment(signal: Signal, is_long: bool) -> Tuple[bool, Optional[str]]:
+    """2026-08-22, user request: simplified from an EMA9-vs-EMA20 crossover
+    to EMA9's own slope -- current-minute EMA9 minus the previous minute's
+    EMA9 must be positive for a long entry, negative for a short (checked
+    alongside the trail-buy entry). Applies to both directions, unlike
+    _check_momentum_freshness (long-only) -- a short entry needs the same
+    short-term-trend check.
+
+    Fail-open on missing/insufficient bar data (fewer than
+    EMA_TREND_MIN_BARS of 1-min history) -- same philosophy as
+    _check_momentum_freshness: never block a trade on data the bot doesn't
+    have, only on data that actively contradicts it.
+    """
+    if not EMA_TREND_FILTER_ENABLED:
+        return True, None
+    bars = get_bars(signal.symbol, period="1d", interval="1m")
+    if bars.empty or "close" not in bars.columns or len(bars) < EMA_TREND_MIN_BARS:
+        return True, None
+    ema9  = bars["close"].ewm(span=9, adjust=False).mean()
+    slope = float(ema9.iloc[-1] - ema9.iloc[-2])  # this minute's EMA9 vs last minute's
+    aligned = (slope > 0) if is_long else (slope < 0)
+    if not aligned:
+        return False, (
+            f"{signal.symbol}: 1-min EMA9 slope {slope:+.4f} "
+            f"({'not rising' if is_long else 'not falling'}) — trend not aligned with the "
+            f"{'long' if is_long else 'short'} entry"
         )
     return True, None
 
@@ -276,22 +310,29 @@ def _apply_strategy_kelly_mult(risk_info: Dict, strategy: str, equity: float) ->
     return dict(risk_info, allocation_pct=new_pct, dollar_amount=round(equity * new_pct / 100.0, 2))
 
 
-def _trail_pct_for(symbol: str, price: float, entry_log: Dict) -> Tuple[float, str]:
-    """Trailing-stop % + tier label for `symbol`, with the thin-liquidity
-    override applied: a symbol admitted only via TRADE_THIN_LIQUIDITY_REJECTS
-    (entry_log[symbol]['thin_liquidity'] -- set at entry, see _execute_entry)
-    always gets HALF the normal dynamic-tier trail% (THIN_LIQUIDITY_
-    TRAILING_STOP_MULT) instead of the tier's own value -- these names
-    already failed a liquidity guardrail, so they're held on a shorter leash
-    for their whole life. Single source of truth for every trailing-stop
-    placement/re-place/tighten in this file (protect_positions, ratchet,
-    after-hours virtual-stop, all re-arm fallbacks) instead of 6 separate
-    get_dynamic_tier() call sites drifting out of sync with each other."""
-    tier_info = get_dynamic_tier(symbol, price)
-    trail_pct, tier_label = tier_info["ts"], tier_info["tier"]
-    if entry_log.get(symbol, {}).get("thin_liquidity"):
-        return round(trail_pct * THIN_LIQUIDITY_TRAILING_STOP_MULT, 2), f"{tier_label}/THIN"
-    return trail_pct, tier_label
+def _trail_pct_for(symbol: str, price: float, entry_log: Dict, gain_pct: float = None) -> Tuple[float, str]:
+    """Trailing-stop % for `symbol`. 2026-08-22, user request: replaced the
+    tiered/thin-liquidity system (get_dynamic_tier + THIN_LIQUIDITY_
+    TRAILING_STOP_MULT) with one flat floor, TRAIL_STOP_PCT, for every
+    position -- no more per-tier or per-liquidity variability.
+
+    If `gain_pct` (current unrealized %) is given and positive, widen past
+    the floor to PROFIT_TRAIL_GIVEBACK_PCT of that gain once it computes
+    wider than the floor -- a winning trade earns more room instead of
+    riding the same fixed leash as a fresh entry. Losing/flat positions
+    (gain_pct <= 0 or omitted) just get the flat floor.
+
+    Single source of truth for every trailing-stop placement/re-place/
+    tighten in this file (protect_positions, ratchet, after-hours
+    virtual-stop, all re-arm fallbacks) instead of separate call sites
+    drifting out of sync with each other."""
+    trail_pct = TRAIL_STOP_PCT
+    label = "FLAT"
+    if gain_pct is not None and gain_pct > 0:
+        profit_trail = round(gain_pct * (PROFIT_TRAIL_GIVEBACK_PCT / 100.0), 2)
+        if profit_trail > trail_pct:
+            trail_pct, label = profit_trail, "PROFIT"
+    return trail_pct, label
 
 
 def _demo() -> None:
@@ -305,6 +346,65 @@ def _demo() -> None:
     assert abs(mid - expected_mid) < 1e-9, f"halfway point off: {mid} != {expected_mid}"
     assert ratchet_scale(0.90) < ratchet_scale(0.80), "higher confidence must tighten more"
     print("ratchet_scale: all checks passed")
+
+    # _trail_pct_for: flat floor, widens to PROFIT_TRAIL_GIVEBACK_PCT of gain
+    # only once that's wider than the floor. 2026-08-22, user request.
+    assert _trail_pct_for("X", 10.0, {}) == (TRAIL_STOP_PCT, "FLAT")
+    assert _trail_pct_for("X", 10.0, {}, gain_pct=-2.0) == (TRAIL_STOP_PCT, "FLAT"), "losing position must use the floor"
+    assert _trail_pct_for("X", 10.0, {}, gain_pct=0.0) == (TRAIL_STOP_PCT, "FLAT")
+    below = TRAIL_STOP_PCT / (PROFIT_TRAIL_GIVEBACK_PCT / 100.0) - 1.0  # gain just under the crossover
+    assert _trail_pct_for("X", 10.0, {}, gain_pct=below)[1] == "FLAT", "still under the floor -> no widening yet"
+    r = _trail_pct_for("X", 10.0, {}, gain_pct=10.0)
+    assert r == (round(10.0 * PROFIT_TRAIL_GIVEBACK_PCT / 100.0, 2), "PROFIT"), r
+    print("_trail_pct_for: all checks passed")
+
+    # _ema15_exit_reason: exit a long once close < EMA15, a short once
+    # close > EMA15. 2026-08-22, user request.
+    reason = EnhancedExecutor._ema15_exit_reason
+    assert reason(10.05, 10.00, True) is None, "close above EMA15 while long -> no exit"
+    assert reason(10.00, 10.00, True) is None, "close at EMA15 while long -> no exit (strict below only)"
+    assert reason(9.95, 10.00, True) is not None, "close below EMA15 while long -> exit"
+    assert reason(9.95, 10.00, False) is None, "close below EMA15 while short -> no exit"
+    assert reason(10.00, 10.00, False) is None, "close at EMA15 while short -> no exit (strict above only)"
+    assert reason(10.05, 10.00, False) is not None, "close above EMA15 while short -> exit"
+    print("_ema15_exit_reason: all checks passed")
+
+    # api_blackout_minutes / _note_protection_fetch: the API-blackout
+    # guardrail's clock. 2026-08-22, user request.
+    class _BlackoutStub:
+        _protection_fail_since = None
+    bstub = _BlackoutStub()
+    assert EnhancedExecutor.api_blackout_minutes(bstub) == 0.0, "no failure yet -> 0"
+    EnhancedExecutor._note_protection_fetch(bstub, False)
+    assert bstub._protection_fail_since is not None, "a failure must start the clock"
+    bstub._protection_fail_since = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=6)
+    assert EnhancedExecutor.api_blackout_minutes(bstub) >= 5.99, "6 min old failure must read as ~6 min"
+    EnhancedExecutor._note_protection_fetch(bstub, True)
+    assert bstub._protection_fail_since is None, "a success must clear the clock"
+    assert EnhancedExecutor.api_blackout_minutes(bstub) == 0.0
+    print("api_blackout_minutes: all checks passed")
+
+    # _check_ema_trend_alignment: EMA9's own slope (this minute vs last)
+    # must confirm the trade direction, fail-open on missing/insufficient
+    # data. 2026-08-22, user request.
+    import pandas as _pd
+    _orig_get_bars = get_bars
+    _sig_stub = Signal("TEST", "buy", 10.0, 0.9, "test", "TestStrat")
+    globals()["get_bars"] = lambda symbol, period, interval: _pd.DataFrame({"close": list(range(1, 40))})  # rising -> EMA9 slope positive
+    ok, reason = _check_ema_trend_alignment(_sig_stub, is_long=True)
+    assert ok is True and reason is None, "rising EMA9 must align with a long"
+    ok, reason = _check_ema_trend_alignment(_sig_stub, is_long=False)
+    assert ok is False and reason is not None, "rising EMA9 must reject a short"
+    globals()["get_bars"] = lambda symbol, period, interval: _pd.DataFrame({"close": list(range(40, 1, -1))})  # falling -> EMA9 slope negative
+    ok, reason = _check_ema_trend_alignment(_sig_stub, is_long=False)
+    assert ok is True and reason is None, "falling EMA9 must align with a short"
+    ok, reason = _check_ema_trend_alignment(_sig_stub, is_long=True)
+    assert ok is False and reason is not None, "falling EMA9 must reject a long"
+    globals()["get_bars"] = lambda symbol, period, interval: _pd.DataFrame()
+    ok, reason = _check_ema_trend_alignment(_sig_stub, is_long=True)
+    assert ok is True and reason is None, "empty bars must fail open, never block"
+    globals()["get_bars"] = _orig_get_bars
+    print("_check_ema_trend_alignment: all checks passed")
 
     # _entries_today_count: needs only the two bare attrs, no live client --
     # build a stub rather than a full EnhancedExecutor().
@@ -423,9 +523,25 @@ class EnhancedExecutor:
         self._pdt_violation_alerted: bool = False  # tracks whether the PDT violation email has been sent this session
         self._force_close_pending: Dict[str, dict] = {}  # {symbol: {"reason": str, "chase_count": int}} — EOD/guardrail closes not yet confirmed flat; swept by _sweep_force_closes until filled
         self._guardrail_eod_closed: Dict[object, set] = {}  # {date: {symbol, ...}} — symbols already force-closed today by close_guardrail_fail_positions, so its per-minute reruns don't re-cancel/resubmit an order already in flight
+        # Same idempotency shape, for close_eod_positions() -- 2026-08-22,
+        # user request ("all the positions exit at 3.50pm et") dropped that
+        # function's strategy/date/entry_info filters, which used to double
+        # as its "already handled" marker (an entry_info.pop() on close).
+        # With no entry_info required at all now, an explicit tracked set is
+        # the only idempotency signal left.
+        self._eod_closed: Dict[object, set] = {}
         # {symbol: deque of the last N check_price_drift_stop prices, maxlen = PRICE_DRIFT_LOOKBACK_MIN / PRICE_DRIFT_CHECK_INTERVAL_MIN}
         # deque[0] is the oldest sample kept — the ~PRICE_DRIFT_LOOKBACK_MIN-minutes-ago reference once full.
         self._price_drift_history: Dict[str, Deque[float]] = {}
+        # 2026-08-22, user request (non-negotiable guardrail, after the
+        # 2026-08-21 incident: Alpaca API auth broke mid-session and every
+        # position-protection check silently failed for 32+ hours straight
+        # while the bot kept trading blind) -- earliest UTC timestamp of the
+        # CURRENT unbroken run of fetch failures across detect_stopped_out_
+        # positions/_cover_naked_positions/check_afterhours_stops, cleared
+        # the moment any of them succeeds. See _note_protection_fetch() and
+        # api_blackout_minutes().
+        self._protection_fail_since: Optional[datetime.datetime] = None
         # {symbol: {"order_id": str, "qty": int, "is_long": bool, "chase_count": int}}
         # — resting entry orders not yet confirmed filled; swept by _sweep_pending_entries
         self._entry_pending: Dict[str, dict] = {}
@@ -862,6 +978,12 @@ class EnhancedExecutor:
             if fade_reason:
                 log.info(f"[SIZE] {fade_reason} — trading anyway at reduced size")
 
+        # EMA9/EMA20 trend alignment (both directions) — see
+        # _check_ema_trend_alignment for the reasoning.
+        trend_ok, trend_reason = _check_ema_trend_alignment(signal, order_type == OrderType.LONG)
+        if not trend_ok:
+            return False, trend_reason
+
         # Asset tradability check: skip halted or suspended symbols
         try:
             asset = self.client.get_asset(signal.symbol)
@@ -1135,79 +1257,50 @@ class EnhancedExecutor:
         return has_history
 
     def _create_bracket_order(self, signal: Signal, shares: int, risk_info: Dict, order_type: OrderType) -> bool:
-        """Submit a bounded-limit entry (see _marketable_limit_price) then a
-        GTC trailing stop at risk_info['stop_loss_pct']%. TP bracket leg is
-        intentionally dropped — the trailing stop locks in gains
-        automatically; swap logic and EOD close handle opportunity exits.
+        """Submit a trailing-buy entry, then a GTC trailing stop at
+        TRAIL_STOP_PCT%. TP bracket leg is intentionally dropped -- the
+        trailing stop locks in gains automatically; swap logic and EOD
+        close handle opportunity exits.
 
-        2026-08-18, user request: a 2nd+ same-day entry into `signal.symbol`,
-        OR one still inside its post-loss cooldown (is_reentry either way),
-        submits a TrailingStopOrderRequest instead -- it trails the adverse
-        move (down for a long, up for a short) and only fires once price
-        reverses REENTRY_TRAIL_PCT% off the extreme it reached, so a
-        re-entry can't fill while the name is still actively falling (or
-        squeezing, for a short). See REENTRY_TRAIL_PCT in config.py for the
-        PFSA incident this covers, and _validate_trade's docstring for why
-        the cooldown itself no longer blocks the trade outright. It's a
-        resting order the broker adjusts itself, so it bypasses
-        _entry_pending/_sweep_pending_entries entirely -- nothing for that
-        re-chase loop to do."""
+        2026-08-22, user request: EVERY entry (not just 2nd+ same-day /
+        post-loss-cooldown re-entries) now submits a TrailingStopOrderRequest
+        -- it trails the adverse move (down for a long, up for a short) and
+        only fires once price reverses REENTRY_TRAIL_PCT% off the extreme it
+        reached, so an entry can't fill while the name is still actively
+        falling (or squeezing, for a short). Replaces the old marketable-
+        limit chase / passive-limit-faded-entry path entirely (see
+        _marketable_limit_price, now unused here). It's a resting order the
+        broker adjusts itself, so it bypasses _entry_pending/
+        _sweep_pending_entries entirely -- nothing for that re-chase loop to
+        do; _entry_pending now stays permanently empty.
+
+        2026-08-18, user request (superseded by the above but kept for the
+        PFSA incident this originally covered): REENTRY_TRAIL_PCT in
+        config.py, and _validate_trade's docstring for why the cooldown
+        itself no longer blocks the trade outright."""
         side          = OrderSide.BUY  if order_type == OrderType.LONG else OrderSide.SELL
         stop_side     = OrderSide.SELL if order_type == OrderType.LONG else OrderSide.BUY
-        trail_pct     = risk_info["stop_loss_pct"]  # tiered: NORMAL=3%, MEDIUM=4%, HIGH=5%, EXTREME=7%
+        trail_pct     = TRAIL_STOP_PCT  # flat -- see _trail_pct_for()
         is_long_entry = order_type == OrderType.LONG
-        is_reentry    = self._is_reentry_signal(signal.symbol, is_long_entry)
+        is_reentry    = self._is_reentry_signal(signal.symbol, is_long_entry)  # kept for logging only
 
         # ── Step 1: Entry order (failure aborts the whole bracket) ──────────
         try:
-            if is_reentry and REENTRY_TRAIL_PCT > 0:
-                entry_req = TrailingStopOrderRequest(
-                    symbol          = signal.symbol,
-                    qty             = shares,
-                    side            = side,
-                    type            = AlpacaOrderType.TRAILING_STOP,
-                    time_in_force   = TimeInForce.DAY,
-                    trail_percent   = REENTRY_TRAIL_PCT,
-                    client_order_id = f"apex-reentry-{signal.strategy}-{signal.symbol}-{int(time.time())}",
-                )
-                order = self.client.submit_order(entry_req)
-                self.order_cache[signal.symbol] = order.id
-                log.info(
-                    f"{signal.symbol}: re-entry (already traded today) -- trailing "
-                    f"{'BUY' if is_long_entry else 'SELL'} {REENTRY_TRAIL_PCT:.1f}% instead of chasing in"
-                )
-            else:
-                mid = _live_quote_mid(self.client, signal.symbol, signal.price)
-                baseline_limit = _marketable_limit_price(mid, is_long=is_long_entry)  # today's price, always computed as the never-worse-than ceiling
-                if signal.stale_entry:
-                    # Passive: rest on the OPPOSITE side of the spread from a
-                    # normal chase-in (mid -1% for a long) instead of paying up
-                    # into a signal already confirmed fading -- see
-                    # FADED_ENTRY_PASSIVE_WINDOW_SECONDS in config.py.
-                    entry_limit = _marketable_limit_price(mid, is_long=not is_long_entry)
-                else:
-                    entry_limit = baseline_limit
-                entry_req = LimitOrderRequest(
-                    symbol          = signal.symbol,
-                    qty             = shares,
-                    side            = side,
-                    time_in_force   = TimeInForce.DAY,
-                    limit_price     = entry_limit,
-                    client_order_id = f"apex-{signal.strategy}-{signal.symbol}-{int(time.time())}",
-                )
-                order = self.client.submit_order(entry_req)
-                self.order_cache[signal.symbol] = order.id
-                self._entry_pending[signal.symbol] = {
-                    "order_id": str(order.id), "qty": shares,
-                    "is_long": is_long_entry, "chase_count": 0,
-                }
-                if signal.stale_entry:
-                    self._entry_pending[signal.symbol]["price_ceiling"] = baseline_limit
-                    self._entry_pending[signal.symbol]["first_submitted_at"] = datetime.datetime.now(datetime.timezone.utc)
-                    log.info(
-                        f"{signal.symbol}: faded entry -- passive limit ${entry_limit:.2f} "
-                        f"(vs ${baseline_limit:.2f} marketable), {FADED_ENTRY_PASSIVE_WINDOW_SECONDS}s to fill"
-                    )
+            entry_req = TrailingStopOrderRequest(
+                symbol          = signal.symbol,
+                qty             = shares,
+                side            = side,
+                type            = AlpacaOrderType.TRAILING_STOP,
+                time_in_force   = TimeInForce.DAY,
+                trail_percent   = REENTRY_TRAIL_PCT,
+                client_order_id = f"apex-entry-{signal.strategy}-{signal.symbol}-{int(time.time())}",
+            )
+            order = self.client.submit_order(entry_req)
+            self.order_cache[signal.symbol] = order.id
+            log.info(
+                f"{signal.symbol}: {'re-entry' if is_reentry else 'entry'} -- trailing "
+                f"{'BUY' if is_long_entry else 'SELL'} {REENTRY_TRAIL_PCT:.1f}% instead of chasing in"
+            )
             self._entries_today[signal.symbol] = self._entries_today.get(signal.symbol, 0) + 1
 
             # Store ATR-based TP target — checked each scan cycle by check_tp_targets()
@@ -1605,8 +1698,12 @@ class EnhancedExecutor:
                 avail       = abs(qty_available)
                 current     = float(pos.current_price)
                 is_long_pos = qty > 0
+                try:
+                    gain_pct = float(pos.unrealized_plpc) * 100.0
+                except (TypeError, ValueError, AttributeError):
+                    gain_pct = None
 
-                trail_pct, tier_label = _trail_pct_for(sym, current, self._entry_log)
+                trail_pct, tier_label = _trail_pct_for(sym, current, self._entry_log, gain_pct)
 
                 stop_side = OrderSide.SELL if is_long_pos else OrderSide.BUY
                 self.client.submit_order(TrailingStopOrderRequest(
@@ -1777,7 +1874,9 @@ class EnhancedExecutor:
             covered     = {o.symbol for o in open_orders}
         except Exception as e:
             log.warning(f"_cover_naked_positions: fetch failed: {e}")
+            self._note_protection_fetch(False)
             return
+        self._note_protection_fetch(True)
         for pos in positions:
             sym = pos.symbol
             if re.match(r'^[A-Z]+\d{6}[CP]\d{8}$', sym):
@@ -1858,6 +1957,30 @@ class EnhancedExecutor:
             self._afterhours_stop_cooldown.pop(s, None)
         return set(self._afterhours_stop_cooldown.keys())
 
+    def _note_protection_fetch(self, ok: bool) -> None:
+        """Track consecutive Alpaca fetch failures across the position-
+        protection checks (detect_stopped_out_positions, _cover_naked_
+        positions, check_afterhours_stops). 2026-08-22, user request: a
+        non-negotiable guardrail after 2026-08-21 -- account auth broke at
+        09:20 CT and these three functions logged nothing but "fetch
+        failed: unauthorized" every cycle for 32+ hours with no halt and no
+        alert; the bot kept submitting entries the whole time with zero
+        ability to see or protect what it already held. `ok=False` starts
+        (or continues) the blackout clock; any `ok=True` clears it."""
+        if ok:
+            self._protection_fail_since = None
+        elif self._protection_fail_since is None:
+            self._protection_fail_since = datetime.datetime.now(datetime.timezone.utc)
+
+    def api_blackout_minutes(self) -> float:
+        """Minutes since the current unbroken run of protection-fetch
+        failures began, or 0.0 if not in a blackout. See
+        _note_protection_fetch(); checked by the orchestrator before
+        allowing new entries -- API_BLACKOUT_HALT_MIN in config.py."""
+        if self._protection_fail_since is None:
+            return 0.0
+        return (datetime.datetime.now(datetime.timezone.utc) - self._protection_fail_since).total_seconds() / 60
+
     def detect_stopped_out_positions(self) -> None:
         """Catch a position closing via ANY route — most commonly a normal
         broker-side GTC trailing stop filling on its own — and apply the same
@@ -1880,7 +2003,9 @@ class EnhancedExecutor:
             positions = self.client.get_all_positions()
         except Exception as e:
             log.warning(f"detect_stopped_out_positions: fetch failed: {e}")
+            self._note_protection_fetch(False)
             return
+        self._note_protection_fetch(True)
 
         current: Dict[str, dict] = {}
         for p in positions:
@@ -1990,7 +2115,9 @@ class EnhancedExecutor:
             open_orders = self.client.get_orders()
         except Exception as e:
             log.warning(f"check_afterhours_stops: fetch failed: {e}")
+            self._note_protection_fetch(False)
             return
+        self._note_protection_fetch(True)
 
         # Position closed since the last poll — its re-chase count is stale, drop it
         # so a future breach of the same symbol starts back at the base slip.
@@ -2315,17 +2442,31 @@ class EnhancedExecutor:
         return None
 
     def close_eod_positions(self) -> Optional[dict]:
-        """Close all intraday-strategy positions at EOD_CLOSE_TIME.
-        Targets FloatRotation, GapBreakout, ORB, VWAPReclaim opened today.
+        """Close EVERY open equity position at EOD_CLOSE_TIME, no exceptions.
 
-        2026-08-17, user request: runs every minute through the window
-        (schedule.every(1).minutes) rather than once per day -- the old
-        once-per-day flag meant a position opened AFTER the first post-
-        15:45 tick (ASST/NUAI, opened 15:57 ET) had already missed its
+        2026-08-22, user request ("all the positions exit at 3.50pm et"):
+        dropped the EOD_CLOSE_STRATEGIES filter and the same-day-only
+        filter -- previously this only targeted specific intraday
+        strategies (FloatRotation/GapBreakout/ORB/etc.) entered THAT day,
+        leaving any other strategy, or a multi-day swing hold, to survive
+        overnight as long as it passed close_guardrail_fail_positions'
+        liquidity/quality check. That guardrail-based carve-out is now
+        moot -- nothing carries overnight regardless of strategy or
+        guardrail status. close_guardrail_fail_positions still runs too
+        (harmlessly redundant, just closes guardrail-failures a moment
+        earlier in the same window); EOD_CLOSE_STRATEGIES is kept for
+        anything else that still reads it (see MODULARIZATION_PLAN.md/
+        engine/config.py) but no longer gates this function.
+
+        2026-08-17, user request (still true): runs every minute through
+        the window (schedule.every(1).minutes) rather than once per day --
+        the old once-per-day flag meant a position opened AFTER the first
+        post-15:45 tick (ASST/NUAI, opened 15:57 ET) had already missed its
         only chance to be flattened. Safe to call repeatedly: a symbol
-        already closed has its _entry_log entry popped below, so the next
-        tick's `if not entry_info: continue` is a no-op for it -- only
-        newly-opened, not-yet-processed positions actually submit an order."""
+        already closed has its _entry_log entry popped below, and qty==0
+        (or the position is simply gone) makes the next tick a no-op for
+        it -- only newly-opened, not-yet-closed positions actually submit
+        an order."""
         if not EOD_CLOSE_ENABLED:
             return None
 
@@ -2337,29 +2478,32 @@ class EnhancedExecutor:
         if now_et.hour >= 16:
             return None  # Market already closed
 
+        today = datetime.date.today()
+        already_closed = self._eod_closed.setdefault(today, set())
+        self._eod_closed = {today: already_closed}  # drop any stale prior-day entries
+
         try:
             positions = self.client.get_all_positions()
         except Exception as e:
             log.error(f"close_eod_positions: fetch failed: {e}")
             return None
 
-        today = datetime.date.today()
         closed_items = []
         failed_items = []
 
         for pos in positions:
             sym = pos.symbol
+            if re.match(r'^[A-Z]+\d{6}[CP]\d{8}$', sym):
+                continue  # options legs — managed separately by OptionsExecutor
             qty = int(float(pos.qty))
             if qty == 0:
                 continue
+            if sym in already_closed:
+                continue  # close already attempted today -- _sweep_force_closes chases it if still unfilled
 
-            entry_info = self._entry_log.get(sym)
-            if not entry_info:
-                continue
-            if entry_info.get("date") != today:
-                continue
-            if entry_info.get("strategy") not in EOD_CLOSE_STRATEGIES:
-                continue
+            # No entry_log record (e.g. restored after a restart) still gets
+            # closed -- just without a strategy label for the log line.
+            entry_info = self._entry_log.get(sym) or {}
 
             try:
                 # Cancel only DAY-TIF orders holding shares for this symbol before
@@ -2390,6 +2534,7 @@ class EnhancedExecutor:
                 # the same way once regular hours end instead of re-chasing.
                 self._submit_closing_order(sym, abs(qty), side, float(pos.current_price), no_extended_hours=True)
                 self._entry_log.pop(sym, None)
+                already_closed.add(sym)
                 self._force_close_pending[sym] = {"reason": f"eod:{entry_info.get('strategy', 'unknown')}", "chase_count": 0}
 
                 pnl = float(pos.unrealized_pl)
@@ -2402,7 +2547,7 @@ class EnhancedExecutor:
 
                 log.info(
                     f"EOD CLOSE {sym}: {abs(qty)} shares | "
-                    f"strategy={entry_info['strategy']} | P&L ${pnl:.2f}"
+                    f"strategy={entry_info.get('strategy', 'unknown')} | P&L ${pnl:.2f}"
                 )
             except Exception as e:
                 failed_items.append({"symbol": sym, "error": str(e)})
@@ -3309,6 +3454,151 @@ class EnhancedExecutor:
         # Drop history for symbols no longer held or no longer in scope
         for sym in [s for s in self._price_drift_history if s not in live_syms]:
             self._price_drift_history.pop(sym, None)
+
+    @staticmethod
+    def _ema15_exit_reason(close: float, ema15: float, is_long: bool) -> Optional[str]:
+        """Pure decision function for check_ema15_exit(). Exit a long once
+        the 1-min close is below its own EMA15; exit a short once it's
+        above."""
+        against = (close < ema15) if is_long else (close > ema15)
+        if not against:
+            return None
+        return f"1-min close ${close:.2f} {'below' if is_long else 'above'} EMA15 (${ema15:.2f})"
+
+    def check_ema15_exit(self) -> None:
+        """Every STAGNANT_STOP_CHECK_INTERVAL_MIN (1 min), exit any same-day
+        position whose 1-min close has crossed its own EMA15 against the
+        position. 2026-08-22, user request: "check price close below ema15
+        to exit a long position, and price above ema15 to exit short
+        position" -- supersedes the EMA9-slope version of this same check
+        (check_ema_slope_exit, itself a same-day replacement for the
+        flat/negative-vs-reference stagnant check and the disabled
+        check_price_drift_stop). No in-memory rolling history needed --
+        EMA15 is recomputed fresh from real bar data every check, so a
+        restart can't wipe its state. Fail-open on missing/insufficient bar
+        data. Scoped to same-day entries only, same reasoning as
+        check_price_drift_stop.
+
+        2026-08-22, user request ("market orders executed with other
+        pending orders removed ... price protection from observed price to
+        filled prices"): both already covered by the shared exit plumbing
+        below -- any resting order (e.g. the deferred GTC trailing stop) is
+        cancelled before this submits a close, and _submit_closing_order
+        itself is a marketable LIMIT bounded off the live bid/ask mid, not
+        a naked MarketOrderRequest -- that bound IS the observed-to-filled
+        price protection (see _submit_closing_order's docstring for the
+        NBIL incident a true unbounded market order caused).
+
+        2026-08-22, user request ("always create a complementary trail
+        order to reenter, if the stock is still in the top trade universe
+        list"): if `sym` is still in get_ti_primary() (the current top TI
+        scrape list, ti_primary.json) after the exit fires, immediately
+        re-arms a same-direction REENTRY_TRAIL_PCT trailing entry -- see
+        the re-entry block right after the close below."""
+        if not STAGNANT_STOP_ENABLED:
+            return
+
+        try:
+            positions = self.client.get_all_positions()
+        except Exception as e:
+            log.warning(f"check_ema15_exit: fetch failed: {e}")
+            return
+
+        today = datetime.date.today()
+
+        for pos in positions:
+            sym = pos.symbol
+            if re.match(r'^[A-Z]+\d{6}[CP]\d{8}$', sym):
+                continue  # options legs — managed separately
+            qty = int(float(pos.qty))
+            if qty == 0:
+                continue
+
+            entry_info = self._entry_log.get(sym)
+            if not entry_info or entry_info.get("date") != today:
+                continue  # not a same-day entry — out of scope
+
+            try:
+                current = float(pos.current_price)
+            except (TypeError, ValueError):
+                continue
+            if current <= 0:
+                continue
+            is_long = qty > 0
+
+            bars = get_bars(sym, period="1d", interval="1m")
+            if bars.empty or "close" not in bars.columns or len(bars) < EMA15_EXIT_MIN_BARS:
+                continue  # not enough data -- never force a decision on it
+            last_close = float(bars["close"].iloc[-1])
+            ema15      = float(bars["close"].ewm(span=15, adjust=False).mean().iloc[-1])
+            reason = self._ema15_exit_reason(last_close, ema15, is_long)
+            if reason is None:
+                continue
+
+            # Cancel any resting order (the deferred GTC trailing stop, most
+            # commonly) before closing -- the broker won't accept a second
+            # order against qty that's already reserved by one.
+            try:
+                sym_orders = [o for o in (self.client.get_orders() or []) if o.symbol == sym]
+                for _o in sym_orders:
+                    try:
+                        self.client.cancel_order_by_id(str(_o.id))
+                    except Exception:
+                        pass
+                if sym_orders:
+                    time.sleep(0.4)
+            except Exception as e:
+                log.warning(f"check_ema15_exit {sym}: order fetch/cancel failed, will retry next cycle: {e}")
+                continue
+
+            side = OrderSide.SELL if is_long else OrderSide.BUY
+            try:
+                # Marketable limit bounded off the live mid, not a naked
+                # market order -- this bound is the observed-to-filled price
+                # protection (see _submit_closing_order).
+                self._submit_closing_order(sym, abs(qty), side, current)
+                log.warning(f"EMA15 EXIT {sym}: {abs(qty)} shares | {reason}")
+
+                # 2026-08-22, user request: "always create a complementary
+                # trail order to reenter, if the stock is still in the top
+                # trade universe list" -- don't just exit and forget a name
+                # that's still actively on the TI radar; re-arm a trailing
+                # entry (same direction as the position just closed) so it
+                # re-enters automatically if/when the trend resumes. Best-
+                # effort: a failure here must never be treated as the exit
+                # itself failing.
+                try:
+                    if sym in get_ti_primary():
+                        reentry_side = OrderSide.BUY if is_long else OrderSide.SELL
+                        self.client.submit_order(TrailingStopOrderRequest(
+                            symbol          = sym,
+                            qty             = abs(qty),
+                            side            = reentry_side,
+                            type            = AlpacaOrderType.TRAILING_STOP,
+                            time_in_force   = TimeInForce.DAY,
+                            trail_percent   = REENTRY_TRAIL_PCT,
+                            client_order_id = f"apex-ema15reentry-{sym}-{int(time.time())}",
+                        ))
+                        log.info(
+                            f"EMA15 EXIT {sym}: still in top TI universe — armed a "
+                            f"{REENTRY_TRAIL_PCT:.1f}% trailing {'BUY' if is_long else 'SELL'} to re-enter"
+                        )
+                except Exception as e:
+                    log.warning(f"EMA15 EXIT {sym}: re-entry watch order failed (exit itself still succeeded): {e}")
+            except Exception as e:
+                log.error(f"EMA15 EXIT {sym}: close failed: {e}")
+                # The resting GTC was just cancelled above — re-arm a fallback
+                # so the position isn't left fully unprotected.
+                try:
+                    trail_pct, _ = _trail_pct_for(sym, current, self._entry_log)
+                    self.client.submit_order(TrailingStopOrderRequest(
+                        symbol=sym, qty=abs(qty), side=side,
+                        type=AlpacaOrderType.TRAILING_STOP, time_in_force=TimeInForce.GTC,
+                        trail_percent=trail_pct,
+                    ))
+                    log.warning(f"check_ema15_exit {sym}: re-armed GTC trailing stop after failed close")
+                except Exception as rearm_err:
+                    log.error(f"check_ema15_exit {sym}: close failed AND GTC re-arm failed — position may be UNPROTECTED: {rearm_err}")
 
     @staticmethod
     def _swing_drift_stop_reason(current: float, entry: Optional[float], is_long: bool, stop_pct: float) -> Optional[str]:

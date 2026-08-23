@@ -60,6 +60,13 @@ def _spy_backfill(self, symbol):
 
 orig_backfill = enhanced.EnhancedExecutor._backfill_drift_reference
 enhanced.EnhancedExecutor._backfill_drift_reference = _spy_backfill
+# 2026-08-22, user request: PRICE_DRIFT_STOP_ENABLED now defaults False
+# (replaced by the flat/profit-scaled trailing stop + the 1-min stagnant
+# check) -- the age-gating logic under test still lives in
+# check_price_drift_stop() and stays correct if it's ever re-enabled, so
+# force it on for this test rather than deleting coverage for working code.
+orig_enabled = enhanced.PRICE_DRIFT_STOP_ENABLED
+enhanced.PRICE_DRIFT_STOP_ENABLED = True
 
 try:
     now = datetime.datetime.now(datetime.timezone.utc)
@@ -83,5 +90,6 @@ try:
 
 finally:
     enhanced.EnhancedExecutor._backfill_drift_reference = orig_backfill
+    enhanced.PRICE_DRIFT_STOP_ENABLED = orig_enabled
 
 print("OK: price-drift-stop reference leg is skipped for a position younger than PRICE_DRIFT_LOOKBACK_MIN, still used once it's old enough")
