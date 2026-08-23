@@ -538,8 +538,9 @@ class EnhancedExecutor:
         # position-protection check silently failed for 32+ hours straight
         # while the bot kept trading blind) -- earliest UTC timestamp of the
         # CURRENT unbroken run of fetch failures across detect_stopped_out_
-        # positions/_cover_naked_positions/check_afterhours_stops, cleared
-        # the moment any of them succeeds. See _note_protection_fetch() and
+        # positions/_cover_naked_positions/check_afterhours_stops/
+        # check_ema15_exit, cleared the moment any of them succeeds. See
+        # _note_protection_fetch() and
         # api_blackout_minutes().
         self._protection_fail_since: Optional[datetime.datetime] = None
         # {symbol: {"order_id": str, "qty": int, "is_long": bool, "chase_count": int}}
@@ -1960,13 +1961,14 @@ class EnhancedExecutor:
     def _note_protection_fetch(self, ok: bool) -> None:
         """Track consecutive Alpaca fetch failures across the position-
         protection checks (detect_stopped_out_positions, _cover_naked_
-        positions, check_afterhours_stops). 2026-08-22, user request: a
-        non-negotiable guardrail after 2026-08-21 -- account auth broke at
-        09:20 CT and these three functions logged nothing but "fetch
-        failed: unauthorized" every cycle for 32+ hours with no halt and no
-        alert; the bot kept submitting entries the whole time with zero
-        ability to see or protect what it already held. `ok=False` starts
-        (or continues) the blackout clock; any `ok=True` clears it."""
+        positions, check_afterhours_stops, check_ema15_exit). 2026-08-22,
+        user request: a non-negotiable guardrail after 2026-08-21 --
+        account auth broke at 09:20 CT and these functions logged nothing
+        but "fetch failed: unauthorized" every cycle for 32+ hours with no
+        halt and no alert; the bot kept submitting entries the whole time
+        with zero ability to see or protect what it already held.
+        `ok=False` starts (or continues) the blackout clock; any `ok=True`
+        clears it."""
         if ok:
             self._protection_fail_since = None
         elif self._protection_fail_since is None:
@@ -3502,7 +3504,9 @@ class EnhancedExecutor:
             positions = self.client.get_all_positions()
         except Exception as e:
             log.warning(f"check_ema15_exit: fetch failed: {e}")
+            self._note_protection_fetch(False)
             return
+        self._note_protection_fetch(True)
 
         today = datetime.date.today()
 

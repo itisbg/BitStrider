@@ -798,6 +798,8 @@ EMA15_EXIT_MIN_BARS               = 15  # need at least this many 1-min bars bef
 # position-protection check (detect_stopped_out_positions,
 # _cover_naked_positions, check_afterhours_stops) silently failed every
 # cycle for 32+ hours straight -- no halt, no alert, entries kept firing
+# (check_ema15_exit added to this same watch list 2026-08-22, since it's
+# now the primary same-day exit check and its outages matter just as much)
 # with zero ability to see or protect anything already held. Once those
 # checks have failed continuously for API_BLACKOUT_HALT_MIN minutes, the
 # main scan cycle stops taking new entries and sends one alert email (not

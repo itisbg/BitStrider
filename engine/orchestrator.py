@@ -600,8 +600,8 @@ def scan_and_trade(ctx: AppContext) -> None:
                 send_email(
                     "ApexTrader: API blackout — new entries halted",
                     f"Position-protection checks (detect_stopped_out_positions / "
-                    f"_cover_naked_positions / check_afterhours_stops) have failed "
-                    f"continuously for {blackout_min:.1f} minutes. New entries are "
+                    f"_cover_naked_positions / check_afterhours_stops / "
+                    f"check_ema15_exit) have failed continuously for {blackout_min:.1f} minutes. New entries are "
                     f"halted until they recover. Existing positions' broker-side "
                     f"trailing stops are unaffected, but the bot cannot currently "
                     f"see or protect them. Check the Alpaca dashboard and API "
