@@ -56,6 +56,7 @@ try:
     from selenium.webdriver.edge.service import Service as EdgeService
     from selenium.webdriver.common.action_chains import ActionChains
     from selenium.webdriver.common.by import By
+    from selenium.webdriver.common.keys import Keys
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.webdriver.support import expected_conditions as EC
     from selenium.common.exceptions import SessionNotCreatedException, TimeoutException
@@ -78,6 +79,22 @@ OUTPUT_DIR  = REPO_ROOT / "screenshots"
 CONFIG_FILE = REPO_ROOT / "engine" / "config.py"
 TI_UNUSUAL_OPTIONS_FILE = REPO_ROOT / "data" / "ti_unusual_options.json"
 TI_PRIMARY_FILE = REPO_ROOT / "data" / "ti_primary.json"
+
+# ── TI login credentials (optional, for auto-login) ────────────────
+# 2026-08-24, user request: this script always ran on whatever session was
+# already sitting in the Edge profile -- if that session ever expired there
+# was no recovery, just a near-empty scrape (see MIN_VALID_TICKERS below)
+# until someone noticed and logged back in by hand. Loaded here (not via
+# engine.config) because this script also runs standalone via Task Scheduler
+# (run_ti_capture_task.ps1), outside main.py's own load_dotenv() call.
+import os as _os
+try:
+    from dotenv import load_dotenv as _load_dotenv
+    _load_dotenv(REPO_ROOT / ".env")
+except ImportError:
+    pass
+TI_EMAIL    = _os.environ.get("TI_LOGIN", "")
+TI_PASSWORD = _os.environ.get("TI_PASSWORD", "")
 
 # ── Trade Ideas scan URLs ────────────────────────────────────────
 SCANS: dict[str, dict] = {
@@ -170,6 +187,7 @@ TABLE_WAIT_SEC = 20
 PAGE_LOAD_SEC  = 15
 RENDER_GRACE_SEC = 2
 DROPDOWN_REFRESH_SEC = 2
+LOGIN_WAIT_SEC = 15  # how long to wait for the password field to clear after submitting auto-login
 
 
 # ── Persistent Edge driver singleton ─────────────────────────────
@@ -1050,6 +1068,64 @@ def _extract_race_sides(driver: "webdriver.Chrome") -> tuple[list[str], list[str
     return _dedup(leaders[:25]), _dedup(laggards[:25])
 
 
+def _ensure_logged_in(driver) -> bool:
+    """If the page just loaded is TI's login form -- any scan page redirects
+    here once the session's cookie has expired -- fill in TI_LOGIN /
+    TI_PASSWORD from .env and submit. Returns True if we're past
+    login (including "wasn't a login page at all"), False if a login form is
+    still showing (no creds configured, or the submit didn't clear it) -- the
+    caller skips scraping that page rather than let a login-page scrape
+    pollute universe.json.
+
+    2026-08-24, user request: this used to have no recovery at all -- a
+    session lapsing silently produced a near-empty scrape (see
+    MIN_VALID_TICKERS in _patch_config) until someone noticed and logged
+    back in by hand.
+
+    input[type='password'] is the detection signal: no real TI scan page has
+    one, every login form does, so it needs no TI-specific markup to find.
+    The email/username field is guessed from common attribute patterns since
+    it's not as uniform -- falls back to the only text input on the page if
+    nothing more specific matches."""
+    try:
+        pw_fields = driver.find_elements(By.CSS_SELECTOR, "input[type='password']")
+    except Exception:
+        pw_fields = []
+    if not pw_fields:
+        return True  # not a login page
+
+    if not TI_EMAIL or not TI_PASSWORD:
+        print("[WARN ] TI login page detected but TI_LOGIN/TI_PASSWORD "
+              "not set in .env -- can't auto-login")
+        return False
+
+    print("[....] TI session expired -- attempting auto-login")
+    try:
+        email_field = None
+        for sel in ("input[type='email']", "input[name*='email' i]", "input[id*='email' i]",
+                    "input[name*='user' i]", "input[id*='user' i]", "input[type='text']"):
+            found = driver.find_elements(By.CSS_SELECTOR, sel)
+            if found:
+                email_field = found[0]
+                break
+        if email_field is not None:
+            email_field.clear()
+            email_field.send_keys(TI_EMAIL)
+
+        pw_fields[0].clear()
+        pw_fields[0].send_keys(TI_PASSWORD)
+        pw_fields[0].send_keys(Keys.RETURN)  # submit via Enter -- no site-specific button markup needed
+
+        WebDriverWait(driver, LOGIN_WAIT_SEC).until(
+            lambda d: not d.find_elements(By.CSS_SELECTOR, "input[type='password']")
+        )
+        print("[OK   ] TI auto-login succeeded")
+        return True
+    except Exception as e:
+        print(f"[WARN ] TI auto-login failed: {e}")
+        return False
+
+
 # ── Main scrape function ──────────────────────────────────────────
 def scrape_tradeideas(
     update_config: bool = False,
@@ -1133,6 +1209,10 @@ def scrape_tradeideas(
 
             # Short grace period for React heatmap to render.
             time.sleep(RENDER_GRACE_SEC)
+
+            if not _ensure_logged_in(driver):
+                print(f"[WARN ] {scan_key}: still on TI login page — skipping")
+                continue
 
             if scan_key == "toplists":
                 local_select_minutes = 15 if select_minutes is None else select_minutes

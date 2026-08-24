@@ -31,9 +31,20 @@ from alpaca.trading.requests import (
 )
 from alpaca.trading.enums import OrderClass, OrderSide, TimeInForce, QueryOrderStatus
 
-# Set to True when Alpaca returns 40310000 (liquidation-only restriction).
-# Prevents repeated failed order attempts until the bot is restarted or the
-# restriction is cleared (checked fresh each cycle via _is_account_tradeable).
+# Set to True only when the broker itself reports the account as blocked
+# (acct.trading_blocked / account_blocked in _is_account_tradeable) --
+# genuinely account-wide, checked fresh each cycle. 2026-08-24, user request:
+# this used to ALSO get latched from any order-submission error whose text
+# contained "40310000" (see place_option_order's except block) -- but that
+# code is Alpaca's generic short/margin-rejection error, the same one
+# enhanced.py's equities path already treats as per-order ("cannot be sold
+# short"), not account-wide. On a low-equity account sitting right at
+# MIN_EQUITY_FOR_SHORT ($2,000), one bearish signal (BearPut/BearCallSpread)
+# failing with it latched this flag and silently blocked every later signal
+# this session INCLUDING unrelated bullish calls -- confirmed live: a failed
+# MULL put at 09:00:03 today, then a stream of MomentumCall-eligible tickers
+# with nothing entered. Fixed at the source: that except block now only logs
+# per-signal, never sets this flag.
 _ACCOUNT_RESTRICTED = False
 
 from engine.config import (
@@ -52,7 +63,7 @@ from engine.config import (
 from engine.utils import MarketState
 from engine.utils.bars import mount_wide_pool
 from engine.never_trade import is_never_trade
-from .strategies import OptionSignal, CONTRACT_SIZE, record_stop_cooldown
+from .strategies import OptionSignal, CONTRACT_SIZE
 
 log = logging.getLogger("ApexTrader.Options")
 
@@ -1070,13 +1081,18 @@ class OptionsExecutor:
             return True
 
         except Exception as e:
-            # Detect account restriction (40310000) and suppress further order attempts
+            # 2026-08-24, user request: 40310000 here is Alpaca's per-order
+            # short/margin rejection (same code enhanced.py's equities path
+            # treats as "cannot be sold short", not account-wide) -- NOT the
+            # broker's real liquidation-only flag, which _is_account_tradeable()
+            # already checks separately via acct.trading_blocked. Skip just
+            # this signal; don't latch _ACCOUNT_RESTRICTED and take out every
+            # later signal this session (bullish calls included) over one
+            # bearish strategy failing margin at this account's equity.
             if re.search(r'40310000', str(e)):
-                global _ACCOUNT_RESTRICTED
-                _ACCOUNT_RESTRICTED = True
-                log.error(
-                    f"[OPTIONS] Account restricted to liquidation-only (40310000) — "
-                    f"halting new entries. Resolve via Alpaca dashboard."
+                log.warning(
+                    f"[OPTIONS] {signal.symbol} {signal.strategy}: rejected (40310000, "
+                    f"likely short/margin restriction at current equity) — skipping this signal only"
                 )
             else:
                 log.error(f"[OPTIONS] CRITICAL FAILURE for {signal.symbol}: {e}", exc_info=True)
@@ -1124,7 +1140,6 @@ class OptionsExecutor:
             return
 
         to_close: List[str] = []
-        stop_symbols: List[str] = []
         today = datetime.date.today()
 
         # PDT/Account Status Logic (unchanged)
@@ -1262,8 +1277,6 @@ class OptionsExecutor:
                                     f"— mark=${current_mark:.2f} < 55% of entry=${entry_mark:.2f} — closing"
                                 )
                                 to_close.append(occ_sym)
-                                stop_symbols.append(pos.symbol)
-
 
                     continue   # skip standard % stop / trailing stop for mleg structures
                 # ── End butterfly/condor logic ────────────────────────────────
@@ -1285,7 +1298,6 @@ class OptionsExecutor:
                                 f"({pnl_pct:.1f}%) same-day — closing"
                             )
                             to_close.append(occ_sym)
-                            stop_symbols.append(pos.symbol)
                         else:
                             log.debug(
                                 f"OPTIONS: {pos.symbol} at stop ({pnl_pct:.1f}%) but entered today — holding"
@@ -1293,7 +1305,6 @@ class OptionsExecutor:
                     elif not pdt_block:
                         log.warning(f"OPTIONS: {pos.symbol} stop hit ({pnl_pct:.1f}%) — closing")
                         to_close.append(occ_sym)
-                        stop_symbols.append(pos.symbol)
 
                 # 5. Trailing stop — arms once peak >= OPTIONS_TRAIL_ACTIVATE_PCT
                 # Fires when pnl drops OPTIONS_TRAIL_DRAWDOWN_PCT pp below the peak.
@@ -1318,10 +1329,6 @@ class OptionsExecutor:
         # Execute closes — pass all_positions so _close_option can compute limit price
         for occ_sym in to_close:
             self._close_option(occ_sym, all_positions=all_positions)
-
-        # Record stop cooldowns so stopped symbols can't re-enter within OPTIONS_STOP_COOLDOWN_DAYS
-        for sym in stop_symbols:
-            record_stop_cooldown(sym)
 
         # IV conversion check (rate-limited to every 10 min, touches only open naked positions)
         self._maybe_convert_to_spread()

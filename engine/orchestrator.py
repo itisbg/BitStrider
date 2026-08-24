@@ -557,7 +557,14 @@ def scan_and_trade(ctx: AppContext) -> None:
     ctx.market_state = MarketState.from_now()
     ctx.market_state.resolve_regime()
     ctx.executor.update_market_state(ctx.market_state)
-    _run_options_cycle(ctx, ctx.market_state)
+    # 2026-08-24, user request: _run_options_cycle no longer runs here --
+    # moved to its own thread (_start_options_scan_thread). It used to be
+    # step 2 of this function, BEFORE equity discovery/scan/execute below,
+    # so every equity cycle wasn't free to run until a full options scan
+    # (160 tickers, sequential per-symbol fetches, minutes long) finished
+    # first -- confirmed live, that alone blew past a minute most cycles,
+    # so equity re-entries (the actual swing-capture mechanism) never got
+    # close to REGULAR_HOURS_SCAN_INTERVAL. See _start_options_scan_thread.
 
     market_state = ctx.market_state
     if not market_state.is_market_open:
@@ -653,7 +660,7 @@ def scan_and_trade(ctx: AppContext) -> None:
             log.info("[SCAN] No signals — market likely in downtrend or momentum gates not met")
 
     for idx, s in enumerate(sorted(signals, key=lambda s: s.confidence, reverse=True)[:cfg.TOP_N_SIGNALS], 1):
-        log.info(f"[SCAN] TOP5_RAW #{idx}: {s.symbol} {s.action.upper()} ${s.price:.2f} conf={s.confidence:.0%} [{s.strategy}] — {s.reason}")
+        log.info(f"[SCAN] TOP{cfg.TOP_N_SIGNALS}_RAW #{idx}: {s.symbol} {s.action.upper()} ${s.price:.2f} conf={s.confidence:.0%} [{s.strategy}] — {s.reason}")
 
     if not signals:
         log.info("[SCAN] No signals this cycle")
@@ -667,7 +674,7 @@ def scan_and_trade(ctx: AppContext) -> None:
     _log_skipped(signals, eligible, fresh_held, regime, ctx.executor)
 
     for idx, s in enumerate(eligible[:cfg.TOP_N_SIGNALS], 1):
-        log.info(f"[TRADE] TOP5_ELIGIBLE #{idx}: {s.symbol} {s.action.upper()} ${s.price:.2f} conf={s.confidence:.0%} [{s.strategy}] — {s.reason}")
+        log.info(f"[TRADE] TOP{cfg.TOP_N_SIGNALS}_ELIGIBLE #{idx}: {s.symbol} {s.action.upper()} ${s.price:.2f} conf={s.confidence:.0%} [{s.strategy}] — {s.reason}")
 
     save_day_picks(eligible[:cfg.TOP_N_SIGNALS], regime)
     notify_scan_results(eligible[:cfg.TOP_N_SIGNALS], datetime.date.today(), sentiment, regime)
@@ -825,17 +832,6 @@ def _swing_drift_stop_job(ctx: AppContext) -> None:
         log.error(f"check_swing_drift_stop error: {e}", exc_info=True)
 
 
-def _ema15_exit_job(ctx: AppContext) -> None:
-    """schedule-driven wrapper for check_ema15_exit -- 2026-08-22, user
-    request: fast (1-min) close-crosses-EMA15-against-the-position
-    replacement for the disabled price-drift stop, its own
-    STAGNANT_STOP_CHECK_INTERVAL_MIN cadence."""
-    try:
-        ctx.executor.check_ema15_exit()
-    except Exception as e:
-        log.error(f"check_ema15_exit error: {e}", exc_info=True)
-
-
 def _concentration_check_job(ctx: AppContext) -> None:
     """schedule-driven wrapper for enforce_position_concentration/
     enforce_correlation_concentration -- 2026-08-15, user request: idea #6
@@ -935,10 +931,32 @@ def scan_top3_only(ctx: AppContext) -> None:
 def _start_software_stop_thread(ctx: AppContext) -> None:
     """Spawn a daemon thread that polls _cover_naked_positions(),
     check_software_stops(), check_afterhours_stops(), _sweep_force_closes(),
-    and _sweep_pending_entries() every 10 seconds."""
+    _sweep_pending_entries(), and detect_stopped_out_positions() every 10
+    seconds, plus check_ema15_exit() every STAGNANT_STOP_CHECK_INTERVAL_MIN.
+
+    2026-08-24, user request ("why do you say the cycle time increase" --
+    it wasn't supposed to touch the EMA check at all): check_ema15_exit used
+    to run via _ema15_exit_job on schedule.every(), with comments claiming
+    that decouples it from scan cadence because "schedule.run_pending()
+    ticks every 5s in the main loop regardless." That's false once
+    scan_and_trade() itself runs long -- the main loop is single-threaded,
+    so schedule.run_pending() (and every job registered on it, EMA15 exit
+    included) simply doesn't get called until scan_and_trade() returns.
+    Confirmed live: cycles were landing 4-10 min apart despite a 1-min
+    config, which silently starved the EMA exit check the same way. This
+    thread is genuine concurrency (a real Thread, checked every 10s
+    independent of what the main loop is doing) -- moving the EMA check
+    here is what schedule.every() was supposed to give it and didn't.
+    _ema15_exit_job/the schedule.every() registration for it are gone; this
+    is its only trigger now. check_ema15_exit() itself already arms an
+    immediate re-entry trailing order when the exited symbol is still in the
+    top TI universe (see its own docstring) -- so this one move restores
+    both halves of "EMA exit check + immediate re-entry" to an actual 1-min
+    heartbeat, independent of however long a discovery scan takes."""
     import threading
 
     def _loop() -> None:
+        last_ema15 = 0.0
         while True:
             try:
                 ctx.executor._cover_naked_positions()
@@ -965,11 +983,58 @@ def _start_software_stop_thread(ctx: AppContext) -> None:
                 ctx.executor.detect_stopped_out_positions()
             except Exception as e:
                 log.error(f"[STOP-THREAD] detect_stopped_out_positions error: {e}", exc_info=True)
+            if time.time() - last_ema15 >= cfg.STAGNANT_STOP_CHECK_INTERVAL_MIN * 60:
+                try:
+                    ctx.executor.check_ema15_exit()
+                except Exception as e:
+                    log.error(f"[STOP-THREAD] check_ema15_exit error: {e}", exc_info=True)
+                last_ema15 = time.time()
             time.sleep(10)
 
     t = threading.Thread(target=_loop, name="SoftwareStopPoller", daemon=True)
     t.start()
-    log.info("[STOP-THREAD] Software-stop fast-poll thread started (10s interval)")
+    log.info("[STOP-THREAD] Software-stop fast-poll thread started (10s interval, EMA15 exit every 1 min)")
+
+
+def _start_options_scan_thread(ctx: AppContext) -> None:
+    """Spawn a daemon thread that runs the options monitor + new-entry cycle
+    (_run_options_cycle) on its own OPTIONS_SCAN_INTERVAL_MIN timer,
+    independent of the equity scan_and_trade() loop.
+
+    2026-08-24, user request ("every one minute there should be new order
+    attempts if the conditions met"): this used to run INSIDE
+    scan_and_trade(), as step 2 of 8 -- BEFORE the equity discovery/scan/
+    execute steps that follow it. Every equity cycle waited on a full
+    options scan (160 tickers, sequential per-symbol bar fetches) to finish
+    first. Confirmed live: that alone routinely ran past a minute by itself,
+    so equity re-entries never got close to REGULAR_HOURS_SCAN_INTERVAL no
+    matter how low that config was set. Same fix as check_ema15_exit
+    (_start_software_stop_thread) and the same reason it has to be a real
+    thread, not schedule.every() -- that's just as blocked whenever
+    scan_and_trade() itself is running, see that function's docstring.
+
+    Computes its own local MarketState each cycle rather than reading
+    ctx.market_state (written concurrently by the main loop) -- only
+    assigns it to ctx.market_state right before calling _run_options_cycle,
+    since that function's scan_options_universe() call still reads it from
+    there. Same level of shared-ctx looseness the SoftwareStopPoller thread
+    already runs with elsewhere in this file."""
+    import threading
+
+    def _loop() -> None:
+        while True:
+            try:
+                market_state = MarketState.from_now()
+                market_state.resolve_regime()
+                ctx.market_state = market_state
+                _run_options_cycle(ctx, market_state)
+            except Exception as e:
+                log.error(f"[OPTIONS-THREAD] cycle error: {e}", exc_info=True)
+            time.sleep(cfg.OPTIONS_SCAN_INTERVAL_MIN * 60)
+
+    t = threading.Thread(target=_loop, name="OptionsScanner", daemon=True)
+    t.start()
+    log.info(f"[OPTIONS-THREAD] Options scan thread started ({cfg.OPTIONS_SCAN_INTERVAL_MIN} min interval)")
 
 
 def start() -> None:
@@ -1006,6 +1071,7 @@ def start() -> None:
 
     # Start the dedicated software-stop monitor thread
     _start_software_stop_thread(ctx)
+    _start_options_scan_thread(ctx)
 
     # Block until startup TI capture completes (up to 90s)
     if cfg.USE_TRADEIDEAS_DISCOVERY:
@@ -1057,7 +1123,8 @@ def start() -> None:
     schedule.every(1).minutes.do(_eod_close_job, ctx)
     _schedule_on_clock_grid(cfg.PRICE_DRIFT_CHECK_INTERVAL_MIN, _price_drift_stop_job, ctx)
     _schedule_on_clock_grid(cfg.SWING_DRIFT_STOP_CHECK_INTERVAL_MIN, _swing_drift_stop_job, ctx)
-    _schedule_on_clock_grid(cfg.STAGNANT_STOP_CHECK_INTERVAL_MIN, _ema15_exit_job, ctx)
+    # check_ema15_exit moved to the SoftwareStopPoller thread (see
+    # _start_software_stop_thread) -- no longer registered here.
     _schedule_on_clock_grid(cfg.CONCENTRATION_CHECK_INTERVAL_MIN, _concentration_check_job, ctx)
 
     try:

@@ -65,7 +65,22 @@ _STALE_THRESHOLD_SECONDS = {
 
 
 def _staleness_threshold(interval: str) -> float:
+    """2026-08-24, user request ("stale data skipping is happening every
+    time"): this used to be interval[-1] alone -- "1m"/"5m"/"15m"/"30m" all
+    end in "m", so every minute-family interval got the SAME flat 120s
+    threshold. A 15m bar's own timestamp is naturally 0-15 min old at any
+    given check (median ~7.5 min = 450s) -- that's how a 15m candle works,
+    not the feed being dead, so it failed a 120s check almost by
+    definition. Now scales with the bar's own period: 1.5x the period + a
+    60s fetch/processing buffer, floored at the original flat 120s so a 1m
+    bar's check is effectively unchanged (150s vs 120s)."""
     suffix = interval[-1] if interval else "d"
+    if suffix == "m":
+        try:
+            n = int(interval[:-1])
+        except ValueError:
+            n = 1
+        return max(120.0, n * 60 * 1.5 + 60)
     return _STALE_THRESHOLD_SECONDS.get(suffix, _STALE_THRESHOLD_SECONDS["d"])
 
 _data_client = None

@@ -52,7 +52,7 @@ from engine.config import (
     MIN_AVG_DAILY_VOLUME_REGULAR_HOURS, MIN_FLOAT_SHARES, MIN_MARKET_CAP,
     SWING_STALE_EXIT_ENABLED, SWING_STALE_DAYS, SWING_STALE_MIN_GAIN_PCT,
     NO_GAIN_EXIT_ENABLED, NO_GAIN_EXIT_HOURS, NO_GAIN_EXIT_MIN_PCT, NO_GAIN_EXIT_MAX_LOSS_PCT,
-    AFTERHOURS_STOP_CHECK_ENABLED, AFTERHOURS_CHASE_STALE_SECONDS, AFTERHOURS_STOP_COOLDOWN_MIN,
+    AFTERHOURS_STOP_CHECK_ENABLED, AFTERHOURS_CHASE_STALE_SECONDS,
     MAX_POSITION_CONCENTRATION_PCT, CORRELATION_GROUPS, MAX_PORTFOLIO_LEVERAGE,
     POSITION_CAP_GROWTH_FACTOR, POSITION_CAP_ABSOLUTE_MAX_PCT,
     LONG_ONLY_MODE,
@@ -500,7 +500,6 @@ class EnhancedExecutor:
         self._ratchet_done: set = set()          # symbols whose stop was already confidence-tightened
         self._tp_targets: Dict[str, float] = {} # {symbol: take-profit price} for ATR-based TP tracking
         self._pdt_stop_blocked: Dict[str, float] = {}  # {symbol: stop_price} — broker-rejected stops; monitored in software
-        self._afterhours_stop_cooldown: Dict[str, float] = {}  # {symbol: monotonic expiry} — blocks re-entry after a stop-loss exit (despite the name, populated by ANY stop-loss close now, not just the after-hours software path — see detect_stopped_out_positions)
         self._last_known_positions: Dict[str, dict] = {}  # {symbol: {entry_price, last_price, is_long}} — snapshot used to notice a position disappearing between polls
         self._afterhours_chase_count: Dict[str, int] = {}  # {symbol: consecutive re-chase attempts} — widens slip each retry so a fast-falling after-hours book actually fills
         self._no_gain_chase_count: Dict[str, int] = {}  # same, for close_no_gain_positions's re-chase
@@ -521,8 +520,8 @@ class EnhancedExecutor:
         # of chasing a marketable limit -- PFSA that day, 2nd EarlySqueeze entry
         # chased in at $13.52 while fading 15% off its high, filled $12.50,
         # stopped $11.72 eight minutes later. Deliberately independent of
-        # _afterhours_stop_cooldown -- that only fires after a LOSING exit, so it
-        # missed this case entirely (PFSA's first exit was a ratcheted win).
+        # win/loss -- PFSA's first exit was a ratcheted win, not a loss, and
+        # still deserved the trailing-buy treatment on the 2nd entry.
         self._entries_today: Dict[str, int] = {}
         self._entries_today_date: Optional[datetime.date] = None
         # symbols confirmed to have zero prior broker fill history -- lets
@@ -915,25 +914,14 @@ class EnhancedExecutor:
         if order_type == OrderType.SHORT and signal.symbol in self._htb_cache:
             return False, f"{signal.symbol} hard-to-borrow (cached)"
 
-        # Post-loss re-entry cooldown (long or short) — no longer a hard block.
-        # 2026-08-18, user request: "instead of blocking the trade enter it
-        # with trail buy" -- a symbol still in AFTERHOURS_STOP_COOLDOWN_MIN
-        # now falls through to _create_bracket_order, which checks
-        # get_afterhours_cooldown_symbols() itself and routes it through the
-        # same trailing-buy path as a same-day re-entry (is_reentry) instead
-        # of the normal marketable chase -- it can't fill while the name is
-        # still actively falling.
-        #
-        # Original hard-block rationale, still worth keeping in mind: SOXS
-        # (2026-08-05) got stopped out and immediately re-bought the IDENTICAL
-        # VWAPFade signal repeatedly -- 22 trades, -$605 net -- because
-        # nothing throttled re-firing the same losing signal. A trailing buy
-        # can't fill mid-fall the way that chase could, but it does NOT cap
-        # how many times a symbol can be re-entered in a day -- if the same
-        # strategy keeps re-signaling and each trail-buy keeps getting stopped
-        # on the next leg down, this only slows the bleed, doesn't prevent
-        # repeated small losses stacking up the way SOXS did. No attempt-cap
-        # added here; revisit if that pattern shows up live.
+        # 2026-08-24, user request: no post-loss re-entry cooldown at all —
+        # every entry (cooldown or not) already goes through the trailing-buy
+        # path (_create_bracket_order), which can't fill mid-fall the way a
+        # marketable chase could. Protection against a re-firing signal is
+        # the exit stack alone now: the trailing stop, check_ema15_exit
+        # (per-minute), and the standalone software stop-loss. See SOXS
+        # (2026-08-05, 22 trades/-$605 net re-firing the same losing signal)
+        # for why that stack matters if this gets revisited.
 
         # Momentum entry freshness (long only — a short entry isn't chasing a
         # gap up) — reject a gap/momentum signal that's already faded off its
@@ -1196,27 +1184,28 @@ class EnhancedExecutor:
 
     def _is_reentry_signal(self, symbol: str, is_long: bool = True) -> bool:
         """True if `symbol` should use the trailing-buy entry path instead of
-        the normal marketable chase: a 2nd+ same-day entry, one still inside
-        its post-loss cooldown window, OR any symbol with SOME prior fill
-        history at all -- broker-confirmed via _get_entry_datetime, since
-        _entry_log alone doesn't survive this bot's frequent restarts.
+        the normal marketable chase: a 2nd+ same-day entry, OR any symbol with
+        SOME prior fill history at all -- broker-confirmed via
+        _get_entry_datetime, since _entry_log alone doesn't survive this
+        bot's frequent restarts.
 
         2026-08-18, user request: "the re entry to trail buy doesn't have to
         come from cool down list only... even if the non cool down reentry to
         a prior traded stock is entering put in a trail buy order" -- SNDQ
-        that day: stopped 09:02 (no cooldown block issue, still same-day/
-        cooldown-covered), but the general case is a symbol that WON its last
-        trade (no cooldown ever set) or was traded days ago (cooldown long
-        expired) -- neither same-day count nor cooldown catches that, and it
+        that day: stopped 09:02 (no cooldown block issue, still same-day
+        entry), but the general case is a symbol that WON its last trade or
+        was traded days ago -- same-day count alone catches neither, and it
         deserves the same falling-knife protection on re-entry.
+
+        2026-08-24, user request: dropped the post-loss cooldown branch that
+        used to live here -- there's no cooldown window left to check (see
+        _validate_trade), everything else about this function is unchanged.
 
         Broker lookup only runs once per symbol per process lifetime -- a
         confirmed "never traded" result is cached in _no_history_cache so a
         genuinely new symbol doesn't pay a broker round-trip on every single
         entry attempt forever."""
         if self._entries_today_count(symbol) > 0:
-            return True
-        if symbol in self.get_afterhours_cooldown_symbols():
             return True
         if symbol in self._no_history_cache:
             return False
@@ -1245,8 +1234,9 @@ class EnhancedExecutor:
 
         2026-08-18, user request (superseded by the above but kept for the
         PFSA incident this originally covered): REENTRY_TRAIL_PCT in
-        config.py, and _validate_trade's docstring for why the cooldown
-        itself no longer blocks the trade outright."""
+        config.py. See _validate_trade's docstring -- as of 2026-08-24 there's
+        no post-loss cooldown left at all, just this trailing-buy entry plus
+        the trailing stop / check_ema15_exit / standalone stop-loss exit stack."""
         side          = OrderSide.BUY  if order_type == OrderType.LONG else OrderSide.SELL
         stop_side     = OrderSide.SELL if order_type == OrderType.LONG else OrderSide.BUY
         trail_pct     = TRAIL_STOP_PCT  # flat -- see _trail_pct_for()
@@ -1916,31 +1906,18 @@ class EnhancedExecutor:
             except Exception as e:
                 log.error(f"check_software_stops {sym}: {e}")
 
-    def get_afterhours_cooldown_symbols(self) -> set:
-        """Symbols currently blocked from re-entry after an after-hours stop-loss exit."""
-        now = time.monotonic()
-        expired = [s for s, exp in self._afterhours_stop_cooldown.items() if now >= exp]
-        for s in expired:
-            self._afterhours_stop_cooldown.pop(s, None)
-        return set(self._afterhours_stop_cooldown.keys())
-
     def detect_stopped_out_positions(self) -> None:
         """Catch a position closing via ANY route — most commonly a normal
-        broker-side GTC trailing stop filling on its own — and apply the same
-        re-entry cooldown that check_afterhours_stops() already sets for its
-        own software-triggered closes.
+        broker-side GTC trailing stop filling on its own — and reset its
+        ratchet-tightening state so a later re-entry gets fresh confidence-
+        ratchet protection instead of none (see the _ratchet_done.discard
+        call below).
 
-        Confirmed necessary 2026-08-05: SOXS was stopped out and immediately
-        re-bought the identical VWAPFade signal repeatedly (22 trades, -$605
-        net) because the cooldown only ever fired from
-        check_afterhours_stops()'s own close path — a normal GTC fill, the
-        far more common way a stop actually triggers, never touched it.
-
-        Approximate on purpose: compares against the last-seen mark price
-        rather than looking up the exact closing fill via the orders API —
-        good enough to tell "this was heading toward/at a loss," which is all
-        a re-entry cooldown needs; not meant to be an exact realized-P&L
-        figure (see the trade-history report for that).
+        2026-08-24, user request: this used to also arm a post-loss re-entry
+        cooldown here (and in check_afterhours_stops()'s own close path) —
+        removed. No cooldown left anywhere; the exit stack (trailing stop,
+        per-minute check_ema15_exit, standalone stop-loss) is the only
+        protection now.
         """
         try:
             positions = self.client.get_all_positions()
@@ -1962,7 +1939,7 @@ class EnhancedExecutor:
             except (TypeError, ValueError):
                 continue
 
-        for sym, info in self._last_known_positions.items():
+        for sym in self._last_known_positions:
             if sym in current:
                 continue  # still open
             # Closed via any route — eligible for confidence-ratchet protection
@@ -1971,58 +1948,8 @@ class EnhancedExecutor:
             # ABCL ran +6.3% unrealized on a fresh entry after an earlier lot had
             # already ratcheted, and never got tightened).
             self._ratchet_done.discard(sym)
-            if sym in self._afterhours_stop_cooldown:
-                continue  # already cooling down from elsewhere
-            entry, last, is_long = info["entry_price"], info["last_price"], info["is_long"]
-            # 2026-08-17, found live: `last` is whatever price the LAST poll
-            # (up to 10s old) happened to see while the position was still
-            # open -- on a fast, violent reversal (a low-float squeeze name
-            # spiking then crashing within a single 1-min candle) that stale
-            # snapshot can still show a GAIN even though the real closing
-            # fill was a loss. Confirmed live: FIEE spiked to $5.95, got
-            # polled near that peak, then its trailing stop fired and closed
-            # it at $5.6751 (a real loss vs $5.73 entry) within the same
-            # ~10s gap -- was_loss against the stale $5.95 snapshot came back
-            # False, no cooldown got set, and the identical signal re-bought
-            # FIEE two minutes later. Look up the ACTUAL closing fill first;
-            # only fall back to the approximate last-known mark if that
-            # lookup fails (network hiccup, order not found yet, etc.) --
-            # same fail-open-to-the-old-approximation pattern used
-            # everywhere else in this file.
-            close_price = self._get_recent_close_price(sym, is_long) or last
-            was_loss = (close_price < entry) if is_long else (close_price > entry)
-            if was_loss:
-                self._afterhours_stop_cooldown[sym] = time.monotonic() + AFTERHOURS_STOP_COOLDOWN_MIN * 60
-                log.info(
-                    f"STOP-COOLDOWN {sym}: closed near a loss (last ${close_price:.2f} vs entry ${entry:.2f}) "
-                    f"— blocking re-entry for {AFTERHOURS_STOP_COOLDOWN_MIN} min"
-                )
 
         self._last_known_positions = current
-
-    def _get_recent_close_price(self, symbol: str, is_long: bool) -> Optional[float]:
-        """Look up the most recent CLOSING fill for symbol via the orders
-        API -- the actual realized exit price, not an approximate poll-cycle
-        mark. A closing order is the OPPOSITE side from the position (SELL
-        closes a long, BUY-to-cover closes a short). Returns None (caller
-        falls back to the approximate mark) if the lookup fails or nothing
-        is found -- same fail-safe pattern as _get_entry_date/_get_entry_datetime."""
-        try:
-            from alpaca.common.enums import Sort
-            from alpaca.trading.requests import GetOrdersRequest
-            from alpaca.trading.enums import QueryOrderStatus
-            close_side = OrderSide.SELL if is_long else OrderSide.BUY
-            req = GetOrdersRequest(
-                status=QueryOrderStatus.CLOSED, symbols=[symbol],
-                side=close_side, direction=Sort.DESC, limit=5,
-            )
-            orders = self.client.get_orders(filter=req) or []
-            for order in orders:
-                if str(getattr(order.status, "value", order.status)).lower() == "filled" and order.filled_avg_price:
-                    return float(order.filled_avg_price)
-        except Exception as e:
-            log.warning(f"_get_recent_close_price {symbol}: lookup failed: {e}")
-        return None
 
     def check_afterhours_stops(self) -> None:
         """Actively watch every open position's loss while the market is NOT in
@@ -2123,14 +2050,13 @@ class EnhancedExecutor:
                     slip_pct = min(0.5 * (chase_n + 1), 3.0)  # widen 0.5% -> 1.0% -> ... capped at 3% so a fast-falling book still fills
                     self._submit_closing_order(sym, abs(qty), side, current, slip_pct=slip_pct)
                     self._afterhours_chase_count[sym] = chase_n + 1
-                    self._afterhours_stop_cooldown[sym] = time.monotonic() + AFTERHOURS_STOP_COOLDOWN_MIN * 60
                     _strategy = self._entry_log.get(sym, {}).get("strategy", "unknown")
                     _pnl = (current - entry) * qty
                     log.warning(
                         f"AFTER-HOURS SL HIT {sym} [{_strategy}]: price ${current:.2f} crossed stop ${stop_price:.2f} "
                         f"({trail_pct:.1f}% from entry ${entry:.2f}) | P&L ${_pnl:+,.2f} — extended-hours "
                         f"{'SELL' if is_long else 'BUY-TO-COVER'} submitted @ {slip_pct:.1f}% slip "
-                        f"(attempt {chase_n + 1}), re-entry blocked {AFTERHOURS_STOP_COOLDOWN_MIN // 60}h"
+                        f"(attempt {chase_n + 1})"
                     )
                 except Exception as close_err:
                     log.error(f"AFTER-HOURS SL {sym}: close order failed after GTC cancel: {close_err}")
@@ -3267,10 +3193,9 @@ class EnhancedExecutor:
         entries only (self._entry_log date), not by strategy -- survives the strategy-name
         loss a restart causes.
 
-        Re-entry cooldown is automatic: detect_stopped_out_positions() (10s
-        thread) applies AFTERHOURS_STOP_COOLDOWN_MIN to ANY position that
-        disappears near a loss, regardless of which path closed it -- no
-        separate cooldown logic needed here."""
+        No re-entry cooldown (2026-08-24, user request) -- this drift stop,
+        the trailing stop, and check_ema15_exit are the whole protection
+        stack; nothing here throttles how soon a symbol re-enters."""
         if not PRICE_DRIFT_STOP_ENABLED:
             return
 

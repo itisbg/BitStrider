@@ -36,7 +36,6 @@ def _make_executor(open_positions):
     ex._last_known_positions = {
         "ABCL": {"entry_price": 9.41, "last_price": 10.00, "is_long": True},
     }
-    ex._afterhours_stop_cooldown = {}
     ex._ratchet_done = {"ABCL"}  # simulates lot 1 already ratcheted
     return ex
 

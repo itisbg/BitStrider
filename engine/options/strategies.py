@@ -57,7 +57,6 @@ from engine.config import (
     OPTIONS_MIN_MOVE_PCT,
     OPTIONS_MIN_RVOL,
     OPTIONS_MIN_ADV,
-    OPTIONS_STOP_COOLDOWN_DAYS,
     OPTIONS_EARNINGS_AVOID_DAYS,
     ATR_STOP_MULTIPLIER,
     OPTIONS_CHAIN_CACHE_MAX,
@@ -104,10 +103,6 @@ def _calc_rsi_scalar(prices: pd.Series) -> Optional[float]:
 
 ET  = pytz.timezone("America/New_York")
 
-
-# Session-level stop cooldown: symbol -> date of last stop/loss close
-# Prevents re-entering a symbol within OPTIONS_STOP_COOLDOWN_DAYS after a stop.
-_stop_cooldown: Dict[str, datetime.date] = {}
 log = logging.getLogger("ApexTrader.Options")
 
 CONTRACT_SIZE = 100  # standard 1 options contract = 100 shares
@@ -2312,14 +2307,6 @@ def scan_options_universe(
                 _record_fail("adv", symbol)
                 continue
 
-        # Skip symbols still in stop cooldown
-        if symbol in _stop_cooldown:
-            days_since = (today - _stop_cooldown[symbol]).days
-            if days_since < OPTIONS_STOP_COOLDOWN_DAYS:
-                log.debug(f"Options scan: {symbol} in stop cooldown ({days_since}d / {OPTIONS_STOP_COOLDOWN_DAYS}d) — skipping")
-                _record_fail("stop_cooldown", symbol)
-                continue
-
         symbol_got_signal = False
         # Try all strategies in priority order; one signal per symbol per cycle
         for strat in (momentum_strat, bear_put_strat, bear_call_strat, squeeze_strat, mean_rev_strat,
@@ -2367,11 +2354,3 @@ def scan_options_universe(
     return signals
 
 
-def record_stop_cooldown(underlying: str) -> None:
-    """Call this from OptionsExecutor after a stop/loss close on an option position.
-
-    The underlying ticker is blocked from new MomentumCall entries for
-    OPTIONS_STOP_COOLDOWN_DAYS to prevent same-symbol re-entry after a losing trade.
-    """
-    _stop_cooldown[underlying] = datetime.date.today()
-    log.info(f"Options cooldown set: {underlying} blocked for {OPTIONS_STOP_COOLDOWN_DAYS} days")

@@ -45,7 +45,6 @@ def _make_executor(client_orders):
     ex = EnhancedExecutor.__new__(EnhancedExecutor)
     ex._entries_today = {}
     ex._entries_today_date = None
-    ex._afterhours_stop_cooldown = {}
     ex._no_history_cache = set()
     ex._entry_log = {}
     ex.client = _CountingClient(client_orders)

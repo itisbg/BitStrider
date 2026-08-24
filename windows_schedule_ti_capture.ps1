@@ -2,7 +2,7 @@
 # Run in PowerShell as Administrator.
 
 $taskName = 'ApexTraderTICapture'
-$taskDescription = 'Refresh data/ti_primary.json: every 5 min 08:25-09:30 (9:25-10:30am ET), then every 10 min until 14:50 (3:50pm ET, matches ENTRY_WINDOW_END_ET), Mon-Fri — single-shot runs owned by Task Scheduler'
+$taskDescription = 'Refresh data/ti_primary.json: every 3 min 08:25-09:30 (9:25-10:30am ET), then every 10 min until 14:50 (3:50pm ET, matches ENTRY_WINDOW_END_ET), Mon-Fri — single-shot runs owned by Task Scheduler'
 $BaseDir = $PSScriptRoot
 
 $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$BaseDir\scripts\run_ti_capture_task.ps1`""
@@ -18,15 +18,20 @@ $repetitionClass = Get-CimClass -ClassName MSFT_TaskRepetitionPattern -Namespace
 
 # 2026-08-22, user request: "trade ideas scrapping for the time 9.25am to
 # 10.30 am will be every 5minutes" -- single trigger covering the whole
-# 08:25-09:30 Central window (9:25-10:30am ET), every 5 min, first fire
-# doubling as the old separate kickstart run (was a one-shot 08:25 trigger
-# plus a separate 08:30-09:30 repeating one; merged since the kickstart
-# time is now just this block's first tick).
+# 08:25-09:30 Central window (9:25-10:30am ET), first fire doubling as the
+# old separate kickstart run (was a one-shot 08:25 trigger plus a separate
+# 08:30-09:30 repeating one; merged since the kickstart time is now just
+# this block's first tick).
+# 2026-08-24, user request: "first 1hour run every 3 mins" -- interval
+# 5min -> 3min. Window boundaries (08:25-09:30 Central) left untouched on
+# purpose: it's actually 1h5m, not a flat 1h, but trimming it to a literal
+# 1h would open a 5-min gap before the 09:30 trigger picks up -- said so,
+# didn't do it; ask if you actually want that gap instead.
 $openingTrigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday,Tuesday,Wednesday,Thursday,Friday -At 08:25
 # .Repetition isn't settable in place (returns a fresh, disconnected CIM instance
 # each access) — build the repetition pattern separately and assign it whole.
 $openingRepetition = New-CimInstance -CimClass $repetitionClass -ClientOnly
-$openingRepetition.Interval = 'PT5M'
+$openingRepetition.Interval = 'PT3M'
 $openingRepetition.Duration = 'PT1H5M'   # 08:25 -> 09:30 (9:25-10:30am ET)
 $openingRepetition.StopAtDurationEnd = $false
 $openingTrigger.Repetition = $openingRepetition

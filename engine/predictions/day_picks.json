@@ -1,15 +1,23 @@
 {
-  "generated_at": "2026-08-06T09:40:14-04:00",
-  "date": "2026-08-06",
+  "generated_at": "2026-08-24T10:39:47-04:00",
+  "date": "2026-08-24",
   "market_regime": "bull",
   "picks": [
     {
-      "symbol": "IOVA",
+      "symbol": "SDOT",
       "action": "buy",
-      "price": 5.81,
-      "confidence": 0.97,
-      "strategy": "GapBreakout",
-      "reason": "Gap up 33.9% from $4.34 | volume x3.2"
+      "price": 27.45,
+      "confidence": 0.9,
+      "strategy": "TrendBreaker",
+      "reason": "Trend break above 20SMA + 10d high | vol x10.5 | RSI 77"
+    },
+    {
+      "symbol": "NBIL",
+      "action": "buy",
+      "price": 21.31,
+      "confidence": 0.7793,
+      "strategy": "VWAPReclaim",
+      "reason": "VWAP reclaim $20.89 | vol x2.1 | RSI 66"
     }
   ]
 }

@@ -40,12 +40,16 @@ OPTIONS_STOP_LOSS_PCT       = float(os.getenv("OPTIONS_STOP_LOSS_PCT", "30.0")) 
 OPTIONS_THETA_EXIT_DTE      = int(os.getenv("OPTIONS_THETA_EXIT_DTE", "2"))           # exit within N DTE to avoid theta decay spike
 OPTIONS_COVERED_CALL_DELTA  = float(os.getenv("OPTIONS_COVERED_CALL_DELTA", "0.25")) # sell OTM calls ~0.25 delta
 OPTIONS_MIN_SIGNAL_CONFIDENCE = float(os.getenv("OPTIONS_MIN_SIGNAL_CONFIDENCE", "0.82"))  # sniper threshold — only highest-probability setups
+# 2026-08-24, user request: options scan moved off the equity scan_and_trade()
+# cycle onto its own thread (_start_options_scan_thread) so it stops blocking
+# equity re-entries. This is that thread's own cadence -- doesn't need to be
+# 1 min like equity, options positions are held far longer than a swing.
+OPTIONS_SCAN_INTERVAL_MIN   = int(os.getenv("OPTIONS_SCAN_INTERVAL_MIN", "3"))
 OPTIONS_MIN_STOCK_PRICE     = float(os.getenv("OPTIONS_MIN_STOCK_PRICE", "8.0"))   # sub-$8 stocks have wide spreads and thin option chains
 OPTIONS_MIN_MOVE_PCT        = float(os.getenv("OPTIONS_MIN_MOVE_PCT", "1.5"))      # min % daily move to qualify
 OPTIONS_MIN_RVOL            = float(os.getenv("OPTIONS_MIN_RVOL", "1.5"))          # min relative volume — need genuine conviction surge
 OPTIONS_MIN_ADV             = float(os.getenv("OPTIONS_MIN_ADV", "500_000"))     # min avg dollar volume — avoid thinly-traded names
 OPTIONS_UNIVERSE_OVERRIDE   = os.getenv("OPTIONS_UNIVERSE_OVERRIDE", "").strip()  # comma-separated tickers to force a smaller options universe
-OPTIONS_STOP_COOLDOWN_DAYS  = int(os.getenv("OPTIONS_STOP_COOLDOWN_DAYS", "2"))   # no re-entry within N days after a stop on same symbol
 OPTIONS_EARNINGS_AVOID_DAYS = int(os.getenv("OPTIONS_EARNINGS_AVOID_DAYS", "15")) # skip entries if earnings within N calendar days
 OPTIONS_TRAIL_ACTIVATE_PCT  = float(os.getenv("OPTIONS_TRAIL_ACTIVATE_PCT", "20.0"))  # trailing stop arms once P&L exceeds this %
 OPTIONS_TRAIL_DRAWDOWN_PCT  = float(os.getenv("OPTIONS_TRAIL_DRAWDOWN_PCT", "15.0"))  # close if pnl drops this many pp from peak
@@ -553,14 +557,17 @@ KILL_MODE_TRAIL_PCT    =  0.5   # PDT-safe hairpin trailing stop % placed on tod
 # Market Hours Tuning
 USE_MARKET_HOURS_TUNING    = True
 PREMARKET_SCAN_INTERVAL    = 10
-REGULAR_HOURS_SCAN_INTERVAL = 3
+# 2026-08-24, user request: regular-hours discovery scan every 1 min (was 3) --
+# so a position that exits gets a re-entry shot within the same minute
+# instead of waiting up to 3-5 min, to actually catch a swing back in.
+REGULAR_HOURS_SCAN_INTERVAL = 1
 AFTERHOURS_SCAN_INTERVAL   = 10
 
 # Position-Based Adaptive Scanning
 USE_POSITION_TUNING      = True
-HIGH_POSITION_INTERVAL   = 5    # was 10 — check more frequently when holding many positions
-NORMAL_POSITION_INTERVAL = 3    # was 5
-LOW_POSITION_INTERVAL    = 2    # was 3
+HIGH_POSITION_INTERVAL   = 1    # was 5 (2026-08-24, user request: every-minute rescan regardless of position count)
+NORMAL_POSITION_INTERVAL = 1    # was 3
+LOW_POSITION_INTERVAL    = 1    # was 2
 
 # ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 # VIX Rate-of-Change Filter
@@ -863,15 +870,9 @@ NO_GAIN_EXIT_MAX_LOSS_PCT = -1.5  # loss at or below this also exits (new — wa
 # ─────────────────────────────────────────────────────────────────
 AFTERHOURS_STOP_CHECK_ENABLED = True
 AFTERHOURS_CHASE_STALE_SECONDS = 45  # re-chase (cancel + resubmit at fresh price) if the close sits unfilled this long
-AFTERHOURS_STOP_COOLDOWN_MIN = 1440  # Block re-entry (long or short) for 24h after ANY loss exit (was 60 = 1h)
-                                    # (after-hours software backstop or a normal GTC fill — see
-                                    # detect_stopped_out_positions in enhanced.py). Short on purpose:
-                                    # long enough to break an immediate whipsaw off frozen/stale data
-                                    # (now separately guarded — see get_bars' yfinance staleness check),
-                                    # short enough that a genuinely new signal an hour later still gets through.
-                                     # After-hours momentum signals are often computed off a frozen daily bar (see
-                                     # BIOA 2026-07-31: same stale "buy" signal re-fired every cycle overnight,
-                                     # re-entering right after each stop-out into the next leg down).
+# 2026-08-24, user request: no post-loss re-entry cooldown anymore (was 1440min /
+# 24h here). Protection is the exit stack alone -- trailing stop, per-minute
+# check_ema15_exit, standalone stop-loss.
 
 # Stale order upgrade: unfilled orders older than this get re-submitted as market/limit
 STALE_ORDER_MINUTES          = 360  # minutes before an unfilled order is considered stale
@@ -921,7 +922,12 @@ LONG_ONLY_MODE        = False  # False = allow shorts (paper); True = long-only 
 MIN_SIGNAL_CONFIDENCE = 0.72   # Execute signals with confidence >= this (lowered from 0.78 for bear regime coverage)
 MIN_SHORT_CONFIDENCE_BEAR = 0.65  # In bear regime, allow Technical short setups at current confidence scale
 SHORT_FAIL_COOLDOWN_MIN = 5    # Re-try failed short symbols immediately
-MAX_SIGNALS_PER_CYCLE = 3      # Execute at most this many signals per scan cycle
+# 2026-08-24, user request ("top 15 list not top 4/5"): was 3 -- matches
+# TOP_N_SIGNALS now so the execution cap isn't quietly narrower than the
+# ranked watchlist it's drawn from. Still bounded above by MAX_POSITIONS (12
+# total open at once) and each attempt still has to individually pass
+# _validate_trade -- this only raises how many the cycle is willing to TRY.
+MAX_SIGNALS_PER_CYCLE = 15     # Execute at most this many signals per scan cycle
 
 # Per-symbol HMM regime alignment: confidence bonus (not a gate) when a
 # signal's direction agrees with the symbol's own 2-state Gaussian HMM regime,
