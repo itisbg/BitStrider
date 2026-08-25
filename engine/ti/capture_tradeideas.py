@@ -1086,9 +1086,17 @@ def _ensure_logged_in(driver) -> bool:
     one, every login form does, so it needs no TI-specific markup to find.
     The email/username field is guessed from common attribute patterns since
     it's not as uniform -- falls back to the only text input on the page if
-    nothing more specific matches."""
+    nothing more specific matches.
+
+    2026-08-24 (same day, caught by actually running it live): the first
+    version took find_elements()[0] unconditionally and hit
+    ElementNotInteractableException on every field -- a CSS match doesn't
+    mean the element is the VISIBLE one; the page has other hidden/
+    off-screen inputs matching the same broad selectors (a decoy field,
+    a collapsed alternate form, etc.) that matched first. Now filters to
+    is_displayed() and takes the first genuinely visible match."""
     try:
-        pw_fields = driver.find_elements(By.CSS_SELECTOR, "input[type='password']")
+        pw_fields = [e for e in driver.find_elements(By.CSS_SELECTOR, "input[type='password']") if e.is_displayed()]
     except Exception:
         pw_fields = []
     if not pw_fields:
@@ -1104,14 +1112,16 @@ def _ensure_logged_in(driver) -> bool:
         email_field = None
         for sel in ("input[type='email']", "input[name*='email' i]", "input[id*='email' i]",
                     "input[name*='user' i]", "input[id*='user' i]", "input[type='text']"):
-            found = driver.find_elements(By.CSS_SELECTOR, sel)
+            found = [e for e in driver.find_elements(By.CSS_SELECTOR, sel) if e.is_displayed()]
             if found:
                 email_field = found[0]
                 break
         if email_field is not None:
+            email_field.click()
             email_field.clear()
             email_field.send_keys(TI_EMAIL)
 
+        pw_fields[0].click()
         pw_fields[0].clear()
         pw_fields[0].send_keys(TI_PASSWORD)
         pw_fields[0].send_keys(Keys.RETURN)  # submit via Enter -- no site-specific button markup needed

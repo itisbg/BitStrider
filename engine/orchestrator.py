@@ -988,12 +988,16 @@ def _start_software_stop_thread(ctx: AppContext) -> None:
                     ctx.executor.check_ema15_exit()
                 except Exception as e:
                     log.error(f"[STOP-THREAD] check_ema15_exit error: {e}", exc_info=True)
+                try:
+                    ctx.executor.check_pending_entries_ema()
+                except Exception as e:
+                    log.error(f"[STOP-THREAD] check_pending_entries_ema error: {e}", exc_info=True)
                 last_ema15 = time.time()
             time.sleep(10)
 
     t = threading.Thread(target=_loop, name="SoftwareStopPoller", daemon=True)
     t.start()
-    log.info("[STOP-THREAD] Software-stop fast-poll thread started (10s interval, EMA15 exit every 1 min)")
+    log.info("[STOP-THREAD] Software-stop fast-poll thread started (10s interval, EMA15 exit + pending-entry EMA re-check every 1 min)")
 
 
 def _start_options_scan_thread(ctx: AppContext) -> None:

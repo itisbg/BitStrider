@@ -2,11 +2,14 @@
 and close_guardrail_fail_positions act on, if run right now?
 
 Never submits an order or cancels anything -- reuses the exact same
-selection logic those two live functions use (EOD_CLOSE_STRATEGIES
-membership for the former, EnhancedExecutor._guardrail_fail_reason for the
-latter) against real current positions/orders, but only prints. Ignores
-both functions' own time-of-day gate, since the point is to preview the
-decision, not to check whether it's currently their scheduled window.
+selection logic those two live functions use (same-day entry only for the
+former -- 2026-08-24, user request: "I wouldn't expect any positions to
+stay active at 3:50pm ET", dropped the EOD_CLOSE_STRATEGIES allow-list
+gate that used to also apply here; EnhancedExecutor._guardrail_fail_reason
+for the latter) against real current positions/orders, but only prints.
+Ignores both functions' own time-of-day gate, since the point is to
+preview the decision, not to check whether it's currently their scheduled
+window.
 
 Run with:
   python scripts/dry_run_eod_guardrail_check.py
@@ -24,7 +27,6 @@ load_dotenv(ROOT / ".env")  # main.py loads this the same way before touching en
 
 import datetime
 from engine.orchestrator import _build_context
-from engine.config import EOD_CLOSE_STRATEGIES
 from engine.utils.bars import get_daily_volume_bars
 from engine.equity.strategies import _get_float_shares, _get_market_cap
 
@@ -51,9 +53,9 @@ for pos in positions:
     if qty == 0:
         continue
 
-    # --- close_eod_positions criteria ---
+    # --- close_eod_positions criteria: any same-day entry, any strategy ---
     entry_info = ctx.executor._entry_log.get(sym)
-    if entry_info and entry_info.get("date") == today and entry_info.get("strategy") in EOD_CLOSE_STRATEGIES:
+    if entry_info and entry_info.get("date") == today:
         eod_would_close.append((sym, entry_info.get("strategy")))
 
     # --- close_guardrail_fail_positions criteria ---

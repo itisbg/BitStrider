@@ -1,23 +1,15 @@
 {
-  "generated_at": "2026-08-24T10:39:47-04:00",
+  "generated_at": "2026-08-24T15:47:22-04:00",
   "date": "2026-08-24",
   "market_regime": "bull",
   "picks": [
     {
-      "symbol": "SDOT",
+      "symbol": "CORZ",
       "action": "buy",
-      "price": 27.45,
-      "confidence": 0.9,
-      "strategy": "TrendBreaker",
-      "reason": "Trend break above 20SMA + 10d high | vol x10.5 | RSI 77"
-    },
-    {
-      "symbol": "NBIL",
-      "action": "buy",
-      "price": 21.31,
-      "confidence": 0.7793,
-      "strategy": "VWAPReclaim",
-      "reason": "VWAP reclaim $20.89 | vol x2.1 | RSI 66"
+      "price": 17.305,
+      "confidence": 0.839,
+      "strategy": "LiquiditySweep",
+      "reason": "Liquidity sweep: swept low $17.25, BOS above $17.29, vol x3.0"
     }
   ]
 }
