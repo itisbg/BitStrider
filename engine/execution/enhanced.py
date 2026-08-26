@@ -47,8 +47,8 @@ from engine.config import (
     PRICE_DRIFT_STOP_ENABLED, PRICE_DRIFT_STOP_PCT,
     PRICE_DRIFT_CHECK_INTERVAL_MIN, PRICE_DRIFT_LOOKBACK_MIN,
     TRAIL_STOP_PCT, PROFIT_TRAIL_GIVEBACK_PCT,
-    STAGNANT_STOP_ENABLED, STAGNANT_STOP_CHECK_INTERVAL_MIN, EMA15_EXIT_MIN_BARS, EMA15_EXIT_DELTA_PCT, EMA15_TREND_DROP_PCT, EMA15_BREAKDOWN_PCT, EMA15_RECLAIM_PCT,
-    EMA_TREND_FILTER_ENABLED, EMA_TREND_MIN_BARS,
+    STAGNANT_STOP_ENABLED, STAGNANT_STOP_CHECK_INTERVAL_MIN, ENTRY_WINDOW_END_ET,
+    EMA_TREND_FILTER_ENABLED, EMA_TREND_MIN_BARS, EMA9_TRAIL_PCT,
     SWING_DRIFT_STOP_ENABLED, SWING_DRIFT_STOP_PCT,
     MIN_AVG_DAILY_VOLUME_REGULAR_HOURS, MIN_FLOAT_SHARES, MIN_MARKET_CAP,
     SWING_STALE_EXIT_ENABLED, SWING_STALE_DAYS, SWING_STALE_MIN_GAIN_PCT,
@@ -150,10 +150,26 @@ def _check_ema_trend_alignment(signal: Signal, is_long: bool) -> Tuple[bool, Opt
     through -- but all 4 turned out to be losers under both exit versions,
     so EMA7 blocking them was correct, not a problem). Verified: with the
     current exit logic, EMA7 beats EMA9 on today's 13 real entries
-    (-$3.94 vs -$9.79) -- switched back to EMA7. Paired with the
-    entry-anchored EMA15 delta exit (see check_ema15_exit) so an entry
-    that's still below its EMA15 isn't rejected outright here -- it's
-    instead watched post-entry for whether the gap keeps widening.
+    (-$3.94 vs -$9.79) -- switched back to EMA7. (The EMA15-based exit this
+    was originally paired with, check_ema15_exit, was removed 2026-08-25 --
+    see check_ema9_exit for the current exit-side check.)
+
+    2026-08-25, user request: "check ema 7 delta and ema 3 delta both
+    positive for entry long (opposite for short)" -- EMA7's slope alone
+    used to be enough; EMA3 (faster, noisier) had to agree too for a
+    while, then dropped ("remove ema3 delta positive") once EMA7's slope
+    was paired with the crossover condition below -- the two together
+    (velocity + position) covered the same ground EMA3 was added for,
+    without a third moving average's own noise added on top.
+
+    2026-08-25, user request: "add one more condition of ema 7 above ema
+    15 for entry long order and vice versa for short" -- a structural
+    condition alongside EMA7's slope: EMA7 must sit on the right side of
+    EMA15 -- above it for a long, below it for a short. The slope check
+    only looks at velocity (is the average still moving the right way
+    this minute); this adds position (is the fast average actually
+    leading the slow one), the classic fast-over-slow crossover reading
+    of "in an uptrend." Both conditions must hold together.
 
     Fail-open on missing/insufficient bar data (fewer than
     EMA_TREND_MIN_BARS of 1-min history) -- same philosophy as
@@ -165,14 +181,19 @@ def _check_ema_trend_alignment(signal: Signal, is_long: bool) -> Tuple[bool, Opt
     bars = get_bars(signal.symbol, period="1d", interval="1m")
     if bars.empty or "close" not in bars.columns or len(bars) < EMA_TREND_MIN_BARS:
         return True, None
-    ema7  = bars["close"].ewm(span=7, adjust=False).mean()
-    slope = float(ema7.iloc[-1] - ema7.iloc[-2])  # this minute's EMA7 vs last minute's
-    aligned = (slope > 0) if is_long else (slope < 0)
-    if not aligned:
+    closes     = bars["close"]
+    ema7       = closes.ewm(span=7, adjust=False).mean()
+    ema7_delta = float(ema7.diff().iloc[-1])
+    ema7_now   = float(ema7.iloc[-1])
+    ema15_now  = float(closes.ewm(span=15, adjust=False).mean().iloc[-1])
+    slope_aligned = (ema7_delta > 0) if is_long else (ema7_delta < 0)
+    crossover_aligned = (ema7_now > ema15_now) if is_long else (ema7_now < ema15_now)
+    if not (slope_aligned and crossover_aligned):
         return False, (
-            f"{signal.symbol}: 1-min EMA7 slope {slope:+.4f} "
-            f"({'not rising' if is_long else 'not falling'}) — trend not aligned with the "
-            f"{'long' if is_long else 'short'} entry"
+            f"{signal.symbol}: EMA7 delta {ema7_delta:+.4f} / "
+            f"EMA7 ${ema7_now:.2f} vs EMA15 ${ema15_now:.2f} "
+            f"(need {'rising delta + EMA7 above EMA15' if is_long else 'falling delta + EMA7 below EMA15'}) "
+            f"— trend not aligned with the {'long' if is_long else 'short'} entry"
         )
     return True, None
 
@@ -373,75 +394,90 @@ def _demo() -> None:
     assert r == (round(above * PROFIT_TRAIL_GIVEBACK_PCT / 100.0, 2), "PROFIT"), r
     print("_trail_pct_for: all checks passed")
 
-    # _ema15_exit_reason: entry-anchored (price-EMA15) delta check, exits
-    # once it's worsened by EMA15_EXIT_DELTA_PCT% of ema15 vs. its
-    # entry-time value -- not on any single cross of EMA15 itself.
-    # 2026-08-24, user request (supersedes the old zero-buffer cross check).
-    reason = EnhancedExecutor._ema15_exit_reason
-    # entry delta -5 (entered at 10, ema15 15, user's own worked example);
-    # threshold at EMA15_EXIT_DELTA_PCT% of 15.
-    threshold = EMA15_EXIT_DELTA_PCT / 100.0 * 15.0
-    assert reason(10.00, 15.00, -5.0, True) is None, "delta unchanged from entry -> no exit"
-    assert reason(10.00 + threshold / 2, 15.00, -5.0, True) is None, "delta improved -> no exit"
-    assert reason(10.00 - threshold - 0.01, 15.00, -5.0, True) is not None, "delta worsened past threshold -> exit"
-    assert reason(10.00 - threshold + 0.01, 15.00, -5.0, True) is None, "delta worsened but still under threshold -> no exit"
-    # short: entry delta +5 (entered at 20, ema15 15) -- adverse direction is delta growing MORE positive
-    assert reason(20.00, 15.00, 5.0, False) is None, "delta unchanged from entry (short) -> no exit"
-    assert reason(20.00 + threshold + 0.01, 15.00, 5.0, False) is not None, "delta worsened past threshold (short) -> exit"
-    print("_ema15_exit_reason: all checks passed")
+    # _update_ema9_peak: tracks the running peak (long) / trough (short) of
+    # EMA9 since entry -- the reference check_ema9_exit trails against
+    # (2026-08-25, user request: "get a ema 9 trail stop of 0.3%").
+    update_peak = EnhancedExecutor._update_ema9_peak
+    p: Dict[str, float] = {}
+    assert update_peak(p, "X", 10.0, True) == 10.0, "first observation becomes the initial peak"
+    assert update_peak(p, "X", 10.5, True) == 10.5, "new high -> peak ratchets up"
+    assert update_peak(p, "X", 10.2, True) == 10.5, "pullback -> peak holds, doesn't fall back"
+    assert update_peak(p, "X", 10.8, True) == 10.8, "new high again -> peak ratchets further"
+    # short: trough moves DOWN, never back up
+    assert update_peak(p, "Y", 20.0, False) == 20.0, "first observation becomes the initial trough (short)"
+    assert update_peak(p, "Y", 19.5, False) == 19.5, "new low -> trough ratchets down (short)"
+    assert update_peak(p, "Y", 19.8, False) == 19.5, "bounce -> trough holds (short)"
+    print("_update_ema9_peak: all checks passed")
 
-    # _ema15_trend_drop_reason: second, independent check -- EMA15 itself
-    # vs. its own entry-time value, not price vs. EMA15. 2026-08-24, user
-    # request (closes the slow-bleed blind spot _ema15_exit_reason has).
-    trend_reason = EnhancedExecutor._ema15_trend_drop_reason
-    entry_ema15 = 15.00
-    trend_threshold = EMA15_TREND_DROP_PCT / 100.0 * entry_ema15
-    assert trend_reason(entry_ema15, entry_ema15, True) is None, "EMA15 unchanged from entry -> no exit"
-    assert trend_reason(entry_ema15 - trend_threshold / 2, entry_ema15, True) is None, "EMA15 dipped but under threshold -> no exit"
-    assert trend_reason(entry_ema15 - trend_threshold - 0.01, entry_ema15, True) is not None, "EMA15 fell past threshold -> exit"
-    assert trend_reason(entry_ema15 + 1.0, entry_ema15, True) is None, "EMA15 rose (favorable for a long) -> no exit"
-    # short: adverse direction is EMA15 rising
-    assert trend_reason(entry_ema15 + trend_threshold + 0.01, entry_ema15, False) is not None, "EMA15 rose past threshold (short) -> exit"
-    assert trend_reason(entry_ema15 - 1.0, entry_ema15, False) is None, "EMA15 fell (favorable for a short) -> no exit"
-    print("_ema15_trend_drop_reason: all checks passed")
+    # _ema9_trail_exit_reason: exit once EMA9 has pulled back
+    # EMA9_TRAIL_PCT% from its own peak/trough since entry -- a trailing
+    # stop on EMA9, not a snapshot vs. the previous minute.
+    trail_reason = EnhancedExecutor._ema9_trail_exit_reason
+    peak = 10.00
+    trail_threshold = EMA9_TRAIL_PCT / 100.0 * peak
+    assert trail_reason(peak, peak, True) is None, "at the peak -> no exit"
+    assert trail_reason(peak - trail_threshold / 2, peak, True) is None, "pulled back but under the trail% -> no exit"
+    assert trail_reason(peak - trail_threshold - 0.0001, peak, True) is not None, "pulled back past the trail% -> exit"
+    assert trail_reason(peak + 1.0, peak, True) is None, "new high (favorable) -> no exit"
+    # short: adverse direction is EMA9 rising back past trough + trail%
+    trough = 20.00
+    trough_threshold = EMA9_TRAIL_PCT / 100.0 * trough
+    assert trail_reason(trough, trough, False) is None, "at the trough (short) -> no exit"
+    assert trail_reason(trough + trough_threshold + 0.0001, trough, False) is not None, "rose past the trail% off the trough (short) -> exit"
+    assert trail_reason(trough - 1.0, trough, False) is None, "new low (favorable, short) -> no exit"
+    print("_ema9_trail_exit_reason: all checks passed")
 
-    # _ema15_breakdown_reason: single rule used for a favorable-side entry
-    # (long: entered at/above EMA15; short: at/below) -- exit once price
-    # breaks the CURRENT EMA15 by more than EMA15_BREAKDOWN_PCT%, not
-    # anchored to entry at all. 2026-08-24, user request.
-    breakdown_reason = EnhancedExecutor._ema15_breakdown_reason
-    ema15 = 15.00
-    breakdown_threshold = EMA15_BREAKDOWN_PCT / 100.0 * ema15
-    assert breakdown_reason(ema15, ema15, True) is None, "close at EMA15 -> no exit (strict below only)"
-    assert breakdown_reason(ema15 - breakdown_threshold + 0.001, ema15, True) is None, "close under EMA15 but within buffer -> no exit"
-    assert breakdown_reason(ema15 - breakdown_threshold - 0.01, ema15, True) is not None, "close broke past the buffer -> exit"
-    # short: adverse direction is a close ABOVE EMA15 + buffer
-    assert breakdown_reason(ema15 + breakdown_threshold - 0.001, ema15, False) is None, "close over EMA15 but within buffer (short) -> no exit"
-    assert breakdown_reason(ema15 + breakdown_threshold + 0.01, ema15, False) is not None, "close broke past the buffer (short) -> exit"
-    print("_ema15_breakdown_reason: all checks passed")
-
-    # _check_ema_trend_alignment: EMA7's own slope (this minute vs last)
-    # must confirm the trade direction, fail-open on missing/insufficient
-    # data. 2026-08-22, user request; EMA9 -> EMA7 2026-08-24 (see the
-    # function's own docstring for the revert-then-revert-back).
+    # _check_ema_trend_alignment: EMA7 delta must confirm the trade
+    # direction AND EMA7 must sit on the right side of EMA15, fail-open on
+    # missing/insufficient data. 2026-08-22, user request; EMA9 -> EMA7
+    # 2026-08-24; EMA3 added alongside EMA7 2026-08-25, then removed
+    # 2026-08-25 ("remove ema3 delta positive"); EMA7-vs-EMA15 crossover
+    # added 2026-08-25 (see the function's own docstring).
     import pandas as _pd
     _orig_get_bars = get_bars
     _sig_stub = Signal("TEST", "buy", 10.0, 0.9, "test", "TestStrat")
-    globals()["get_bars"] = lambda symbol, period, interval: _pd.DataFrame({"close": list(range(1, 40))})  # rising -> EMA7 slope positive
+    globals()["get_bars"] = lambda symbol, period, interval: _pd.DataFrame({"close": list(range(1, 40))})  # rising -> EMA7 delta positive, EMA7 above EMA15
     ok, reason = _check_ema_trend_alignment(_sig_stub, is_long=True)
-    assert ok is True and reason is None, "rising EMA7 must align with a long"
+    assert ok is True and reason is None, "rising EMA7 + EMA7>EMA15 must align with a long"
     ok, reason = _check_ema_trend_alignment(_sig_stub, is_long=False)
     assert ok is False and reason is not None, "rising EMA7 must reject a short"
-    globals()["get_bars"] = lambda symbol, period, interval: _pd.DataFrame({"close": list(range(40, 1, -1))})  # falling -> EMA7 slope negative
+    globals()["get_bars"] = lambda symbol, period, interval: _pd.DataFrame({"close": list(range(40, 1, -1))})  # falling -> EMA7 delta negative, EMA7 below EMA15
     ok, reason = _check_ema_trend_alignment(_sig_stub, is_long=False)
-    assert ok is True and reason is None, "falling EMA7 must align with a short"
+    assert ok is True and reason is None, "falling EMA7 + EMA7<EMA15 must align with a short"
     ok, reason = _check_ema_trend_alignment(_sig_stub, is_long=True)
     assert ok is False and reason is not None, "falling EMA7 must reject a long"
+    # crossover: a long decline that just turned up -- EMA7's delta is
+    # freshly positive, but EMA7 hasn't caught up past the still-elevated,
+    # slower-reacting EMA15 yet. Proves the crossover condition does real
+    # work beyond the slope check alone (which would pass this on its own).
+    globals()["get_bars"] = lambda symbol, period, interval: _pd.DataFrame({"close": list(range(50, 10, -1)) + [11, 12, 13, 14, 15]})
+    ok, reason = _check_ema_trend_alignment(_sig_stub, is_long=True)
+    assert ok is False and reason is not None, "rising EMA7 delta but EMA7 still below EMA15 must reject a long"
+    # mirror: a long rally that just turned down -- EMA7's delta freshly
+    # negative, EMA7 hasn't dropped below the still-elevated EMA15 for a short.
+    globals()["get_bars"] = lambda symbol, period, interval: _pd.DataFrame({"close": list(range(10, 50)) + [49, 48, 47, 46, 45]})
+    ok, reason = _check_ema_trend_alignment(_sig_stub, is_long=False)
+    assert ok is False and reason is not None, "falling EMA7 delta but EMA7 still above EMA15 must reject a short"
     globals()["get_bars"] = lambda symbol, period, interval: _pd.DataFrame()
     ok, reason = _check_ema_trend_alignment(_sig_stub, is_long=True)
     assert ok is True and reason is None, "empty bars must fail open, never block"
     globals()["get_bars"] = _orig_get_bars
     print("_check_ema_trend_alignment: all checks passed")
+
+    # _blocked_entry_action: check_blocked_entries_ema's per-poll decision
+    # -- fire once the gate agrees, expire once the entry window's closed
+    # or the symbol's fallen out of the TI universe, otherwise keep
+    # waiting indefinitely ("no expire" -- no staleness timer anymore).
+    # 2026-08-25, user request chain (see the function's own docstring).
+    action = EnhancedExecutor._blocked_entry_action
+    assert action(gate_ok=False, past_window=False, in_universe=True) == "wait", "just queued, gate still failing -> wait"
+    assert action(gate_ok=False, past_window=False, in_universe=True) == "wait", "still waiting an hour later is fine too -- no staleness timer"
+    assert action(gate_ok=True, past_window=False, in_universe=True) == "fire", "gate agrees -> fire"
+    assert action(gate_ok=False, past_window=True, in_universe=True) == "expire", "past the entry window -> expire regardless of the gate"
+    assert action(gate_ok=True, past_window=True, in_universe=True) == "expire", "past the entry window -> expire even if the gate happens to agree (window is absolute)"
+    assert action(gate_ok=False, past_window=False, in_universe=False) == "expire", "dropped out of the TI universe -> expire even with time left in the window"
+    assert action(gate_ok=True, past_window=False, in_universe=False) == "expire", "dropped out of the TI universe -> expire even if the gate happens to agree"
+    print("_blocked_entry_action: all checks passed")
 
     # _entries_today_count: needs only the two bare attrs, no live client --
     # build a stub rather than a full EnhancedExecutor().
@@ -549,21 +585,12 @@ class EnhancedExecutor:
         self._swap_cycle_closed: set = set()     # positions already swapped this scan cycle
         self._ratchet_done: set = set()          # symbols whose stop was already confidence-tightened
         self._tp_targets: Dict[str, float] = {} # {symbol: take-profit price} for ATR-based TP tracking
-        # {symbol: (entry_price - ema15) captured at entry submission} — the
-        # reference check_ema15_exit() compares against every 1-min poll.
-        # 2026-08-24, user request. Cleared on close in detect_stopped_out_positions.
-        self._entry_ema15_delta: Dict[str, float] = {}
-        # {symbol: raw ema15 value captured at entry submission} — separate
-        # reference for the EMA15-trend-itself check (_ema15_trend_drop_reason),
-        # independent of the delta above. 2026-08-24, user request. Cleared
-        # alongside _entry_ema15_delta in detect_stopped_out_positions.
-        self._entry_ema15: Dict[str, float] = {}
-        # {symbols that entered BELOW their own EMA15 and have since
-        # reclaimed it by EMA15_RECLAIM_PCT% -- permanently switched to the
-        # breakdown rule (_ema15_breakdown_reason) from then on, same as a
-        # favorable-side entry. 2026-08-24, user request. One-way: never
-        # removed except on close. Cleared in detect_stopped_out_positions.
-        self._reclaimed_ema15: set = set()
+        # {symbol: running peak (long) / trough (short) of EMA9 since
+        # entry} -- 2026-08-25, user request ("get a ema 9 trail stop of
+        # 0.3%"): the reference check_ema9_exit trails against. See
+        # _update_ema9_peak. Cleared on close in
+        # detect_stopped_out_positions.
+        self._ema9_trail_peak: Dict[str, float] = {}
         self._pdt_stop_blocked: Dict[str, float] = {}  # {symbol: stop_price} — broker-rejected stops; monitored in software
         self._last_known_positions: Dict[str, dict] = {}  # {symbol: {entry_price, last_price, is_long}} — snapshot used to notice a position disappearing between polls
         self._afterhours_chase_count: Dict[str, int] = {}  # {symbol: consecutive re-chase attempts} — widens slip each retry so a fast-falling after-hours book actually fills
@@ -578,6 +605,22 @@ class EnhancedExecutor:
         # {symbol: {"order_id": str, "qty": int, "is_long": bool, "chase_count": int}}
         # — resting entry orders not yet confirmed filled; swept by _sweep_pending_entries
         self._entry_pending: Dict[str, dict] = {}
+        # {symbol: {"signal": Signal, "order_type": OrderType, "queued_at": datetime}}
+        # -- a signal that was blocked ONLY by _check_ema_trend_alignment,
+        # held for a fresh retry instead of being discarded. 2026-08-25,
+        # user request: "each blocked trade should wait for next minute
+        # recheck not to completely discard the order." Swept every minute
+        # by check_blocked_entries_ema; one slot per symbol, latest signal
+        # wins if a symbol gets blocked again before the first one resolves.
+        self._ema_blocked_entries: Dict[str, dict] = {}
+        # {symbol: {"signal": Signal, "order_type": OrderType}} -- the
+        # signal/order_type behind a still-resting order in order_cache,
+        # kept so check_pending_entries_ema can requeue it into
+        # _ema_blocked_entries (instead of just discarding it) if it has
+        # to cancel the order because the gate turned against it. Same
+        # 2026-08-25 request as above -- "so every minute order is
+        # cancelled to place a new in next minute" once conditions realign.
+        self._pending_entry_signals: Dict[str, dict] = {}
         self._stale_exit_done: object = None  # date of last completed swing stale-exit check
         # {symbol: count} — how many times a symbol has been entered today, reset
         # on a date rollover (_entries_today_date). 2026-08-18, user request: a
@@ -983,7 +1026,7 @@ class EnhancedExecutor:
         # every entry (cooldown or not) already goes through the trailing-buy
         # path (_create_bracket_order), which can't fill mid-fall the way a
         # marketable chase could. Protection against a re-firing signal is
-        # the exit stack alone now: the trailing stop, check_ema15_exit
+        # the exit stack alone now: the trailing stop, check_ema9_exit
         # (per-minute), and the standalone software stop-loss. See SOXS
         # (2026-08-05, 22 trades/-$605 net re-firing the same losing signal)
         # for why that stack matters if this gets revisited.
@@ -1004,6 +1047,20 @@ class EnhancedExecutor:
         # _check_ema_trend_alignment for the reasoning.
         trend_ok, trend_reason = _check_ema_trend_alignment(signal, order_type == OrderType.LONG)
         if not trend_ok:
+            # 2026-08-25, user request: "each blocked trade should wait for
+            # next minute recheck not to completely discard the order" ->
+            # "the trade idea should check for every minute conditions to
+            # see when the new condition is met to reenter than completely
+            # discard a trade signal" -- a signal blocked ONLY by this EMA
+            # gate (not PDT/buying-power/short-restriction/etc., which
+            # aren't "wait for the trend" situations) gets queued instead
+            # of just discarded. check_blocked_entries_ema re-checks it
+            # every minute and fires _execute_entry fresh the moment the
+            # gate agrees, same as any other entry -- see that method.
+            self._ema_blocked_entries[signal.symbol] = {
+                "signal": signal, "order_type": order_type,
+                "queued_at": datetime.datetime.now(datetime.timezone.utc),
+            }
             return False, trend_reason
 
         # Asset tradability check: skip halted or suspended symbols
@@ -1301,7 +1358,7 @@ class EnhancedExecutor:
         PFSA incident this originally covered): REENTRY_TRAIL_PCT in
         config.py. See _validate_trade's docstring -- as of 2026-08-24 there's
         no post-loss cooldown left at all, just this trailing-buy entry plus
-        the trailing stop / check_ema15_exit / standalone stop-loss exit stack."""
+        the trailing stop / check_ema9_exit / standalone stop-loss exit stack."""
         side          = OrderSide.BUY  if order_type == OrderType.LONG else OrderSide.SELL
         stop_side     = OrderSide.SELL if order_type == OrderType.LONG else OrderSide.BUY
         trail_pct     = TRAIL_STOP_PCT  # flat -- see _trail_pct_for()
@@ -1321,20 +1378,7 @@ class EnhancedExecutor:
             )
             order = self.client.submit_order(entry_req)
             self.order_cache[signal.symbol] = order.id
-            # 2026-08-24, user request: capture (entry_price - ema15) now, as
-            # the reference check_ema15_exit() compares every 1-min poll
-            # against -- best-effort off signal.price (the resting trailing-
-            # buy above hasn't necessarily filled at this exact price yet,
-            # same approximation the rest of this bracket already uses for
-            # risk_info). Never blocks the entry itself on a bars fetch failure.
-            try:
-                _bars = get_bars(signal.symbol, period="1d", interval="1m")
-                if not _bars.empty and "close" in _bars.columns and len(_bars) >= EMA15_EXIT_MIN_BARS:
-                    _ema15 = float(_bars["close"].ewm(span=15, adjust=False).mean().iloc[-1])
-                    self._entry_ema15_delta[signal.symbol] = signal.price - _ema15
-                    self._entry_ema15[signal.symbol] = _ema15
-            except Exception as e:
-                log.debug(f"{signal.symbol}: entry EMA15 delta capture failed (non-fatal): {e}")
+            self._pending_entry_signals[signal.symbol] = {"signal": signal, "order_type": order_type}
             log.info(
                 f"{signal.symbol}: {'re-entry' if is_reentry else 'entry'} -- trailing "
                 f"{'BUY' if is_long_entry else 'SELL'} {REENTRY_TRAIL_PCT:.1f}% instead of chasing in"
@@ -1407,11 +1451,23 @@ class EnhancedExecutor:
 
     # ΓöÇΓöÇ Simple Order ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
     def _create_simple_order(self, signal: Signal, shares: int, order_type: OrderType) -> bool:
-        """Non-bracket entry path. Always a bounded limit off the live bid/ask
-        mid (see _marketable_limit_price/_live_quote_mid) -- regular hours
-        used to be a plain MarketOrderRequest with no price bound, same
-        NBIL-class risk _create_bracket_order had (see
-        MARKETABLE_LIMIT_BUFFER_PCT in config.py).
+        """Non-bracket entry path -- fires when _create_bracket_order's own
+        TrailingStopOrderRequest attempt raised (see its except block) or
+        outside regular hours. Used to submit a bounded marketable
+        LimitOrderRequest instead (see _marketable_limit_price/
+        _live_quote_mid); _entry_pending/_sweep_pending_entries then
+        re-chased it at a fresh price if it sat unfilled.
+
+        2026-08-25, user request: "all entry orders should be trail stop
+        orders" -- every entry submission is now a TrailingStopOrderRequest,
+        same as _create_bracket_order's (REENTRY_TRAIL_PCT, resting order
+        the broker adjusts itself). No _entry_pending registration needed
+        for the same reason _create_bracket_order's docstring gives: a
+        trailing order never needs re-chasing, so this bypasses
+        _sweep_pending_entries entirely too now.
+        ponytail: that leaves _entry_pending/_sweep_pending_entries with
+        nothing left to populate them (dead code, not deleted -- ask if you
+        want it cleaned up like check_ema15_exit was).
 
         2026-08-18, user request: entries never use extended hours -- EXTENDED_HOURS
         now only governs exit paths (a stop-loss must be able to fire outside
@@ -1423,28 +1479,23 @@ class EnhancedExecutor:
         action = "BUY"         if order_type == OrderType.LONG else "SHORT"
 
         try:
-            coid     = f"apex-{signal.strategy}-{signal.symbol}-{int(time.time())}"
-            extended = False
-            mid      = _live_quote_mid(self.client, signal.symbol, signal.price)
-            limit    = _marketable_limit_price(mid, is_long=(order_type == OrderType.LONG))
-            req = LimitOrderRequest(
+            coid = f"apex-{signal.strategy}-{signal.symbol}-{int(time.time())}"
+            req = TrailingStopOrderRequest(
                 symbol          = signal.symbol,
                 qty             = shares,
                 side            = side,
+                type            = AlpacaOrderType.TRAILING_STOP,
                 time_in_force   = TimeInForce.DAY,
-                limit_price     = limit,
-                extended_hours  = extended,
+                trail_percent   = REENTRY_TRAIL_PCT,
                 client_order_id = coid,
             )
             order = self.client.submit_order(req)
             self.order_cache[signal.symbol] = order.id
-            self._entry_pending[signal.symbol] = {
-                "order_id": str(order.id), "qty": shares,
-                "is_long": order_type == OrderType.LONG, "chase_count": 0,
-            }
+            self._pending_entry_signals[signal.symbol] = {"signal": signal, "order_type": order_type}
             log.info(
-                f"{action} {signal.symbol}: {shares} @ ${limit:.2f} submitted"
-                f"{' (ext-hours)' if extended else ''} | {signal.strategy}"
+                f"{action} {signal.symbol}: {shares} @ ${signal.price:.2f} -- trailing "
+                f"{'BUY' if order_type == OrderType.LONG else 'SELL'} {REENTRY_TRAIL_PCT:.1f}% "
+                f"instead of chasing in | {signal.strategy}"
             )
             return True
 
@@ -1995,7 +2046,7 @@ class EnhancedExecutor:
         2026-08-24, user request: this used to also arm a post-loss re-entry
         cooldown here (and in check_afterhours_stops()'s own close path) —
         removed. No cooldown left anywhere; the exit stack (trailing stop,
-        per-minute check_ema15_exit, standalone stop-loss) is the only
+        per-minute check_ema9_exit, standalone stop-loss) is the only
         protection now.
         """
         try:
@@ -2027,13 +2078,10 @@ class EnhancedExecutor:
             # ABCL ran +6.3% unrealized on a fresh entry after an earlier lot had
             # already ratcheted, and never got tightened).
             self._ratchet_done.discard(sym)
-            # 2026-08-24, user request: clear both entry-anchored EMA15
-            # references too -- a stale reference from the lot that just
-            # closed must never get compared against a later, differently-
-            # priced re-entry.
-            self._entry_ema15_delta.pop(sym, None)
-            self._entry_ema15.pop(sym, None)
-            self._reclaimed_ema15.discard(sym)
+            # A stale peak from the lot that just closed must never carry
+            # over and get trailed against by a later, differently-priced
+            # re-entry.
+            self._ema9_trail_peak.pop(sym, None)
 
         self._last_known_positions = current
 
@@ -2455,17 +2503,29 @@ class EnhancedExecutor:
             if entry_info.get("date") != today:
                 continue
 
+            side = OrderSide.SELL if qty > 0 else OrderSide.BUY
             try:
-                # Cancel only DAY-TIF orders holding shares for this symbol before
-                # submitting the market close ("insufficient qty available" error).
-                # GTC trailing stops are intentionally preserved — they protect the
-                # position until the close fill settles and should not be cancelled.
+                # Cancel EVERY resting order for this symbol, GTC trailing
+                # stops included, before submitting the market close.
+                #
+                # 2026-08-25: previously only DAY-TIF orders were cancelled
+                # here, on the reasoning that the GTC trailing stop
+                # "protects the position until the close fill settles."
+                # That reasoning was backwards and caused a live bug:
+                # the GTC stop reserves the shares (held_for_orders), so
+                # the close order the bot submits right after is REJECTED
+                # by the broker every single cycle with "insufficient qty
+                # available for order" -- the stop can't protect a sell
+                # that can never execute because the stop itself is
+                # blocking it. Confirmed live 2026-08-25: ABCL/EH/FUTG/
+                # INR/PRME/WLFC/WTI all failed to close every ~1 min from
+                # 14:51 ET onward and were still open hours into
+                # after-hours, unrealized gains never booked. Now cancels
+                # the GTC stop too -- if the close itself then fails for a
+                # different reason (see except below), a fresh GTC stop is
+                # re-armed so the position is never left fully naked.
                 try:
-                    sym_orders = [
-                        o for o in (self.client.get_orders() or [])
-                        if o.symbol == sym
-                        and getattr(o, "time_in_force", None) != TimeInForce.GTC
-                    ]
+                    sym_orders = [o for o in (self.client.get_orders() or []) if o.symbol == sym]
                     for _o in sym_orders:
                         try:
                             self.client.cancel_order_by_id(str(_o.id))
@@ -2476,7 +2536,6 @@ class EnhancedExecutor:
                 except Exception:
                     pass
 
-                side = OrderSide.SELL if qty > 0 else OrderSide.BUY
                 # 2026-08-18, user request: no force_extended_hours -- EOD closes
                 # never chase into after-hours anymore. Unfilled by the 16:00 close,
                 # this expires worthless and the position carries overnight under its
@@ -2501,6 +2560,19 @@ class EnhancedExecutor:
             except Exception as e:
                 failed_items.append({"symbol": sym, "error": str(e)})
                 log.error(f"EOD close failed {sym}: {e}")
+                # The GTC stop was just cancelled above -- re-arm a fallback
+                # so a close failure for some other reason doesn't leave the
+                # position unprotected overnight.
+                try:
+                    trail_pct, _ = _trail_pct_for(sym, float(pos.current_price), self._entry_log)
+                    self.client.submit_order(TrailingStopOrderRequest(
+                        symbol=sym, qty=abs(qty), side=side,
+                        type=AlpacaOrderType.TRAILING_STOP, time_in_force=TimeInForce.GTC,
+                        trail_percent=trail_pct,
+                    ))
+                    log.warning(f"close_eod_positions {sym}: re-armed GTC trailing stop after failed close")
+                except Exception as rearm_err:
+                    log.error(f"close_eod_positions {sym}: close failed AND GTC re-arm failed — position may be UNPROTECTED: {rearm_err}")
 
         summary = {
             "date": today.isoformat(),
@@ -3288,7 +3360,7 @@ class EnhancedExecutor:
         loss a restart causes.
 
         No re-entry cooldown (2026-08-24, user request) -- this drift stop,
-        the trailing stop, and check_ema15_exit are the whole protection
+        the trailing stop, and check_ema9_exit are the whole protection
         stack; nothing here throttles how soon a symbol re-enters."""
         if not PRICE_DRIFT_STOP_ENABLED:
             return
@@ -3404,132 +3476,93 @@ class EnhancedExecutor:
             self._price_drift_history.pop(sym, None)
 
     @staticmethod
-    def _ema15_exit_reason(close: float, ema15: float, entry_delta: float, is_long: bool) -> Optional[str]:
-        """Pure decision function for check_ema15_exit().
-
-        2026-08-24, user request: replaced the old zero-buffer "exit the
-        instant close crosses EMA15" check -- it fired on ordinary 1-min
-        noise (confirmed live: AZTA/SBET/VYX all oscillated within pennies
-        of their own EMA15 and got exited/re-entered repeatedly without
-        ever making a real move). Now entry-anchored: compare the CURRENT
-        (close - ema15) against its value AT ENTRY (entry_delta, captured
-        in _create_bracket_order) -- exit only once it's worsened by
-        EMA15_EXIT_DELTA_PCT% of ema15's value, not on any single cross.
-        Lets a position that entered already below its own EMA15 stay open
-        as long as it isn't getting WORSE relative to where it started.
-        Deliberately anchored to entry, not the best delta seen since --
-        that give-back protection is the trailing stop's job, this answers
-        "is this still deteriorating," not "give back some of the best case."
-        """
-        current_delta = close - ema15
-        threshold = EMA15_EXIT_DELTA_PCT / 100.0 * ema15
-        against = (current_delta <= entry_delta - threshold) if is_long else (current_delta >= entry_delta + threshold)
-        if not against:
-            return None
-        return (
-            f"1-min (price-EMA15) delta {current_delta:+.3f} vs entry {entry_delta:+.3f} "
-            f"(close ${close:.2f}, EMA15 ${ema15:.2f})"
-        )
+    def _update_ema9_peak(peak_map: Dict[str, float], sym: str, ema9_now: float, is_long: bool) -> float:
+        """Track the running peak of EMA9 since entry for a long (trough
+        for a short) -- the reference _ema9_trail_exit_reason trails
+        against, same role _trail_pct_for's peak-tracking plays for the
+        price-based TRAIL_STOP_PCT stop, just on EMA9 instead of raw
+        price. First observation for a symbol becomes the initial peak
+        (no guessing needed, same fail-open-to-first-reading philosophy
+        used everywhere else in this file -- a restart or a position with
+        no captured peak yet just starts fresh from here). Returns the
+        (possibly updated) peak so the caller doesn't need a second
+        lookup."""
+        prev = peak_map.get(sym)
+        new_peak = ema9_now if prev is None else (max(prev, ema9_now) if is_long else min(prev, ema9_now))
+        peak_map[sym] = new_peak
+        return new_peak
 
     @staticmethod
-    def _ema15_trend_drop_reason(ema15_now: float, ema15_entry: float, is_long: bool) -> Optional[str]:
-        """Pure decision function for check_ema15_exit()'s second, independent
-        check: has the EMA15 trend LINE ITSELF moved against the position by
-        EMA15_TREND_DROP_PCT% since entry -- not price vs. EMA15 (that's
-        _ema15_exit_reason's job), the trend line vs. its own earlier value.
+    def _ema9_trail_exit_reason(ema9_now: float, peak: float, is_long: bool) -> Optional[str]:
+        """Pure decision function for check_ema9_exit(): exit once EMA9 has
+        pulled back EMA9_TRAIL_PCT% from its own peak (long) / trough
+        (short) since entry -- a trailing stop ON EMA9, not a delta
+        snapshot against the previous minute.
 
-        2026-08-24, user request: closes the blind spot _ema15_exit_reason
-        has on a slow, steady bleed -- if price declines in step with its
-        own EMA15, (price - ema15) stays roughly flat even though the trend
-        has clearly turned (confirmed in backtest: MUZ drifted down all
-        session without ever tripping the delta check, because EMA15 was
-        drifting down right alongside price the whole way). This check
-        catches that directly, independent of where price sits relative to
-        EMA15 at any given instant. check_ema15_exit() exits if EITHER this
-        or _ema15_exit_reason fires -- they're deliberately separate checks
-        on separate signals, not merged into one condition."""
-        move_pct = (ema15_now - ema15_entry) / ema15_entry * 100.0
-        against = (move_pct <= -EMA15_TREND_DROP_PCT) if is_long else (move_pct >= EMA15_TREND_DROP_PCT)
+        2026-08-25, user request chain: "add exit condition ema 7 and ema 3
+        both negative for exit" -> EMA7 alone -> a delta-vs-0.3%-of-price
+        threshold -> "should only trigger is the stock trending down"
+        (price-vs-EMA9 added) -> "try options 2" (2-bar persistence) ->
+        switched from EMA7 to EMA9 -> "get a ema 9 trail stop of 0.3%
+        instead of just delta with 0.3% of price". Every version before
+        this one was a flat, memoryless snapshot -- no matter how it was
+        thresholded or persisted, it judged a trade only against its last
+        1-2 bars, never against how far it had already run. That's the
+        exact gap the JEM/SDOT/RZLV backtests kept surfacing: a real
+        pullback inside a real uptrend reads identically to a real top,
+        so a memoryless check cuts both the same way. Tracking EMA9's own
+        peak fixes that directly -- a trade that's run up 10% gets 0.3%
+        of real room to breathe measured from where it's BEEN, not from
+        one bar to the next."""
+        threshold = EMA9_TRAIL_PCT / 100.0 * peak
+        against = (ema9_now <= peak - threshold) if is_long else (ema9_now >= peak + threshold)
         if not against:
             return None
         return (
-            f"EMA15 itself moved {move_pct:+.2f}% since entry "
-            f"(${ema15_entry:.2f} -> ${ema15_now:.2f}) — trend turned against the position"
+            f"EMA9 ${ema9_now:.2f} pulled back {EMA9_TRAIL_PCT:.1f}% from its "
+            f"{'peak' if is_long else 'trough'} ${peak:.2f} since entry — trailing EMA9 stop hit"
         )
 
-    @staticmethod
-    def _ema15_breakdown_reason(close: float, ema15: float, is_long: bool) -> Optional[str]:
-        """Pure decision function for check_ema15_exit() -- the SINGLE rule
-        used instead of (_ema15_exit_reason + _ema15_trend_drop_reason) when
-        the position entered AT OR ABOVE its own EMA15 (entry_delta >= 0).
-
-        2026-08-24, user request: "the ema conditions I have currently in
-        place are for the price is normally below the ema15, before entry.
-        for price above ema15 at the entry consider only one rule exit if
-        the price below ema15 minus 0.5% of ema" (confirmed via follow-up:
-        0.5%, not the 5% the worked example implied). Not entry-anchored at
-        all -- a fresh line under wherever the CURRENT EMA15 sits, since an
-        above-EMA15 entry is already the stronger/more conventional setup
-        and doesn't need the below-EMA15 checks' entry-relative tolerance."""
-        threshold = EMA15_BREAKDOWN_PCT / 100.0 * ema15
-        against = (close < ema15 - threshold) if is_long else (close > ema15 + threshold)
-        if not against:
-            return None
-        level = ema15 - threshold if is_long else ema15 + threshold
-        return (
-            f"1-min close ${close:.2f} broke {'below' if is_long else 'above'} "
-            f"EMA15{'-' if is_long else '+'}{EMA15_BREAKDOWN_PCT:.1f}% (${level:.2f}, EMA15 ${ema15:.2f})"
-        )
-
-    def check_ema15_exit(self) -> None:
+    def check_ema9_exit(self) -> None:
         """Every STAGNANT_STOP_CHECK_INTERVAL_MIN (1 min), exit any same-day
-        position whose (price - EMA15) has worsened, vs. its value at entry,
-        by EMA15_EXIT_DELTA_PCT% of EMA15. 2026-08-22, user request: "check
-        price close below ema15 to exit a long position, and price above
-        ema15 to exit short position" -- supersedes the EMA9-slope version
-        of this same check (check_ema_slope_exit, itself a same-day
-        replacement for the flat/negative-vs-reference stagnant check and
-        the disabled check_price_drift_stop).
+        position where EMA9 has pulled back EMA9_TRAIL_PCT% from its own
+        peak (long) / trough (short) since entry -- a trailing stop on
+        EMA9 itself. See _ema9_trail_exit_reason / _update_ema9_peak for
+        the full "why," including the request chain that got here (delta
+        snapshot -> thresholded -> price-vs-EMA9 -> 2-bar persistence ->
+        finally a proper trailing stop, 2026-08-25). Only entry
+        (_check_ema_trend_alignment) still looks at EMA7's delta and the
+        EMA7-vs-EMA15 crossover -- this exit is EMA9-only. This is now
+        the ONLY per-minute exit check -- check_ema15_exit (its slower,
+        entry-anchored EMA15 rules) was removed 2026-08-25, user request:
+        "remove the ema15 delta check, only keep the ema3 and ema7
+        positive slope."
 
-        2026-08-24, user request: that original version was a zero-buffer
-        cross (exit the instant close < EMA15) -- fired on ordinary 1-min
-        noise, confirmed live (AZTA/SBET/VYX all oscillated within pennies
-        of their own EMA15 and got exited/re-entered repeatedly). Now
-        entry-anchored via self._entry_ema15_delta (captured in
-        _create_bracket_order) -- see _ema15_exit_reason. Unlike the old
-        version, this DOES need in-memory state (the entry delta) to
-        compare against; a restart or a position with no captured delta
-        falls back to treating this check's first observation as the new
-        baseline (logged, not silently guessed) rather than force an exit
-        decision on a reference it doesn't have.
+        2026-08-25, user request: "every exit will look for rentery as
+        soon as the exit but with conditions to entry met" -- on a
+        successful close, immediately re-checks the same
+        _check_ema_trend_alignment gate a fresh signal would need (plus
+        still-in-TI-universe and the entry-window cutoff); only re-arms a
+        trailing re-entry if it currently passes. Deliberately NOT the
+        same as check_ema15_exit's old re-arm, which fired unconditionally
+        on every exit with no entry-condition check at all -- confirmed
+        live: that blind re-arm whipsawed RZLV three times in 28 minutes
+        on 2026-08-25 (exit -> re-arm -> re-enter -> exit again, repeat).
+        Also registers the re-entry order in self.order_cache, which the
+        old re-arm never did either -- that meant check_pending_entries_ema
+        could never see or cancel a stale re-armed order once conditions
+        turned against it; this one is covered by that same per-minute
+        recheck like any other entry.
 
-        EMA15 itself is still recomputed fresh from real bar data every
-        check. Fail-open on missing/insufficient bar data. Scoped to
-        same-day entries only, same reasoning as check_price_drift_stop.
-
-        2026-08-22, user request ("market orders executed with other
-        pending orders removed ... price protection from observed price to
-        filled prices"): both already covered by the shared exit plumbing
-        below -- any resting order (e.g. the deferred GTC trailing stop) is
-        cancelled before this submits a close, and _submit_closing_order
-        itself is a marketable LIMIT bounded off the live bid/ask mid, not
-        a naked MarketOrderRequest -- that bound IS the observed-to-filled
-        price protection (see _submit_closing_order's docstring for the
-        NBIL incident a true unbounded market order caused).
-
-        2026-08-22, user request ("always create a complementary trail
-        order to reenter, if the stock is still in the top trade universe
-        list"): if `sym` is still in get_ti_primary() (the current top TI
-        scrape list, ti_primary.json) after the exit fires, immediately
-        re-arms a same-direction REENTRY_TRAIL_PCT trailing entry -- see
-        the re-entry block right after the close below."""
+        Fail-open on missing/insufficient bar data. Scoped to same-day
+        entries only."""
         if not STAGNANT_STOP_ENABLED:
             return
 
         try:
             positions = self.client.get_all_positions()
         except Exception as e:
-            log.warning(f"check_ema15_exit: fetch failed: {e}")
+            log.warning(f"check_ema9_exit: fetch failed: {e}")
             return
 
         today = datetime.date.today()
@@ -3555,59 +3588,11 @@ class EnhancedExecutor:
             is_long = qty > 0
 
             bars = get_bars(sym, period="1d", interval="1m")
-            if bars.empty or "close" not in bars.columns or len(bars) < EMA15_EXIT_MIN_BARS:
+            if bars.empty or "close" not in bars.columns or len(bars) < EMA_TREND_MIN_BARS:
                 continue  # not enough data -- never force a decision on it
-            last_close = float(bars["close"].iloc[-1])
-            ema15      = float(bars["close"].ewm(span=15, adjust=False).mean().iloc[-1])
-
-            entry_delta = self._entry_ema15_delta.get(sym)
-            entry_ema15 = self._entry_ema15.get(sym)
-            if entry_delta is None or entry_ema15 is None:
-                # No captured reference (restart wiped it, or this position
-                # predates the delta capture) -- adopt this observation as
-                # the new baseline instead of guessing; next check compares
-                # against it.
-                self._entry_ema15_delta[sym] = last_close - ema15
-                self._entry_ema15[sym] = ema15
-                continue
-
-            # 2026-08-24, user request: two different rule sets depending on
-            # which side of its own EMA15 the position entered on.
-            #   - Entered on the FAVORABLE side (long: at/above EMA15;
-            #     short: at/below) -- the stronger, more conventional
-            #     entry. Single rule: _ema15_breakdown_reason, a fresh line
-            #     under/over the CURRENT EMA15, not anchored to entry.
-            #   - Entered on the WEAKER side (already lagging its own
-            #     trend at entry, e.g. a dip-buy) -- the two entry-anchored
-            #     checks: _ema15_exit_reason (price-EMA15 delta worsening
-            #     vs. entry) OR _ema15_trend_drop_reason (the trend line
-            #     itself moving against the position since entry -- catches
-            #     a slow bleed where price and EMA15 decline together and
-            #     the delta check alone never fires). Either firing exits.
-            favorable_entry = (entry_delta >= 0) if is_long else (entry_delta <= 0)
-            if not favorable_entry:
-                # 2026-08-24, user request: "ema 15 above doesn't have to be
-                # only for the stocks entered above ema 15, if the price
-                # exceeds ema 15 by 1% then these stocks should hold above
-                # ema15 minus 0.5%" -- a below-EMA15 entry that's since
-                # reclaimed it by EMA15_RECLAIM_PCT% permanently switches to
-                # the breakdown rule, same as if it had entered favorably.
-                # One-way: checked every cycle only until reclaimed once.
-                if sym in self._reclaimed_ema15:
-                    favorable_entry = True
-                else:
-                    reclaim_pct = ((last_close - ema15) / ema15 * 100.0) if is_long else ((ema15 - last_close) / ema15 * 100.0)
-                    if reclaim_pct >= EMA15_RECLAIM_PCT:
-                        self._reclaimed_ema15.add(sym)
-                        favorable_entry = True
-                        log.info(f"{sym}: reclaimed EMA15 by {reclaim_pct:.2f}% — switching to the breakdown exit rule")
-
-            if favorable_entry:
-                reason = self._ema15_breakdown_reason(last_close, ema15, is_long)
-            else:
-                reason = self._ema15_exit_reason(last_close, ema15, entry_delta, is_long)
-                if reason is None:
-                    reason = self._ema15_trend_drop_reason(ema15, entry_ema15, is_long)
+            ema9_now = float(bars["close"].ewm(span=9, adjust=False).mean().iloc[-1])
+            peak = self._update_ema9_peak(self._ema9_trail_peak, sym, ema9_now, is_long)
+            reason = self._ema9_trail_exit_reason(ema9_now, peak, is_long)
             if reason is None:
                 continue
 
@@ -3624,45 +3609,63 @@ class EnhancedExecutor:
                 if sym_orders:
                     time.sleep(0.4)
             except Exception as e:
-                log.warning(f"check_ema15_exit {sym}: order fetch/cancel failed, will retry next cycle: {e}")
+                log.warning(f"check_ema9_exit {sym}: order fetch/cancel failed, will retry next cycle: {e}")
                 continue
 
             side = OrderSide.SELL if is_long else OrderSide.BUY
             try:
-                # Marketable limit bounded off the live mid, not a naked
-                # market order -- this bound is the observed-to-filled price
-                # protection (see _submit_closing_order).
                 self._submit_closing_order(sym, abs(qty), side, current)
-                log.warning(f"EMA15 EXIT {sym}: {abs(qty)} shares | {reason}")
+                log.warning(f"EMA9 EXIT {sym}: {abs(qty)} shares | {reason}")
 
-                # 2026-08-22, user request: "always create a complementary
-                # trail order to reenter, if the stock is still in the top
-                # trade universe list" -- don't just exit and forget a name
-                # that's still actively on the TI radar; re-arm a trailing
-                # entry (same direction as the position just closed) so it
-                # re-enters automatically if/when the trend resumes. Best-
-                # effort: a failure here must never be treated as the exit
-                # itself failing.
+                # 2026-08-25, user request: "I though every exit will look
+                # for rentery as soon as the exit but with conditions to
+                # entry met" -- re-check the SAME entry gate a fresh signal
+                # would need (_check_ema_trend_alignment: EMA7 delta +
+                # EMA7-vs-EMA15) right now, in the same direction just closed. Only
+                # re-arms if it currently passes -- unlike the old, removed
+                # check_ema15_exit, which re-armed unconditionally on every
+                # exit whenever the symbol was still in the TI universe,
+                # with no entry-condition check at all (confirmed live:
+                # exactly this blind re-arm whipsawed RZLV three times in
+                # 28 minutes on 2026-08-25 -- see check_ema9_exit's
+                # docstring). Registers in self.order_cache so
+                # check_pending_entries_ema's per-minute recheck actually
+                # covers it -- the old re-arm didn't do this either, so a
+                # stale resting order was never cancelled once conditions
+                # turned. Best-effort: a failure here must never be treated
+                # as the exit itself failing.
                 try:
-                    if sym in get_ti_primary():
-                        reentry_side = OrderSide.BUY if is_long else OrderSide.SELL
-                        self.client.submit_order(TrailingStopOrderRequest(
-                            symbol          = sym,
-                            qty             = abs(qty),
-                            side            = reentry_side,
-                            type            = AlpacaOrderType.TRAILING_STOP,
-                            time_in_force   = TimeInForce.DAY,
-                            trail_percent   = REENTRY_TRAIL_PCT,
-                            client_order_id = f"apex-ema15reentry-{sym}-{int(time.time())}",
-                        ))
-                        log.info(
-                            f"EMA15 EXIT {sym}: still in top TI universe — armed a "
-                            f"{REENTRY_TRAIL_PCT:.1f}% trailing {'BUY' if is_long else 'SELL'} to re-enter"
-                        )
+                    import pytz as _pytz
+                    _now_et = datetime.datetime.now(_pytz.timezone("America/New_York"))
+                    if _now_et.strftime("%H:%M") > ENTRY_WINDOW_END_ET:
+                        log.info(f"EMA9 EXIT {sym}: past entry window ({ENTRY_WINDOW_END_ET} ET) — not re-arming a re-entry")
+                    elif sym not in get_ti_primary():
+                        log.info(f"EMA9 EXIT {sym}: no longer in top TI universe — not re-arming a re-entry")
+                    else:
+                        sig_stub = SimpleNamespace(symbol=sym)
+                        gate_ok, gate_reason = _check_ema_trend_alignment(sig_stub, is_long)
+                        if not gate_ok:
+                            log.info(f"EMA9 EXIT {sym}: entry conditions not currently met ({gate_reason}) — not re-arming")
+                        else:
+                            reentry_side = OrderSide.BUY if is_long else OrderSide.SELL
+                            reentry_order = self.client.submit_order(TrailingStopOrderRequest(
+                                symbol          = sym,
+                                qty             = abs(qty),
+                                side            = reentry_side,
+                                type            = AlpacaOrderType.TRAILING_STOP,
+                                time_in_force   = TimeInForce.DAY,
+                                trail_percent   = REENTRY_TRAIL_PCT,
+                                client_order_id = f"apex-ema9reentry-{sym}-{int(time.time())}",
+                            ))
+                            self.order_cache[sym] = reentry_order.id
+                            log.info(
+                                f"EMA9 EXIT {sym}: entry conditions still met — armed a "
+                                f"{REENTRY_TRAIL_PCT:.1f}% trailing {'BUY' if is_long else 'SELL'} to re-enter"
+                            )
                 except Exception as e:
-                    log.warning(f"EMA15 EXIT {sym}: re-entry watch order failed (exit itself still succeeded): {e}")
+                    log.warning(f"EMA9 EXIT {sym}: re-entry watch order failed (exit itself still succeeded): {e}")
             except Exception as e:
-                log.error(f"EMA15 EXIT {sym}: close failed: {e}")
+                log.error(f"EMA9 EXIT {sym}: close failed: {e}")
                 # The resting GTC was just cancelled above — re-arm a fallback
                 # so the position isn't left fully unprotected.
                 try:
@@ -3672,15 +3675,15 @@ class EnhancedExecutor:
                         type=AlpacaOrderType.TRAILING_STOP, time_in_force=TimeInForce.GTC,
                         trail_percent=trail_pct,
                     ))
-                    log.warning(f"check_ema15_exit {sym}: re-armed GTC trailing stop after failed close")
+                    log.warning(f"check_ema9_exit {sym}: re-armed GTC trailing stop after failed close")
                 except Exception as rearm_err:
-                    log.error(f"check_ema15_exit {sym}: close failed AND GTC re-arm failed — position may be UNPROTECTED: {rearm_err}")
+                    log.error(f"check_ema9_exit {sym}: close failed AND GTC re-arm failed — position may be UNPROTECTED: {rearm_err}")
 
     def check_pending_entries_ema(self) -> None:
-        """Every STAGNANT_STOP_CHECK_INTERVAL_MIN (1 min), re-check the EMA7
-        trend-alignment gate (_check_ema_trend_alignment) for every entry
-        order still resting unfilled (tracked in self.order_cache), and
-        cancel it if the condition no longer holds.
+        """Every STAGNANT_STOP_CHECK_INTERVAL_MIN (1 min), re-check the
+        EMA7 trend-alignment gate (_check_ema_trend_alignment) for
+        every entry order still resting unfilled (tracked in
+        self.order_cache), and cancel it if the condition no longer holds.
 
         2026-08-24, user request: "every minute check for the placed orders
         again for ema condition if the orders are not place already, often
@@ -3693,13 +3696,27 @@ class EnhancedExecutor:
         _create_bracket_order), so it can sit unfilled for a while. By the
         time it would fill, the trend that justified placing it may have
         already turned back over. Rather than let it fill anyway on a
-        setup that's no longer valid, this cancels it -- a fresh scan
-        cycle is free to re-signal and re-submit if the setup comes back.
+        setup that's no longer valid, this cancels it.
+
+        2026-08-25, user request: "so every minute order is cancelled to
+        place a new in next minute" [once conditions realign] -- a
+        cancelled order isn't just discarded anymore, same as a signal
+        blocked before ever placing one (see _validate_trade /
+        check_blocked_entries_ema): if self._pending_entry_signals has the
+        original signal for this symbol, it moves into
+        self._ema_blocked_entries for the same per-minute retry treatment,
+        instead of waiting on a fresh scan cycle to re-signal it. No
+        stored signal (e.g. check_ema9_exit's re-entry re-arm, which has
+        no real Signal to requeue with) -- just cancels, same as before.
 
         Only touches orders in self.order_cache -- that dict is populated
-        exclusively by entry submissions (_create_bracket_order and the
-        EMA15-exit re-entry arm), never by exit/protective orders, so
-        there's no risk of this cancelling a stop or a closing order."""
+        by entry submissions (_create_bracket_order and its re-chase path)
+        and, as of 2026-08-25, check_ema9_exit's gated re-entry re-arm too
+        (see that method's docstring) -- never by exit/protective orders,
+        so there's no risk of this cancelling a stop or a closing order.
+        A re-armed re-entry gets exactly the same per-minute EMA7-delta +
+        EMA7-vs-EMA15 recheck-and-cancel treatment as any other pending
+        entry, with no special-casing needed here."""
         for sym, order_id in list(self.order_cache.items()):
             try:
                 order = self.client.get_order_by_id(order_id)
@@ -3708,6 +3725,7 @@ class EnhancedExecutor:
                 continue
             status = str(getattr(order, "status", "")).lower()
             if status not in {"new", "partially_filled", "pending_new", "accepted", "held"}:
+                self._pending_entry_signals.pop(sym, None)  # no longer pending -- stale reference
                 continue  # already filled, cancelled, or expired elsewhere -- nothing to re-check
             raw_side = getattr(order, "side", "")
             side = str(getattr(raw_side, "value", raw_side)).lower()
@@ -3719,9 +3737,99 @@ class EnhancedExecutor:
             try:
                 self.client.cancel_order_by_id(order_id)
                 self.order_cache.pop(sym, None)
-                log.warning(f"PENDING ENTRY CANCELLED {sym}: still unfilled and {reason}")
+                pending = self._pending_entry_signals.pop(sym, None)
+                if pending is not None:
+                    self._ema_blocked_entries[sym] = {
+                        "signal": pending["signal"], "order_type": pending["order_type"],
+                        "queued_at": datetime.datetime.now(datetime.timezone.utc),
+                    }
+                    log.warning(f"PENDING ENTRY CANCELLED {sym}: still unfilled and {reason} — requeued for retry")
+                else:
+                    log.warning(f"PENDING ENTRY CANCELLED {sym}: still unfilled and {reason}")
             except Exception as e:
                 log.warning(f"check_pending_entries_ema {sym}: cancel failed: {e}")
+
+    @staticmethod
+    def _blocked_entry_action(gate_ok: bool, past_window: bool, in_universe: bool) -> str:
+        """Pure decision function for check_blocked_entries_ema(): what to
+        do with one queued blocked-entry this poll. Returns "fire" (gate
+        now agrees -- submit it), "expire" (the entry window's closed, or
+        the symbol's fallen out of the top-15 TI universe -- drop it,
+        nothing left to wait for), or "wait" (keep it queued, check again
+        next minute).
+
+        2026-08-25, user request chain: "each blocked trade should wait for
+        next minute recheck not to completely discard the order" -> ... ->
+        "no expire" (dropped the arbitrary ENTRY_RETRY_MAX_MIN staleness
+        timer -- a queued entry now waits as long as the entry window
+        itself allows, not a fixed number of minutes) -> "the signal
+        should cancel out only due to price conditions and not part of
+        the top 15 list of the universe" -- clarifies what "waiting" is
+        actually for: price (the gate) realigning, scoped to names still
+        worth watching (still in the top-15 universe). A symbol that's
+        dropped out of the universe isn't coming back on its own, so
+        there's nothing left to wait for even before the window closes.
+        past_window and not in_universe both take priority over gate_ok --
+        same as every other re-entry-arm path in this file (e.g.
+        check_ema9_exit's): both are absolute give-up conditions, checked
+        first, no exception even if the gate happens to agree that exact
+        minute."""
+        if past_window or not in_universe:
+            return "expire"
+        if gate_ok:
+            return "fire"
+        return "wait"
+
+    def check_blocked_entries_ema(self) -> None:
+        """Every STAGNANT_STOP_CHECK_INTERVAL_MIN (1 min), re-check every
+        signal queued in self._ema_blocked_entries (blocked by
+        _check_ema_trend_alignment at signal time, or cancelled out of
+        self.order_cache by check_pending_entries_ema once conditions
+        turned) -- the moment the gate agrees, fires _execute_entry fresh
+        with a current account snapshot (re-validates and re-sizes from
+        scratch; nothing about the original signal's price/sizing is
+        assumed still current). Drops a queued entry once the entry window
+        closes, or once the symbol falls out of the top-15 TI universe --
+        no separate staleness timer, see _blocked_entry_action.
+
+        2026-08-25, user request chain: "each blocked trade should wait
+        for next minute recheck not to completely discard the order" ->
+        "the trade idea should check for every minute conditions to see
+        when the new condition is met to reenter than completely discard
+        a trade signal" -> "so every minute order is cancelled to place a
+        new in next minute" [after conditions realign] -> "that why the
+        trade enters as soon as the condition are met than stale orders"
+        -> "no expire" -> "the signal should cancel out only due to price
+        conditions and not part of the top 15 list of the universe" (the
+        TI-universe check added here).
+
+        Every signal reaching this queue already came from the normal
+        scan (which draws from the TI top-N universe), so under normal
+        conditions this is already scoped to whatever the scan actually
+        flagged -- the explicit get_ti_primary() check here is what keeps
+        a queued entry from waiting indefinitely on a name that's since
+        dropped off that list entirely."""
+        import pytz as _pytz
+        _now_et = datetime.datetime.now(_pytz.timezone("America/New_York"))
+        past_window = _now_et.strftime("%H:%M") > ENTRY_WINDOW_END_ET
+        ti_universe = set(get_ti_primary())
+
+        for sym, info in list(self._ema_blocked_entries.items()):
+            signal, order_type = info["signal"], info["order_type"]
+            gate_ok, _ = _check_ema_trend_alignment(signal, order_type == OrderType.LONG)
+            action = self._blocked_entry_action(gate_ok, past_window, sym in ti_universe)
+            if action == "wait":
+                continue
+            del self._ema_blocked_entries[sym]
+            if action == "expire":
+                log.info(f"BLOCKED ENTRY EXPIRED {sym}: entry window closed or no longer in TI universe")
+                continue
+            try:
+                acct = self._get_account(force_refresh=True)
+                if self._execute_entry(signal, acct, order_type):
+                    log.info(f"BLOCKED ENTRY RE-FIRED {sym}: EMA condition realigned")
+            except Exception as e:
+                log.warning(f"check_blocked_entries_ema {sym}: retry failed: {e}")
 
     @staticmethod
     def _swing_drift_stop_reason(current: float, entry: Optional[float], is_long: bool, stop_pct: float) -> Optional[str]:

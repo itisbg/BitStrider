@@ -500,7 +500,10 @@ TRAILING_STOP_NORMAL  =  8.0  # default trailing stop
 # position; this flat stop is the worst-case backstop for a move between
 # two 1-min checks, not the front line, so it carries more room than the
 # original 1.5% floor without going as wide as the first 4% pass.
-TRAIL_STOP_PCT = 2.0
+# 2026-08-25, user request: 2.0% -> 1.0% -- tighter backstop now that entry
+# (_check_ema_trend_alignment, EMA7 delta + EMA7-vs-EMA15) and exit
+# (check_ema9_exit, an EMA9 trailing stop) both also gate on the trend.
+TRAIL_STOP_PCT = 1.0
 
 # Once a position is profitable, widen the trailing stop to give back only
 # this fraction of the unrealized gain -- e.g. +10% unrealized -> stop at
@@ -791,73 +794,15 @@ PRICE_DRIFT_CHECK_INTERVAL_MIN = 10     # how often the check runs, in step with
 PRICE_DRIFT_LOOKBACK_MIN       = 30     # how far back the comparison price is from ("price from 30 min ago")
 
 # ─────────────────────────────────────────────────────────────────
-# EMA15 Close-Cross Exit ("Stagnant Position Stop") -- 2026-08-22, user
-# request: independent fast-loop replacement for the disabled
-# PRICE_DRIFT_STOP above, polled every STAGNANT_STOP_CHECK_INTERVAL_MIN
-# (1 min, vs the old 10). Two earlier same-day versions: first a flat/
-# negative-vs-reference-price check, then an EMA9-slope check; superseded by
-# "check price close below ema15 to exit a long position, and price above
-# ema15 to exit short position" -- the 1-min close crossing EMA15 against
-# the position triggers an exit. See check_ema15_exit() in enhanced.py.
-# Scoped to same-day entries only, same reasoning as PRICE_DRIFT_STOP.
-#
-# 2026-08-24, user request: that zero-buffer cross fired on ordinary 1-min
-# noise -- AZTA/SBET/VYX all oscillated within pennies of their own EMA15
-# and got exited/re-entered repeatedly without ever making a real move.
-# Replaced with an entry-anchored delta check: capture (entry_price -
-# ema15) at entry time, then every 1-min poll compare the CURRENT (price -
-# ema15) against that entry delta -- exit only once it's worsened by
-# EMA15_EXIT_DELTA_PCT% of ema15's value, not on any single cross. Example
-# (user's own, at the original 1% before this was raised to 1.5%): entry
-# price 10, ema15 15 -> entry delta -5; exits once delta reaches ~-5.15 (a
-# 1%-of-15 move against it), not the instant price dips under 15. At the
-# current 1.5% that same example exits around -5.225. Lets an entry that's
-# already below its EMA15 stay
-# open as long as it isn't getting WORSE relative to entry -- deliberately
-# entry-anchored, not trailing off the best delta seen, so it answers "is
-# this still deteriorating" rather than "give back some of the best case."
+# Stagnant Position Stop -- independent fast-loop exit check, polled every
+# STAGNANT_STOP_CHECK_INTERVAL_MIN (1 min). 2026-08-22 through 2026-08-25
+# this ran an EMA15 close-cross rule (check_ema15_exit, entry-anchored
+# delta/trend-drop/breakdown variants) -- removed 2026-08-25, user request:
+# "remove the ema15 delta check, only keep the ema3 and ema7 positive
+# slope." check_ema9_exit (an EMA9_TRAIL_PCT% trailing stop on EMA9, see
+# below) is the only per-minute exit check now; these two flags still gate it.
 STAGNANT_STOP_ENABLED             = True
 STAGNANT_STOP_CHECK_INTERVAL_MIN  = 1
-EMA15_EXIT_MIN_BARS               = 15  # need at least this many 1-min bars before trusting EMA15
-EMA15_EXIT_DELTA_PCT              = 0.75  # exit once (price - ema15) worsens vs. its entry-time value by this % of ema15
-# 2026-08-24, user request: second, independent exit check -- the trend
-# LINE itself (EMA15) vs. its own value at entry, not price vs. EMA15.
-# Added because the delta check above has a blind spot on a slow, steady
-# bleed: if price declines in step with its own EMA15, (price - ema15)
-# stays roughly flat even though the trend has clearly turned (confirmed
-# in backtest: MUZ drifted down all session without ever tripping the
-# delta check, because EMA15 was drifting down right alongside it). This
-# check catches that directly -- exit if EMA15 itself has moved against
-# the position by this % since entry, regardless of where price sits
-# relative to it right now. Either check firing is sufficient to exit.
-EMA15_TREND_DROP_PCT              = 0.25  # exit once EMA15 itself has moved this % against the position vs. its entry-time value
-# 2026-08-24, user request: the two entry-anchored checks above (delta,
-# trend-drop) are for a position that entered BELOW its own EMA15 -- for
-# one that entered AT OR ABOVE it, use a single simpler rule instead: exit
-# once price breaks below the CURRENT EMA15 by more than this % of it (not
-# anchored to entry at all -- a fresh line in the sand under wherever
-# EMA15 sits right now). check_ema15_exit() picks whichever rule set
-# applies based on the sign of entry_delta, never both.
-EMA15_BREAKDOWN_PCT               = 0.25  # exit once price breaks below (current) EMA15 by this % of it -- only for entries that started at/above their EMA15
-# 2026-08-24, user request ("tighten slightly the buffer"): all three of
-# EMA15_EXIT_DELTA_PCT/TREND_DROP_PCT/BREAKDOWN_PCT halved (1.5/0.5/0.5 ->
-# 0.75/0.25/0.25) after the fully-verified backtest showed EMA7 + the
-# ORIGINAL zero-buffer cross (+$1.66 on today's 13 real entries) beat every
-# version of this exit logic tried, including the 1.5/0.5/0.5 one
-# (-$3.95) -- moving these back toward the zero-buffer end (without going
-# all the way, keeping the entry-anchored/breakdown/reclaim structure)
-# should recover most of that gap.
-# 2026-08-24, user request: "ema 15 above doesn't have to be only for the
-# stocks entered above ema 15, if the price exceeds ema 15 by 1% then these
-# stocks should hold above ema15 minus 0.5%" -- a position that entered
-# BELOW its own EMA15 (the weaker/dip-buy case) permanently switches to the
-# breakdown rule above once it reclaims EMA15 by this much, instead of
-# staying on the wider entry-anchored delta/trend-drop tolerance for its
-# whole life even after the dip-buy thesis has clearly confirmed. One-way:
-# once reclaimed, stays on the breakdown rule even if price dips back
-# under the reclaim threshold (it's just protected by the breakdown rule's
-# own -0.5% line at that point, not un-reclaimed).
-EMA15_RECLAIM_PCT                 = 1.0  # a below-EMA15 entry switches to the breakdown rule once price exceeds EMA15 by this %
 
 # ─────────────────────────────────────────────────────────────────
 # EMA Trend Alignment Filter -- 2026-08-22, user request: "ensure the trend
@@ -871,8 +816,45 @@ EMA15_RECLAIM_PCT                 = 1.0  # a below-EMA15 entry switches to the b
 # allows an earlier entry read; paired with the entry-anchored EMA15 delta
 # exit above so a still-below-EMA15 entry isn't rejected outright, it's
 # instead watched for whether it keeps getting worse.
+# 2026-08-25, user request: EMA3 delta required alongside EMA7's for a
+# while (both had to agree), then dropped ("remove ema3 delta positive")
+# once paired with a structural condition -- EMA7 above EMA15 for a long,
+# below it for a short ("add one more condition of ema 7 above ema 15 for
+# entry long order and vice versa for short"). See
+# _check_ema_trend_alignment's own docstring for both current conditions.
 EMA_TREND_FILTER_ENABLED = True
 EMA_TREND_MIN_BARS       = 10  # need at least this many 1-min bars before trusting EMA7's slope
+
+# check_blocked_entries_ema -- 2026-08-25, user request: "each blocked
+# trade should wait for next minute recheck not to completely discard the
+# order" -> "the trade idea should check for every minute conditions to
+# see when the new condition is met to reenter than completely discard a
+# trade signal." A signal blocked only by the EMA gate above gets queued
+# and re-checked every STAGNANT_STOP_CHECK_INTERVAL_MIN instead of just
+# vanishing -- fires the moment the gate agrees. Originally also dropped
+# after a fixed number of minutes without realigning; removed same day
+# ("no expire") -- ENTRY_WINDOW_END_ET closing is now the only reason a
+# queued entry ever gets dropped instead of retried.
+
+# check_ema9_exit -- 2026-08-25, user request chain: "add exit condition
+# ema 7 and ema 3 both negative for exit" -> narrowed to EMA7 alone -> a
+# delta-vs-0.3%-of-price threshold -> "should only trigger is the stock
+# trending down" (added price-vs-EMA9) -> "try options 2" (require the
+# combined condition to persist 2 consecutive polls) -> switched from EMA7
+# to EMA9 -> finally "get a ema 9 trail stop of 0.3% instead of just delta
+# with 0.3% of price" -- replaced the whole delta/threshold/persistence
+# stack with a proper trailing stop ON EMA9 ITSELF: track the running peak
+# of EMA9 since entry (trough for a short), exit once EMA9 has pulled back
+# EMA9_TRAIL_PCT% from that peak. Same shape as the existing price-based
+# TRAIL_STOP_PCT trailing stop, just computed on the smoothed EMA9 line
+# instead of raw price -- and unlike every version before this one, it has
+# actual memory of how far the trade has run (a peak that only ratchets
+# forward), the exact gap flagged by the JEM/SDOT/RZLV backtests (a flat
+# threshold cuts a real winner short on its first pullback with no memory
+# of the run-up). See _ema9_trail_exit_reason / _update_ema9_peak.
+# 2026-08-25, user request: 0.3% -> 0.5% -- a bit more room on the trail
+# itself, on top of the peak-tracking already giving the trade room to run.
+EMA9_TRAIL_PCT = 0.5
 
 # ─────────────────────────────────────────────────────────────────
 # Swing/Multi-Day Drift Stop -- wider sibling of the price drift stop above,
@@ -937,7 +919,7 @@ AFTERHOURS_STOP_CHECK_ENABLED = True
 AFTERHOURS_CHASE_STALE_SECONDS = 45  # re-chase (cancel + resubmit at fresh price) if the close sits unfilled this long
 # 2026-08-24, user request: no post-loss re-entry cooldown anymore (was 1440min /
 # 24h here). Protection is the exit stack alone -- trailing stop, per-minute
-# check_ema15_exit, standalone stop-loss.
+# check_ema9_exit, standalone stop-loss.
 
 # Stale order upgrade: unfilled orders older than this get re-submitted as market/limit
 STALE_ORDER_MINUTES          = 360  # minutes before an unfilled order is considered stale
@@ -1302,11 +1284,23 @@ REENTRY_TRAIL_PCT = 0.5
 # 5-16% off their 30-min high) and the other 2 never even got tried
 # (MAX_SIGNALS_PER_CYCLE slices to the top 3 before attempting anything) --
 # zero fills from a cycle with 5 real candidates. Rather than a hard skip,
-# a stale-momentum signal now trades anyway at THIN_LIQUIDITY_POSITION_
+# a stale-momentum signal traded anyway at THIN_LIQUIDITY_POSITION_
 # SIZE_PCT (reuses signal.thin_liquidity -- same flag, same sizing, same
 # halved trailing stop -- a chased/faded entry deserves the same tighter
 # leash as a liquidity-guardrail admit, not a separate mechanism).
-TRADE_STALE_MOMENTUM_REJECTS = True
+#
+# 2026-08-25, user request ("any other recommendations to reduce losses" ->
+# "fix 4"): flipped back to a hard reject. Today's log still showed faded
+# entries trading anyway at reduced size (JEM: "faded 8.9%/9.0%/11.1% off
+# its 30-min high -- entry not fresh -- trading anyway") and losing --
+# with _check_ema_trend_alignment (EMA7 delta + EMA7-vs-EMA15) now gating
+# every entry too, a stale-momentum signal is doubly suspect, not a case
+# that just needs a smaller position. Re-accepts the original 2026-08-14
+# risk this flag exists to avoid -- a cycle's top-ranked candidates can
+# all be stale and get hard-skipped before a fresher lower-ranked one is
+# even tried -- watch for that pattern in the logs (a cycle with 0 fills
+# despite several signals) if this needs revisiting.
+TRADE_STALE_MOMENTUM_REJECTS = False
 
 # 2026-08-12, user request: these names already failed a guardrail, so hold
 # them on a shorter leash for their whole life too, not just a smaller size

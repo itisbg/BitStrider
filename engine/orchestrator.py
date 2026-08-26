@@ -216,6 +216,15 @@ def _run_options_cycle(ctx: AppContext, market_state: MarketState) -> None:
         if market_state.is_options_lull_hours:
             log.info("[OPTIONS] Lull period — monitoring only, no new entries")
             return
+        # 2026-08-24, user request: "don't trade or do anything after 3:50pm
+        # ET" -- this function's own is_regular_hours gate only stops it at
+        # 16:00 ET, a 10-min window past the equities side's entry cutoff
+        # (ENTRY_WINDOW_END_ET) where options could still open a brand new
+        # position. Monitoring/closing stays active past the cutoff (same
+        # as equities); only new entries stop.
+        if not _within_entry_window(market_state.now):
+            log.info(f"[OPTIONS] Outside entry window (ends {cfg.ENTRY_WINDOW_END_ET} ET) — monitoring only, no new entries")
+            return
         all_positions = ctx.client.get_all_positions()
         held_map      = {p.symbol: int(float(p.qty)) for p in all_positions if float(p.qty) > 0}
         existing_syms = {pos.occ_symbol for pos in ctx.options_executor._positions.values()}
@@ -932,27 +941,26 @@ def _start_software_stop_thread(ctx: AppContext) -> None:
     """Spawn a daemon thread that polls _cover_naked_positions(),
     check_software_stops(), check_afterhours_stops(), _sweep_force_closes(),
     _sweep_pending_entries(), and detect_stopped_out_positions() every 10
-    seconds, plus check_ema15_exit() every STAGNANT_STOP_CHECK_INTERVAL_MIN.
+    seconds, plus check_ema9_exit(), check_pending_entries_ema(), and
+    check_blocked_entries_ema() every STAGNANT_STOP_CHECK_INTERVAL_MIN.
 
     2026-08-24, user request ("why do you say the cycle time increase" --
-    it wasn't supposed to touch the EMA check at all): check_ema15_exit used
-    to run via _ema15_exit_job on schedule.every(), with comments claiming
-    that decouples it from scan cadence because "schedule.run_pending()
-    ticks every 5s in the main loop regardless." That's false once
-    scan_and_trade() itself runs long -- the main loop is single-threaded,
-    so schedule.run_pending() (and every job registered on it, EMA15 exit
-    included) simply doesn't get called until scan_and_trade() returns.
-    Confirmed live: cycles were landing 4-10 min apart despite a 1-min
-    config, which silently starved the EMA exit check the same way. This
-    thread is genuine concurrency (a real Thread, checked every 10s
-    independent of what the main loop is doing) -- moving the EMA check
-    here is what schedule.every() was supposed to give it and didn't.
-    _ema15_exit_job/the schedule.every() registration for it are gone; this
-    is its only trigger now. check_ema15_exit() itself already arms an
-    immediate re-entry trailing order when the exited symbol is still in the
-    top TI universe (see its own docstring) -- so this one move restores
-    both halves of "EMA exit check + immediate re-entry" to an actual 1-min
-    heartbeat, independent of however long a discovery scan takes."""
+    it wasn't supposed to touch the EMA check at all): the per-minute EMA
+    exit check used to run via schedule.every() in the main loop, with
+    comments claiming that decouples it from scan cadence because
+    "schedule.run_pending() ticks every 5s in the main loop regardless."
+    That's false once scan_and_trade() itself runs long -- the main loop is
+    single-threaded, so schedule.run_pending() (and every job registered on
+    it) simply doesn't get called until scan_and_trade() returns. Confirmed
+    live: cycles were landing 4-10 min apart despite a 1-min config, which
+    silently starved the EMA exit check the same way. This thread is
+    genuine concurrency (a real Thread, checked every 10s independent of
+    what the main loop is doing) -- moving the EMA check here is what
+    schedule.every() was supposed to give it and didn't. Still the only
+    trigger for the per-minute exit check, now check_ema9_exit
+    (2026-08-25, user request: the original EMA15-based check_ema15_exit
+    this reasoning was built for is removed -- see check_ema9_exit's
+    docstring for the current logic)."""
     import threading
 
     def _loop() -> None:
@@ -985,19 +993,32 @@ def _start_software_stop_thread(ctx: AppContext) -> None:
                 log.error(f"[STOP-THREAD] detect_stopped_out_positions error: {e}", exc_info=True)
             if time.time() - last_ema15 >= cfg.STAGNANT_STOP_CHECK_INTERVAL_MIN * 60:
                 try:
-                    ctx.executor.check_ema15_exit()
+                    # 2026-08-25, user request: "remove the ema15 delta
+                    # check, only keep the ema3 and ema7 positive slope" --
+                    # the EMA15-based exit check (method, helpers, config
+                    # constants, self-tests) was deleted outright, not just
+                    # unwired. check_ema9_exit (EMA9 delta now, was EMA7) is
+                    # the only per-minute exit check now.
+                    ctx.executor.check_ema9_exit()
                 except Exception as e:
-                    log.error(f"[STOP-THREAD] check_ema15_exit error: {e}", exc_info=True)
+                    log.error(f"[STOP-THREAD] check_ema9_exit error: {e}", exc_info=True)
                 try:
                     ctx.executor.check_pending_entries_ema()
                 except Exception as e:
                     log.error(f"[STOP-THREAD] check_pending_entries_ema error: {e}", exc_info=True)
+                try:
+                    # 2026-08-25, user request: "each blocked trade should
+                    # wait for next minute recheck not to completely
+                    # discard the order" -- see check_blocked_entries_ema.
+                    ctx.executor.check_blocked_entries_ema()
+                except Exception as e:
+                    log.error(f"[STOP-THREAD] check_blocked_entries_ema error: {e}", exc_info=True)
                 last_ema15 = time.time()
             time.sleep(10)
 
     t = threading.Thread(target=_loop, name="SoftwareStopPoller", daemon=True)
     t.start()
-    log.info("[STOP-THREAD] Software-stop fast-poll thread started (10s interval, EMA15 exit + pending-entry EMA re-check every 1 min)")
+    log.info("[STOP-THREAD] Software-stop fast-poll thread started (10s interval, EMA9 exit + pending-entry + blocked-entry EMA re-check every 1 min)")
 
 
 def _start_options_scan_thread(ctx: AppContext) -> None:
@@ -1012,9 +1033,9 @@ def _start_options_scan_thread(ctx: AppContext) -> None:
     options scan (160 tickers, sequential per-symbol bar fetches) to finish
     first. Confirmed live: that alone routinely ran past a minute by itself,
     so equity re-entries never got close to REGULAR_HOURS_SCAN_INTERVAL no
-    matter how low that config was set. Same fix as check_ema15_exit
-    (_start_software_stop_thread) and the same reason it has to be a real
-    thread, not schedule.every() -- that's just as blocked whenever
+    matter how low that config was set. Same fix as the per-minute EMA exit
+    check (_start_software_stop_thread) and the same reason it has to be a
+    real thread, not schedule.every() -- that's just as blocked whenever
     scan_and_trade() itself is running, see that function's docstring.
 
     Computes its own local MarketState each cycle rather than reading
@@ -1127,8 +1148,9 @@ def start() -> None:
     schedule.every(1).minutes.do(_eod_close_job, ctx)
     _schedule_on_clock_grid(cfg.PRICE_DRIFT_CHECK_INTERVAL_MIN, _price_drift_stop_job, ctx)
     _schedule_on_clock_grid(cfg.SWING_DRIFT_STOP_CHECK_INTERVAL_MIN, _swing_drift_stop_job, ctx)
-    # check_ema15_exit moved to the SoftwareStopPoller thread (see
-    # _start_software_stop_thread) -- no longer registered here.
+    # Per-minute EMA exit check (check_ema9_exit) runs on the
+    # SoftwareStopPoller thread (see _start_software_stop_thread), not
+    # registered here.
     _schedule_on_clock_grid(cfg.CONCENTRATION_CHECK_INTERVAL_MIN, _concentration_check_job, ctx)
 
     try:
