@@ -1669,6 +1669,27 @@ class EnhancedExecutor:
             return False
         try:
             qty = abs(int(positions.positions_dict[signal.symbol].qty))
+            # 2026-08-25, user request ("you f-ed up again" -- rightly):
+            # every other close path in this file (close_eod_positions,
+            # check_afterhours_stops, close_no_gain_positions, the
+            # weakest-swap path, check_tp_targets, close_stale_swing_positions,
+            # close_guardrail_fail_positions) already cancels resting orders
+            # -- GTC trailing stop included -- before submitting its close,
+            # because that stop reserves the qty and the close order gets
+            # rejected "insufficient qty available" otherwise. This
+            # strategy-driven cover path never got that same fix. Same
+            # pattern here.
+            try:
+                sym_orders = [o for o in (self.client.get_orders() or []) if o.symbol == signal.symbol]
+                for _o in sym_orders:
+                    try:
+                        self.client.cancel_order_by_id(str(_o.id))
+                    except Exception:
+                        pass
+                if sym_orders:
+                    time.sleep(0.4)
+            except Exception:
+                pass
             if EXTENDED_HOURS and not self._current_market_state().is_regular_hours:
                 req = LimitOrderRequest(
                     symbol=signal.symbol, qty=qty, side=OrderSide.BUY,
@@ -1699,6 +1720,24 @@ class EnhancedExecutor:
 
         qty = abs(int(float(positions.positions_dict[signal.symbol].qty)))
         try:
+            # 2026-08-25, user request ("you f-ed up again" -- rightly): same
+            # cancel-resting-orders-first fix as _close_short_position right
+            # above (and every other close path in this file) -- the GTC
+            # trailing stop protect_positions() places reserves the qty, so
+            # a close submitted while it's still resting gets rejected
+            # "insufficient qty available." This strategy-driven sell path
+            # never had that fix either.
+            try:
+                sym_orders = [o for o in (self.client.get_orders() or []) if o.symbol == signal.symbol]
+                for _o in sym_orders:
+                    try:
+                        self.client.cancel_order_by_id(str(_o.id))
+                    except Exception:
+                        pass
+                if sym_orders:
+                    time.sleep(0.4)
+            except Exception:
+                pass
             # A plain MarketOrderRequest gets rejected outside regular hours — this
             # path (a strategy-driven "sell" signal on a held long) is reachable
             # any time scan_and_trade runs, which spans the full 07:00-20:00
