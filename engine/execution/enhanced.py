@@ -2135,16 +2135,17 @@ class EnhancedExecutor:
         Same day, follow-up request ("irrespective of exit type reentry
         should happen for the top 30 list... catch the missed gains after
         the dips"): widened further -- now checks self._no_rearm, which
-        only THREE closing paths still mark (see _maybe_rearm_reentry's
+        only FOUR closing paths still mark (see _maybe_rearm_reentry's
         docstring for the full reasoning): close_guardrail_fail_positions
         (structurally unsafe), the portfolio-rebalance paths
         (enforce_position_concentration/enforce_correlation_concentration/
         enforce_portfolio_leverage/_attempt_swap/_execute_entry's weakest-
-        position swap), and emergency_close_all (kill-switch). Every other
-        close in the file — EOD, stale-swing, no-gain, swing-drift, take-
-        profit, a contradicting strategy signal — is unmarked on purpose, so
-        it falls through here and gets the same re-entry check as a genuine
-        stop.
+        position swap), emergency_close_all (kill-switch), and
+        close_eod_positions (explicit follow-up request: "don't reenter
+        after end of day exit"). Every other close in the file — stale-
+        swing, no-gain, swing-drift, take-profit, a contradicting strategy
+        signal — is unmarked on purpose, so it falls through here and gets
+        the same re-entry check as a genuine stop.
         """
         try:
             positions = self.client.get_all_positions()
@@ -2655,12 +2656,13 @@ class EnhancedExecutor:
                 # existing GTC trailing stop; _sweep_force_closes (below) gives up
                 # the same way once regular hours end instead of re-chasing.
                 # 2026-08-26, user request ("irrespective of exit type
-                # reentry should happen for the top 30 list"): NOT marked
-                # _no_rearm -- the ENTRY_WINDOW_END_ET check inside
-                # _maybe_rearm_reentry already blocks re-arming this late in
-                # the day anyway (EOD closes fire at/after 15:50, exactly
-                # when that gate says no), so this was always a no-op
-                # exclusion in practice.
+                # reentry should happen for the top 30 list") briefly left
+                # this unmarked on the reasoning that ENTRY_WINDOW_END_ET
+                # already blocks re-arming this late anyway -- user then
+                # explicitly asked to exclude EOD regardless ("don't
+                # reenter after end of day exit"), so this marks it directly
+                # rather than relying on that time-window side effect.
+                self._no_rearm.add(sym)
                 self._submit_closing_order(sym, abs(qty), side, float(pos.current_price), no_extended_hours=True)
                 self._entry_log.pop(sym, None)
                 self._force_close_pending[sym] = {"reason": f"eod:{entry_info.get('strategy', 'unknown')}", "chase_count": 0}
@@ -3681,12 +3683,18 @@ class EnhancedExecutor:
             loop).
           - emergency_close_all: the market-wide kill switch (VIX spike/SPY
             crash). Re-entering right after defeats its entire purpose.
-        Everything else -- close_eod_positions, close_stale_swing_positions,
-        close_no_gain_positions, check_swing_drift_stop, check_tp_targets,
-        _close_long_position/_close_short_position -- now re-arms the same
-        as any stop-loss close, via the generic catch in
-        detect_stopped_out_positions() (below): NOT marking self._no_rearm
-        for these is what lets that generic path pick them up.
+        Immediate follow-up ("exclude eod don't reenter after end of day
+        exit"): close_eod_positions added back as a fourth exclusion --
+        briefly left unmarked on the reasoning that ENTRY_WINDOW_END_ET
+        already blocks re-arming this late anyway, but the user wants it
+        excluded directly rather than relying on that time-window side
+        effect.
+        Everything else -- close_stale_swing_positions, close_no_gain_positions,
+        check_swing_drift_stop, check_tp_targets, _close_long_position/
+        _close_short_position -- re-arms the same as any stop-loss close,
+        via the generic catch in detect_stopped_out_positions() (below):
+        NOT marking self._no_rearm for these is what lets that generic path
+        pick them up.
 
         Registers in self.order_cache so check_pending_entries_ema's
         per-minute recheck covers the new order like any other entry.
