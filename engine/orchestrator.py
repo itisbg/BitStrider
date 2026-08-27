@@ -551,6 +551,20 @@ def _within_entry_window(now_et: datetime.datetime) -> bool:
     return cfg.ENTRY_WINDOW_START_ET <= t <= cfg.ENTRY_WINDOW_END_ET
 
 
+def _within_discovery_window(now_et: datetime.datetime) -> bool:
+    """True if now_et falls within [DISCOVERY_WINDOW_START_ET,
+    ENTRY_WINDOW_END_ET] -- the wider band universe discovery (TI-capture
+    trigger + scan_alpaca_movers, both inside _run_discovery) is allowed to
+    run in. Strictly wider than _within_entry_window on the early side only
+    (DISCOVERY_WINDOW_START_ET < ENTRY_WINDOW_START_ET): discovery gets a
+    pre-market head start so the scan universe is already warm by the time
+    ENTRY_WINDOW_START_ET opens order submission, per scan_and_trade()'s
+    two-stage gate. Never wider on the late side -- discovery has no reason
+    to outlive the entry window itself."""
+    t = now_et.strftime("%H:%M")
+    return cfg.DISCOVERY_WINDOW_START_ET <= t <= cfg.ENTRY_WINDOW_END_ET
+
+
 def _margin_cushion_ok(equity: float, maintenance_margin: float, min_ratio: float) -> bool:
     """True if equity is still >= min_ratio x maintenance_margin (safe cushion
     against an Alpaca maintenance margin call). No margin exposure at all
@@ -603,9 +617,9 @@ def scan_and_trade(ctx: AppContext) -> None:
         log.info("[SYSTEM] Kill mode active — aborting cycle")
         return
 
-    if not _within_entry_window(market_state.now):
+    if not _within_discovery_window(market_state.now):
         log.info(
-            f"[SYSTEM] Outside entry window ({cfg.ENTRY_WINDOW_START_ET}-{cfg.ENTRY_WINDOW_END_ET} ET) "
+            f"[SYSTEM] Outside discovery window ({cfg.DISCOVERY_WINDOW_START_ET}-{cfg.ENTRY_WINDOW_END_ET} ET) "
             f"— skipping discovery/scan this cycle (concentration/correlation checks run on their own "
             f"schedule now, unaffected by this gate — see _concentration_check_job)"
         )
@@ -654,6 +668,13 @@ def scan_and_trade(ctx: AppContext) -> None:
     _t_discovery = time.monotonic()
     _run_discovery(ctx, market_state)
     log.info(f"[TIMING] discovery: {time.monotonic() - _t_discovery:.1f}s")
+
+    if not _within_entry_window(market_state.now):
+        log.info(
+            f"[SYSTEM] Pre-market discovery only (entry window opens {cfg.ENTRY_WINDOW_START_ET} ET) "
+            f"— universe refreshed, no scan/execute this cycle"
+        )
+        return
 
     scan_targets, excluded = _build_scan_targets(ctx)
     if not scan_targets:
@@ -1098,8 +1119,14 @@ def _poller_staleness_job() -> None:
 # ApexTraderTICapture (scripts/update_ti_capture_schedule_4tier.ps1): fast
 # 3-min sweeps right after the open and into the close, wider spacing
 # through the midday lull.
+# 2026-08-27, user request ("fix the stock universe check from ti web
+# scrapping ... starting 9:09 ET and perform the 3 min check till 10:30
+# ET, but don't trade until 9:30 ET"): tier 1 start moved 9:25 -> 9:09,
+# matching DISCOVERY_WINDOW_START_ET in config.py -- 7 extra 3-min
+# refreshes before the entry window (now 9:30, see ENTRY_WINDOW_START_ET)
+# opens, so the universe is warm well before trading is allowed to start.
 _TI_CAPTURE_TIERS = [
-    ((9, 25),  (10, 30), 3),
+    ((9, 9),   (10, 30), 3),
     ((10, 30), (12, 30), 5),
     ((12, 30), (14, 50), 10),
     ((14, 50), (15, 50), 3),
@@ -1491,8 +1518,8 @@ def _demo() -> None:
 
     try:
         # Tier lookup: inside each tier, and the gaps between/around them.
-        assert _ti_capture_interval_min(ET.localize(datetime.datetime(2026, 8, 27, 9, 24))) is None, "before first tier"
-        assert _ti_capture_interval_min(ET.localize(datetime.datetime(2026, 8, 27, 9, 25))) == 3, "tier 1 start (inclusive)"
+        assert _ti_capture_interval_min(ET.localize(datetime.datetime(2026, 8, 27, 9, 8))) is None, "before first tier"
+        assert _ti_capture_interval_min(ET.localize(datetime.datetime(2026, 8, 27, 9, 9))) == 3, "tier 1 start (inclusive)"
         assert _ti_capture_interval_min(ET.localize(datetime.datetime(2026, 8, 27, 10, 29))) == 3, "tier 1 end (exclusive upper)"
         assert _ti_capture_interval_min(ET.localize(datetime.datetime(2026, 8, 27, 10, 30))) == 5, "tier 2 start"
         assert _ti_capture_interval_min(ET.localize(datetime.datetime(2026, 8, 27, 11, 45))) == 5, "mid tier 2"

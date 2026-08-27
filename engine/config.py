@@ -681,7 +681,24 @@ DAILY_PROFIT_TARGET       = 3500.0
 # ET kickstart run (windows_schedule_ti_capture.ps1), so fresh universe data
 # is already available the moment the entry window opens instead of trading
 # blind for the scraper's first 5 min.
-ENTRY_WINDOW_START_ET = "09:25"
+# 2026-08-27, user request ("fix the stock universe check from ti web
+# scrapping or alpaca movers starting 9:09 ET and perform the 3 min check
+# till 10:30 ET, but don't trade until 9:30 ET"): reverted to actual market
+# open (09:30). The "trade blind" problem this used to dodge is solved
+# properly now instead -- universe discovery (TI capture + Alpaca movers,
+# see DISCOVERY_WINDOW_START_ET / _run_discovery's gating in
+# scan_and_trade()) starts even earlier, at 09:09, giving 7 refresh cycles
+# of warm-up before the entry window opens, rather than shaving the entry
+# window itself 5 minutes into pre-market to make up the difference.
+ENTRY_WINDOW_START_ET = "09:30"
+
+# 2026-08-27, user request (see ENTRY_WINDOW_START_ET above): universe
+# discovery (TI-capture trigger + scan_alpaca_movers, both inside
+# _run_discovery) is allowed to run starting this early -- well before
+# ENTRY_WINDOW_START_ET -- so the scan universe is already warm the moment
+# trading opens. Nothing gated by ENTRY_WINDOW_START_ET (order submission)
+# is affected; see scan_and_trade()'s two-stage gate.
+DISCOVERY_WINDOW_START_ET = "09:09"
 # 2026-08-18, user request ("no new buys after 2:45" -- 2:45 PM CDT = 15:45
 # ET -- then same day, refined to "change the eod close time and no trades
 # time to 3:50pm ET... after this no new entry positions only keep the
