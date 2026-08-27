@@ -1025,6 +1025,21 @@ SCAN_WORKERS        = 16   # Threads scanning symbols concurrently. Was capped a
                             # us actually checking it — pure throughput, doesn't change what gets
                             # traded, so it's not another variable in reading tomorrow's results.
 SCAN_SYMBOL_TIMEOUT = 15   # Max seconds per symbol before it is skipped
+
+# 2026-08-27, user request ("the 1 min check algo has to work in parallel
+# if needed to avoid overload issue"): check_ema9_exit,
+# check_pending_entries_ema, check_blocked_entries_ema all run on the
+# SoftwareStopPoller thread's tight 10s-tick budget and each does one
+# fresh (bypass_cache/force_fresh) bar fetch per symbol -- network I/O,
+# sequential, one symbol at a time before this. A busy day with many
+# open positions/pending entries/blocked entries could stack up enough
+# sequential fetches to run the tick past its budget. Lower than
+# SCAN_WORKERS (16) on purpose: these run 6x more often than a scan
+# cycle and typically cover far fewer symbols (positions/pending/blocked
+# counts, not the full 30-symbol universe) -- no need for the same
+# thread count, and the bar-fetch client pool is shared with the scan
+# threads too.
+POLLER_CHECK_WORKERS = 8
 # SCAN_MAX_SYMBOLS: unused as of 2026-08-26. Used to cap a much larger
 # multi-source combined universe (EDGAR/sympathy/movers/watchlist + an
 # ~80-symbol rotating fallback list on top of the TI batch) that

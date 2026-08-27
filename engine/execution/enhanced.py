@@ -11,6 +11,7 @@ import logging
 import datetime
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import deque
 from types import SimpleNamespace
 from typing import Optional, Dict, Tuple, Deque
@@ -35,6 +36,7 @@ from engine.config import (
     MAX_POSITIONS,
     SWAP_ON_FULL,
     SWAP_MIN_CONFIDENCE,
+    POLLER_CHECK_WORKERS,
     EXTENDED_HOURS,
     USE_DYNAMIC_TIERS,
     USE_RISK_EQUALIZED_SIZING,
@@ -717,6 +719,144 @@ def _demo() -> None:
         print("check_pending_entries_ema: all checks passed")
     finally:
         _check_ema_trend_alignment = _orig_gate2
+
+    # check_blocked_entries_ema: same 2026-08-27 parallelization request,
+    # applied to the fire/wait/expire loop. Verifies multiple queued
+    # symbols are each gate-checked (now concurrently) and correctly
+    # fire/wait/expire, that one symbol's gate check raising doesn't take
+    # down the rest, and that a raised gate check leaves that symbol
+    # queued (not silently dropped) rather than treated as a pass or fail.
+    _orig_gate3, _orig_scan3, _orig_window3 = _check_ema_trend_alignment, _get_scan_targets, ENTRY_WINDOW_END_ET
+    try:
+        class _BlockedClient:
+            def __init__(self):
+                self.submitted = []
+            def submit_order(self, req):
+                self.submitted.append(req)
+                return SimpleNamespace(id="fake-id")
+
+        def _fake_signal(sym):
+            return SimpleNamespace(symbol=sym)
+
+        class _BlockedStub:
+            check_blocked_entries_ema = EnhancedExecutor.check_blocked_entries_ema
+            _blocked_entry_action = staticmethod(EnhancedExecutor._blocked_entry_action)
+            def __init__(self):
+                self.client = _BlockedClient()
+                self._ema_blocked_entries = {}
+                self.fired = []
+            def _get_account(self, force_refresh=False):
+                return SimpleNamespace(equity=10000, buying_power=10000)
+            def _is_reentry_signal(self, sym, is_long):
+                return False
+            def _execute_entry(self, signal, acct, order_type, bypass_pdt=False):
+                self.fired.append(signal.symbol)
+                return True
+
+        ENTRY_WINDOW_END_ET = "23:59"
+        _get_scan_targets = lambda: ["GOOD1", "GOOD2", "BAD", "RAISES"]
+
+        def _gate_by_symbol(sig, is_long, force_fresh=False):
+            if sig.symbol == "RAISES":
+                raise RuntimeError("simulated fetch failure")
+            return (sig.symbol != "BAD", None)
+        _check_ema_trend_alignment = _gate_by_symbol
+
+        s = _BlockedStub()
+        for sym in ["GOOD1", "BAD", "RAISES"]:
+            s._ema_blocked_entries[sym] = {
+                "signal": _fake_signal(sym), "order_type": OrderType.LONG,
+                "queued_at": datetime.datetime.now(datetime.timezone.utc),
+            }
+        s.check_blocked_entries_ema()
+        assert s.fired == ["GOOD1"], f"only GOOD1 must fire, got {s.fired}"
+        assert "BAD" in s._ema_blocked_entries, "gate-fail (BAD) with time left in the window must stay queued, not be dropped"
+        assert "RAISES" in s._ema_blocked_entries, \
+            "a symbol whose gate check itself raised must stay queued for retry, not be dropped or treated as pass/fail"
+        assert "GOOD1" not in s._ema_blocked_entries, "a fired symbol must leave the queue"
+
+        # Past the entry window -> everything still queued expires, gate result irrelevant.
+        s2 = _BlockedStub()
+        s2._ema_blocked_entries["GOOD1"] = {
+            "signal": _fake_signal("GOOD1"), "order_type": OrderType.LONG,
+            "queued_at": datetime.datetime.now(datetime.timezone.utc),
+        }
+        ENTRY_WINDOW_END_ET = "00:00"  # already past for any real now_et
+        s2.check_blocked_entries_ema()
+        assert s2.fired == [], "past the entry window, nothing may fire even if the gate agrees"
+        assert "GOOD1" not in s2._ema_blocked_entries, "past the entry window, the queued entry must expire (be removed)"
+
+        print("check_blocked_entries_ema: all checks passed")
+    finally:
+        _check_ema_trend_alignment, _get_scan_targets, ENTRY_WINDOW_END_ET = _orig_gate3, _orig_scan3, _orig_window3
+
+    # check_ema9_exit: same 2026-08-27 parallelization request, applied to
+    # the fetch/decide phase (fresh bar fetch per same-day position).
+    # _update_ema9_peak/_ema9_trail_exit_reason are already covered by
+    # their own dedicated tests above -- this only needs to prove multiple
+    # positions get independently fetched/decided in the new parallel
+    # phase, the one that should exit actually reaches the sequential
+    # close path, and one symbol's fetch failing doesn't take down the
+    # rest. The exit decision is driven by a distinguishable close price
+    # per symbol from the mocked get_bars, run through the REAL
+    # _ema9_trail_exit_reason (not stubbed) -- exercises the actual logic,
+    # not just the wiring.
+    _orig_bars2 = get_bars
+    try:
+        class _Ema9Client:
+            def __init__(self, positions):
+                self._positions = positions
+                self.cancelled = []
+                self.orders = []
+            def get_all_positions(self):
+                return self._positions
+            def get_orders(self):
+                return self.orders
+            def cancel_order_by_id(self, order_id):
+                self.cancelled.append(order_id)
+
+        class _FakePos:
+            def __init__(self, symbol, qty, price):
+                self.symbol, self.qty, self.current_price = symbol, qty, price
+
+        class _Ema9Stub:
+            check_ema9_exit = EnhancedExecutor.check_ema9_exit
+            _update_ema9_peak = staticmethod(EnhancedExecutor._update_ema9_peak)
+            _ema9_trail_exit_reason = staticmethod(EnhancedExecutor._ema9_trail_exit_reason)
+            def __init__(self, positions):
+                self.client = _Ema9Client(positions)
+                self._entry_log = {p.symbol: {"date": datetime.date.today()} for p in positions}
+                # Pre-seed a peak well above the mocked EXIT1 reading below,
+                # so its very first check this call already shows a genuine
+                # pullback -- _update_ema9_peak's real "first observation
+                # becomes the peak" behavior would otherwise mean nothing
+                # can trigger on a symbol's first-ever check.
+                self._ema9_trail_peak = {"EXIT1": 100.0, "HOLD1": 1.0}
+                self.closed = []
+            def _submit_closing_order(self, sym, qty, side, current):
+                self.closed.append(sym)
+            def _maybe_rearm_reentry(self, sym, is_long, qty, tag):
+                pass
+
+        import pandas as _pd
+        def _bars_for(sym, *a, **k):
+            if sym == "FAILS":
+                raise RuntimeError("simulated fetch failure")
+            # EXIT1: was at peak 100, now way down -> real trailing-stop
+            # logic must flag it. HOLD1: right at its own peak -> must not.
+            close = 50.0 if sym == "EXIT1" else 1.0
+            return _pd.DataFrame({"close": [close] * (EMA_TREND_MIN_BARS + 1)})
+        get_bars = _bars_for
+
+        positions = [_FakePos("EXIT1", 5, 10.0), _FakePos("HOLD1", 5, 10.0), _FakePos("FAILS", 5, 10.0)]
+        s = _Ema9Stub(positions)
+        s.check_ema9_exit()
+        assert s.closed == ["EXIT1"], \
+            f"only the position that genuinely pulled back from its peak must close, got {s.closed}"
+
+        print("check_ema9_exit: all checks passed")
+    finally:
+        get_bars = _orig_bars2
 
 
 
@@ -4102,7 +4242,22 @@ class EnhancedExecutor:
         recheck like any other entry.
 
         Fail-open on missing/insufficient bar data. Scoped to same-day
-        entries only."""
+        entries only.
+
+        2026-08-27, user request ("the 1 min check algo has to work in
+        parallel if needed to avoid overload issue"): the fresh bar fetch
+        (bypass_cache=True) is a network call per open same-day position --
+        I/O-bound, previously one position at a time. Fetched/decided in
+        parallel via a small pool (POLLER_CHECK_WORKERS): each position's
+        peak tracking (_update_ema9_peak) only ever touches ITS OWN key in
+        self._ema9_trail_peak, so concurrent updates across different
+        symbols don't collide. Actually closing a position (cancel resting
+        order, submit the close, re-arm a re-entry) stays strictly
+        sequential in a second pass -- unrelated to any capital/PDT
+        concern here (each close only affects its own symbol), but there's
+        no benefit to parallelizing broker mutations that don't share a
+        bottleneck, and it keeps this exit path exactly as easy to reason
+        about as it was before."""
         if not STAGNANT_STOP_ENABLED:
             return
 
@@ -4114,6 +4269,7 @@ class EnhancedExecutor:
 
         today = datetime.date.today()
 
+        eligible = []  # (sym, qty, current, is_long)
         for pos in positions:
             sym = pos.symbol
             if re.match(r'^[A-Z]+\d{6}[CP]\d{8}$', sym):
@@ -4132,8 +4288,10 @@ class EnhancedExecutor:
                 continue
             if current <= 0:
                 continue
-            is_long = qty > 0
+            eligible.append((sym, qty, current, qty > 0))
 
+        def _fetch_and_decide(item):
+            sym, qty, current, is_long = item
             # 2026-08-27, user request ("it should have canceled the order"):
             # bypass_cache=True -- this is the actual per-minute stop-loss
             # trigger, not just a gate check; it must never read a snapshot
@@ -4143,13 +4301,25 @@ class EnhancedExecutor:
             # same BTDR case that exposed this in the re-entry gate).
             bars = get_bars(sym, period="1d", interval="1m", bypass_cache=True)
             if bars.empty or "close" not in bars.columns or len(bars) < EMA_TREND_MIN_BARS:
-                continue  # not enough data -- never force a decision on it
+                return item, None  # not enough data -- never force a decision on it
             ema9_now = float(bars["close"].ewm(span=9, adjust=False).mean().iloc[-1])
             peak = self._update_ema9_peak(self._ema9_trail_peak, sym, ema9_now, is_long)
             reason = self._ema9_trail_exit_reason(ema9_now, peak, is_long)
-            if reason is None:
-                continue
+            return item, reason
 
+        to_exit = []  # (item, reason)
+        if eligible:
+            with ThreadPoolExecutor(max_workers=min(POLLER_CHECK_WORKERS, len(eligible))) as pool:
+                futures = [pool.submit(_fetch_and_decide, item) for item in eligible]
+                for fut in as_completed(futures):
+                    try:
+                        item, reason = fut.result()
+                        if reason is not None:
+                            to_exit.append((item, reason))
+                    except Exception as e:
+                        log.warning(f"check_ema9_exit: fetch/decide failed for one position, skipping this poll: {e}")
+
+        for (sym, qty, current, is_long), reason in to_exit:
             # Cancel any resting order (the deferred GTC trailing stop, most
             # commonly) before closing -- the broker won't accept a second
             # order against qty that's already reserved by one.
@@ -4239,7 +4409,18 @@ class EnhancedExecutor:
         looks identical to a long entry's buy order except for this field).
         side determines is_long per order (buy=long entry, sell=short
         entry) rather than assuming buy, so short entries get the same
-        coverage as long ones."""
+        coverage as long ones.
+
+        2026-08-27, user request ("the 1 min check algo has to work in
+        parallel if needed to avoid overload issue"): the gate check per
+        order is a fresh (force_fresh=True) network bar fetch -- I/O-bound,
+        one per resting order, previously sequential. On a day with many
+        resting entries that stacks up real wall-clock time on the
+        10s-tick poller thread. Fetched/decided in parallel via a small
+        pool (POLLER_CHECK_WORKERS); the actual mutations (cancel, dict
+        writes) stay strictly sequential afterward in the main thread --
+        no shared mutable state is touched from worker threads, only the
+        read-only gate check runs concurrently."""
         try:
             from alpaca.trading.requests import GetOrdersRequest
             from alpaca.trading.enums import QueryOrderStatus
@@ -4249,6 +4430,7 @@ class EnhancedExecutor:
             log.warning(f"check_pending_entries_ema: could not list open orders, skipping this recheck: {e}")
             return
 
+        candidates = []  # (order, order_id, sym, is_long)
         pending_syms_seen = set()
         for order in open_orders:
             raw_type = getattr(order, "order_type", "")
@@ -4258,13 +4440,28 @@ class EnhancedExecutor:
             if getattr(order, "time_in_force", None) != TimeInForce.DAY:
                 continue  # GTC == protective exit stop, never touch it here
             sym = order.symbol
-            order_id = str(order.id)
             pending_syms_seen.add(sym)
             raw_side = getattr(order, "side", "")
             side = str(getattr(raw_side, "value", raw_side)).lower()
-            is_long = side == "buy"
+            candidates.append((order, str(order.id), sym, side == "buy"))
+
+        def _gate(item):
+            _order, order_id, sym, is_long = item
             sig_stub = SimpleNamespace(symbol=sym)
             ok, reason = _check_ema_trend_alignment(sig_stub, is_long, force_fresh=True)
+            return item, ok, reason
+
+        results = []
+        if candidates:
+            with ThreadPoolExecutor(max_workers=min(POLLER_CHECK_WORKERS, len(candidates))) as pool:
+                futures = [pool.submit(_gate, item) for item in candidates]
+                for fut in as_completed(futures):
+                    try:
+                        results.append(fut.result())
+                    except Exception as e:
+                        log.warning(f"check_pending_entries_ema: gate check failed, skipping this order this poll: {e}")
+
+        for (_order, order_id, sym, _is_long), ok, reason in results:
             if ok:
                 continue
             try:
@@ -4363,15 +4560,48 @@ class EnhancedExecutor:
         universe (get_scan_targets(), same as _maybe_rearm_reentry) rather
         than the raw, uncapped get_ti_primary() -- was checking membership
         in a ~90-100-ticker list when the equity scan itself only ever
-        trades 30 of them."""
+        trades 30 of them.
+
+        2026-08-27, user request ("the 1 min check algo has to work in
+        parallel if needed to avoid overload issue"): the gate check
+        (_check_ema_trend_alignment, force_fresh=True) is a fresh network
+        bar fetch per queued symbol -- I/O-bound, previously done one
+        symbol at a time. Fetched in parallel via a small pool
+        (POLLER_CHECK_WORKERS) as its own first pass; firing an entry
+        (_execute_entry, real capital/order-submission side effects) stays
+        strictly sequential in a second pass, same order and same logic as
+        before -- two blocked entries racing to spend the same buying
+        power in parallel would be a genuinely different (and worse) class
+        of bug than the one being fixed here, so only the read-only gate
+        check runs concurrently."""
         import pytz as _pytz
         _now_et = datetime.datetime.now(_pytz.timezone("America/New_York"))
         past_window = _now_et.strftime("%H:%M") > ENTRY_WINDOW_END_ET
         ti_universe = set(_get_scan_targets())
 
-        for sym, info in list(self._ema_blocked_entries.items()):
+        queued = list(self._ema_blocked_entries.items())
+
+        def _gate(item):
+            sym, info = item
+            gate_ok, _ = _check_ema_trend_alignment(info["signal"], info["order_type"] == OrderType.LONG, force_fresh=True)
+            return sym, gate_ok
+
+        gate_results: Dict[str, bool] = {}
+        if queued:
+            with ThreadPoolExecutor(max_workers=min(POLLER_CHECK_WORKERS, len(queued))) as pool:
+                futures = [pool.submit(_gate, item) for item in queued]
+                for fut in as_completed(futures):
+                    try:
+                        sym, gate_ok = fut.result()
+                        gate_results[sym] = gate_ok
+                    except Exception as e:
+                        log.warning(f"check_blocked_entries_ema: gate check failed, skipping this symbol this poll: {e}")
+
+        for sym, info in queued:
+            if sym not in gate_results:
+                continue  # this symbol's gate check itself failed above -- leave it queued, retry next poll
             signal, order_type = info["signal"], info["order_type"]
-            gate_ok, _ = _check_ema_trend_alignment(signal, order_type == OrderType.LONG, force_fresh=True)
+            gate_ok = gate_results[sym]
             action = self._blocked_entry_action(gate_ok, past_window, sym in ti_universe)
             if action == "wait":
                 continue
