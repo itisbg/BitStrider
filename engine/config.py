@@ -503,7 +503,19 @@ TRAILING_STOP_NORMAL  =  8.0  # default trailing stop
 # 2026-08-25, user request: 2.0% -> 1.0% -- tighter backstop now that entry
 # (_check_ema_trend_alignment, EMA7 delta + EMA7-vs-EMA15) and exit
 # (check_ema9_exit, an EMA9 trailing stop) both also gate on the trend.
-TRAIL_STOP_PCT = 1.0
+# 2026-08-26, user request: 1.0% -> 1.5%. The 1% setting whipsawed a
+# meaningful share of today's trades (several stopped out in single-digit
+# seconds -- BZ's worst loss of the day was a 36-second, -$4.48 stop-out).
+# A precise backtest to justify a specific replacement value wasn't
+# possible -- attempted a 2.5% comparison and a full percentage sweep, but
+# the sweep's own 1.0% baseline didn't reproduce today's actual results
+# even at the same setting (yfinance's free 1-min bar Low is noisier than
+# what a real resting stop order actually saw, so simulated fills triggered
+# well before the real ones did -- e.g. WOLF: real hold 40 min/+$4.75 vs.
+# simulated 5 min/-$1.48 on the identical trade). 1.5% is a live-tested
+# choice made without that data, not a backtested-optimal one -- judge it
+# from live results, not this comment.
+TRAIL_STOP_PCT = 1.5
 
 # Once a position is profitable, widen the trailing stop to give back only
 # this fraction of the unrealized gain -- e.g. +10% unrealized -> stop at
