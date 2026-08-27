@@ -37,6 +37,7 @@ Contains reusable scanning functions for main loop and run_top3 tools.
 
 import datetime
 import logging
+import time
 import pytz
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Tuple, Set, Optional
@@ -441,6 +442,46 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
         return False  # fail-safe: block on error, never bypass guardrails
 
 
+# 2026-08-26, user request ("thinly traded stocks should be removed from
+# universe to avoid too much fetchload to alpaca" / "ensure thinly traded
+# stocks removed from list"): a symbol used to sit in the scan target list
+# with genuinely thin liquidity for its whole time there -- it got fully
+# scanned (Alpaca intraday bars, snapshot prefetch, strategy evaluation)
+# every cycle, and only got rejected AFTER all that work, at the
+# _passes_guardrails() avg-daily-volume check. This pre-filters it out of
+# get_scan_targets() entirely, using the same threshold/data source as that
+# guardrail (get_daily_volume_bars, MIN_AVG_DAILY_VOLUME_REGULAR_HOURS) so
+# it's not a new liquidity bar, just enforced earlier.
+#
+# Cached separately from get_daily_volume_bars()'s own cache, which
+# clear_bar_cache() wipes every single scan cycle (1-3 min) -- 3-month
+# average daily volume doesn't meaningfully change within an hour, so a
+# 1-hour TTL here avoids re-fetching the same yfinance data every cycle.
+_thin_check_cache: Dict[str, Tuple[float, bool]] = {}
+_THIN_CHECK_TTL_SEC = 3600
+
+
+def _is_thinly_traded(symbol: str) -> bool:
+    """True if symbol's 3mo avg daily volume is below MIN_AVG_DAILY_VOLUME_REGULAR_HOURS.
+    Fails OPEN (not thin) on missing/errored data -- same as the guardrail's
+    own behavior, so a data hiccup doesn't wrongly prune a real symbol.
+    """
+    now = time.time()
+    cached = _thin_check_cache.get(symbol)
+    if cached is not None and (now - cached[0]) < _THIN_CHECK_TTL_SEC:
+        return cached[1]
+    is_thin = False
+    try:
+        daily = get_daily_volume_bars(symbol)
+        if not daily.empty and len(daily) >= 2:
+            avg_daily_vol = float(daily["volume"].iloc[:-1].mean())
+            is_thin = avg_daily_vol < MIN_AVG_DAILY_VOLUME_REGULAR_HOURS
+    except Exception as e:
+        _log.debug(f"{symbol}: thin-liquidity pre-check failed, failing open: {e}")
+    _thin_check_cache[symbol] = (now, is_thin)
+    return is_thin
+
+
 def get_scan_targets(excluded: Set[str] = None) -> List[str]:
     """Equity scan universe = Alpaca-movers queue + top TI_PRIMARY_SCAN_BATCH_LIMIT
     tickers from the latest Trade Ideas capture (data/ti_primary.json), TI in
@@ -504,6 +545,8 @@ def get_scan_targets(excluded: Set[str] = None) -> List[str]:
     targets = []
     for s in base:
         if s in excluded or s in delisted or is_dead_ticker(s):
+            continue
+        if _is_thinly_traded(s):
             continue
         targets.append(s)
     return targets
