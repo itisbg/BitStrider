@@ -135,7 +135,7 @@ def _check_momentum_freshness(signal: Signal) -> Tuple[bool, Optional[str]]:
     return True, None
 
 
-def _check_ema_trend_alignment(signal: Signal, is_long: bool) -> Tuple[bool, Optional[str]]:
+def _check_ema_trend_alignment(signal: Signal, is_long: bool, force_fresh: bool = False) -> Tuple[bool, Optional[str]]:
     """2026-08-22, user request: simplified from an EMA9-vs-EMA20 crossover
     to an EMA's own slope -- current-minute EMA minus the previous minute's
     EMA must be positive for a long entry, negative for a short (checked
@@ -175,10 +175,24 @@ def _check_ema_trend_alignment(signal: Signal, is_long: bool) -> Tuple[bool, Opt
     EMA_TREND_MIN_BARS of 1-min history) -- same philosophy as
     _check_momentum_freshness: never block a trade on data the bot doesn't
     have, only on data that actively contradicts it.
+
+    force_fresh=True bypasses get_bars()'s per-scan-cycle cache (see its
+    2026-08-27 docstring update). Pass it from any per-minute recheck
+    running on the SoftwareStopPoller thread (check_pending_entries_ema,
+    check_blocked_entries_ema, _maybe_rearm_reentry) -- that thread's whole
+    job is noticing a trend change since the last check, on a different
+    cadence than the equity scan that owns this cache; reading the scan's
+    stale snapshot there defeats the recheck. Confirmed live: BTDR's
+    resting re-entry order sat unfilled 2026-08-27 11:05-11:18 ET while
+    EMA7 was demonstrably below EMA15 the entire time, and
+    check_pending_entries_ema never cancelled it. Leave False for
+    _validate_trade's original signal-time check -- that one runs inside
+    the scan cycle that just populated the cache, so it's already correct
+    and re-fetching would just waste an API call.
     """
     if not EMA_TREND_FILTER_ENABLED:
         return True, None
-    bars = get_bars(signal.symbol, period="1d", interval="1m")
+    bars = get_bars(signal.symbol, period="1d", interval="1m", bypass_cache=force_fresh)
     if bars.empty or "close" not in bars.columns or len(bars) < EMA_TREND_MIN_BARS:
         return True, None
     closes     = bars["close"]
@@ -437,12 +451,12 @@ def _demo() -> None:
     import pandas as _pd
     _orig_get_bars = get_bars
     _sig_stub = Signal("TEST", "buy", 10.0, 0.9, "test", "TestStrat")
-    globals()["get_bars"] = lambda symbol, period, interval: _pd.DataFrame({"close": list(range(1, 40))})  # rising -> EMA7 delta positive, EMA7 above EMA15
+    globals()["get_bars"] = lambda symbol, period, interval, bypass_cache=False: _pd.DataFrame({"close": list(range(1, 40))})  # rising -> EMA7 delta positive, EMA7 above EMA15
     ok, reason = _check_ema_trend_alignment(_sig_stub, is_long=True)
     assert ok is True and reason is None, "rising EMA7 + EMA7>EMA15 must align with a long"
     ok, reason = _check_ema_trend_alignment(_sig_stub, is_long=False)
     assert ok is False and reason is not None, "rising EMA7 must reject a short"
-    globals()["get_bars"] = lambda symbol, period, interval: _pd.DataFrame({"close": list(range(40, 1, -1))})  # falling -> EMA7 delta negative, EMA7 below EMA15
+    globals()["get_bars"] = lambda symbol, period, interval, bypass_cache=False: _pd.DataFrame({"close": list(range(40, 1, -1))})  # falling -> EMA7 delta negative, EMA7 below EMA15
     ok, reason = _check_ema_trend_alignment(_sig_stub, is_long=False)
     assert ok is True and reason is None, "falling EMA7 + EMA7<EMA15 must align with a short"
     ok, reason = _check_ema_trend_alignment(_sig_stub, is_long=True)
@@ -451,15 +465,15 @@ def _demo() -> None:
     # freshly positive, but EMA7 hasn't caught up past the still-elevated,
     # slower-reacting EMA15 yet. Proves the crossover condition does real
     # work beyond the slope check alone (which would pass this on its own).
-    globals()["get_bars"] = lambda symbol, period, interval: _pd.DataFrame({"close": list(range(50, 10, -1)) + [11, 12, 13, 14, 15]})
+    globals()["get_bars"] = lambda symbol, period, interval, bypass_cache=False: _pd.DataFrame({"close": list(range(50, 10, -1)) + [11, 12, 13, 14, 15]})
     ok, reason = _check_ema_trend_alignment(_sig_stub, is_long=True)
     assert ok is False and reason is not None, "rising EMA7 delta but EMA7 still below EMA15 must reject a long"
     # mirror: a long rally that just turned down -- EMA7's delta freshly
     # negative, EMA7 hasn't dropped below the still-elevated EMA15 for a short.
-    globals()["get_bars"] = lambda symbol, period, interval: _pd.DataFrame({"close": list(range(10, 50)) + [49, 48, 47, 46, 45]})
+    globals()["get_bars"] = lambda symbol, period, interval, bypass_cache=False: _pd.DataFrame({"close": list(range(10, 50)) + [49, 48, 47, 46, 45]})
     ok, reason = _check_ema_trend_alignment(_sig_stub, is_long=False)
     assert ok is False and reason is not None, "falling EMA7 delta but EMA7 still above EMA15 must reject a short"
-    globals()["get_bars"] = lambda symbol, period, interval: _pd.DataFrame()
+    globals()["get_bars"] = lambda symbol, period, interval, bypass_cache=False: _pd.DataFrame()
     ok, reason = _check_ema_trend_alignment(_sig_stub, is_long=True)
     assert ok is True and reason is None, "empty bars must fail open, never block"
     globals()["get_bars"] = _orig_get_bars
@@ -546,7 +560,7 @@ def _demo() -> None:
         stopped_out = EnhancedExecutor.detect_stopped_out_positions
 
         # Case 1: gate agrees -> submits a real re-entry order.
-        _check_ema_trend_alignment = lambda sig, is_long: (True, None)
+        _check_ema_trend_alignment = lambda sig, is_long, force_fresh=False: (True, None)
         s = _ReentryStub()
         rearm(s, "FOO", True, 10, "TEST")
         assert len(s.client.submitted) == 1, "gate-ok must submit exactly one order"
@@ -555,7 +569,7 @@ def _demo() -> None:
         assert "FOO" not in s._ema_blocked_entries, "a successful arm must not also queue a retry"
 
         # Case 2: gate disagrees -> queues for per-minute retry instead of giving up.
-        _check_ema_trend_alignment = lambda sig, is_long: (False, "trend not aligned")
+        _check_ema_trend_alignment = lambda sig, is_long, force_fresh=False: (False, "trend not aligned")
         s = _ReentryStub()
         rearm(s, "FOO", True, 10, "TEST")
         assert len(s.client.submitted) == 0, "gate-fail must not submit an order"
@@ -565,7 +579,7 @@ def _demo() -> None:
         assert q["signal"].symbol == "FOO" and q["order_type"] == OrderType.LONG, "queued signal must carry the right symbol/direction"
 
         # Case 3: symbol not in the top-30 scan universe -> no order, no queue.
-        _check_ema_trend_alignment = lambda sig, is_long: (True, None)  # would pass if it got there
+        _check_ema_trend_alignment = lambda sig, is_long, force_fresh=False: (True, None)  # would pass if it got there
         s = _ReentryStub()
         rearm(s, "BAZ", True, 10, "TEST")
         assert len(s.client.submitted) == 0, "outside top-30 must not submit"
@@ -584,7 +598,7 @@ def _demo() -> None:
         # Case 5: detect_stopped_out_positions re-arms an UNMARKED close (a
         # genuine broker-side stop firing on its own, with no explicit
         # _no_rearm from any closing path).
-        _check_ema_trend_alignment = lambda sig, is_long: (True, None)
+        _check_ema_trend_alignment = lambda sig, is_long, force_fresh=False: (True, None)
         s = _ReentryStub()
         s._last_known_positions = {"FOO": {"entry_price": 1.0, "last_price": 1.0, "is_long": True, "qty": 10}}
         stopped_out(s)
@@ -3833,7 +3847,7 @@ class EnhancedExecutor:
                 log.info(f"{tag} {sym}: no longer in the top-30 scan universe — not re-arming a re-entry")
                 return
             sig_stub = SimpleNamespace(symbol=sym)
-            gate_ok, gate_reason = _check_ema_trend_alignment(sig_stub, is_long)
+            gate_ok, gate_reason = _check_ema_trend_alignment(sig_stub, is_long, force_fresh=True)
             if not gate_ok:
                 # 2026-08-26, user request ("will the 1 minute check will
                 # reenter the exited runners" -- confirmed this needed
@@ -3951,7 +3965,14 @@ class EnhancedExecutor:
                 continue
             is_long = qty > 0
 
-            bars = get_bars(sym, period="1d", interval="1m")
+            # 2026-08-27, user request ("it should have canceled the order"):
+            # bypass_cache=True -- this is the actual per-minute stop-loss
+            # trigger, not just a gate check; it must never read a snapshot
+            # the equity scan cached possibly several minutes ago. See
+            # get_bars()'s 2026-08-27 docstring update / _check_ema_trend_
+            # alignment's force_fresh for the full reasoning (found via the
+            # same BTDR case that exposed this in the re-entry gate).
+            bars = get_bars(sym, period="1d", interval="1m", bypass_cache=True)
             if bars.empty or "close" not in bars.columns or len(bars) < EMA_TREND_MIN_BARS:
                 continue  # not enough data -- never force a decision on it
             ema9_now = float(bars["close"].ewm(span=9, adjust=False).mean().iloc[-1])
@@ -4048,7 +4069,7 @@ class EnhancedExecutor:
             side = str(getattr(raw_side, "value", raw_side)).lower()
             is_long = side == "buy"
             sig_stub = SimpleNamespace(symbol=sym)
-            ok, reason = _check_ema_trend_alignment(sig_stub, is_long)
+            ok, reason = _check_ema_trend_alignment(sig_stub, is_long, force_fresh=True)
             if ok:
                 continue
             try:
@@ -4142,7 +4163,7 @@ class EnhancedExecutor:
 
         for sym, info in list(self._ema_blocked_entries.items()):
             signal, order_type = info["signal"], info["order_type"]
-            gate_ok, _ = _check_ema_trend_alignment(signal, order_type == OrderType.LONG)
+            gate_ok, _ = _check_ema_trend_alignment(signal, order_type == OrderType.LONG, force_fresh=True)
             action = self._blocked_entry_action(gate_ok, past_window, sym in ti_universe)
             if action == "wait":
                 continue

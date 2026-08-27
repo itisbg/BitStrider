@@ -295,11 +295,29 @@ def _get_bars_yfinance(symbol: str, period: str, interval: str, log) -> pd.DataF
         return df
     return pd.DataFrame()
 
-def get_bars(symbol: str, period: str = "5d", interval: str = "15m") -> pd.DataFrame:
+def get_bars(symbol: str, period: str = "5d", interval: str = "15m", bypass_cache: bool = False) -> pd.DataFrame:
     """Fetch OHLCV bars via Alpaca (yfinance fallback).
 
     Results are cached per (symbol, period, interval) for the current scan
     cycle. Call clear_bar_cache() to reset at cycle start.
+
+    2026-08-27, user request ("but the ema7 isn't above ema 15" / "it should
+    have canceled the order"): this cache is scoped to the EQUITY SCAN's own
+    cycle (cleared by clear_bar_cache() at scan_universe() start) -- but the
+    SoftwareStopPoller thread's per-minute EMA-gate rechecks
+    (check_pending_entries_ema, check_ema9_exit, _maybe_rearm_reentry, etc.)
+    run on a totally separate cadence/thread whose entire job is detecting a
+    trend CHANGE since the last check. Reading the scan's cache there is a
+    scope mismatch: if a symbol wasn't refetched by a recent scan pass (e.g.
+    briefly excluded from scan targets while a position is open), the poller
+    could keep reading a stale snapshot for as long as that symbol goes
+    unrefreshed -- confirmed live: BTDR's resting re-entry order sat
+    unfilled 2026-08-27 11:05-11:18 ET while EMA7 was demonstrably below
+    EMA15 the entire time (verified independently via both Alpaca's own IEX
+    bars and yfinance), yet check_pending_entries_ema never cancelled it.
+    bypass_cache=True skips the cache READ (still populates the cache after
+    a fresh fetch, so scan-cycle consumers still benefit) -- used by every
+    correctness-critical per-minute recheck in the poller thread.
     """
     symbol = symbol.strip().upper().lstrip("$")
     log = logging.getLogger("ApexTrader")
@@ -321,10 +339,11 @@ def get_bars(symbol: str, period: str = "5d", interval: str = "15m") -> pd.DataF
         return pd.DataFrame()
 
     cache_key = (symbol, period, interval)
-    with _bar_cache_lock:
-        if cache_key in _bar_cache:
-            log.debug(f"{symbol}: bar cache hit ({period}/{interval})")
-            return _bar_cache[cache_key]
+    if not bypass_cache:
+        with _bar_cache_lock:
+            if cache_key in _bar_cache:
+                log.debug(f"{symbol}: bar cache hit ({period}/{interval})")
+                return _bar_cache[cache_key]
 
     # ── Alpaca path with retry ──
     if ALPACA_AVAILABLE:
