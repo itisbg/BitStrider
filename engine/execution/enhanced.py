@@ -610,6 +610,114 @@ def _demo() -> None:
         )
     print("_maybe_rearm_reentry / detect_stopped_out_positions: all checks passed")
 
+    # check_pending_entries_ema: 2026-08-27, user request ("ensure 1min
+    # checks are robust to cancel unfilled order if conditions change").
+    # Rewritten to query the broker directly (see the method's own
+    # docstring for why order_cache alone missed a real duplicate-order
+    # case live) -- these checks target that rewrite directly: multiple
+    # resting entries per symbol both get rechecked, a GTC protective stop
+    # is never touched even on a universal gate-fail, side determines
+    # long/short correctly, and stale cache references get swept.
+    _orig_gate2 = _check_ema_trend_alignment
+    try:
+        class _FakeOrderObj:
+            def __init__(self, symbol, order_id, side, otype, tif):
+                self.symbol, self.id, self.side, self.order_type, self.time_in_force = (
+                    symbol, order_id, side, otype, tif
+                )
+
+        class _PendingClient:
+            def __init__(self, orders):
+                self._orders = orders
+                self.cancelled = []
+                self.list_calls = 0
+            def get_orders(self, filter=None):
+                self.list_calls += 1
+                return self._orders
+            def cancel_order_by_id(self, order_id):
+                self.cancelled.append(order_id)
+
+        class _PendingStub:
+            check_pending_entries_ema = EnhancedExecutor.check_pending_entries_ema
+            def __init__(self, orders):
+                self.client = _PendingClient(orders)
+                self.order_cache = {}
+                self._pending_entry_signals = {}
+                self._ema_blocked_entries = {}
+
+        # Case 1: two separate DAY trailing-buy orders resting on the SAME
+        # symbol (the live scenario that exposed this) -- both must be
+        # independently rechecked and, on a gate-fail, both cancelled.
+        # order_cache only ever knew about one of them (the classic
+        # single-slot-overwrite gap), confirmed by leaving it pointed at
+        # a THIRD, unrelated fake id below.
+        orders = [
+            _FakeOrderObj("DUP", "id-1", OrderSide.BUY, AlpacaOrderType.TRAILING_STOP, TimeInForce.DAY),
+            _FakeOrderObj("DUP", "id-2", OrderSide.BUY, AlpacaOrderType.TRAILING_STOP, TimeInForce.DAY),
+        ]
+        s = _PendingStub(orders)
+        s.order_cache["DUP"] = "id-1"  # stale single-slot reference, deliberately
+        _check_ema_trend_alignment = lambda sig, is_long, force_fresh=False: (False, "trend not aligned")
+        s.check_pending_entries_ema()
+        assert set(s.client.cancelled) == {"id-1", "id-2"}, \
+            f"both resting entries for the same symbol must be cancelled independently, got {s.client.cancelled}"
+        assert "DUP" not in s.order_cache, "order_cache must be cleared once its tracked order resolves"
+
+        # Case 2: a GTC trailing_stop (protective exit stop) must NEVER be
+        # touched here, even with a gate check that fails everything --
+        # this is the safety-critical case (a held short's buy-to-cover
+        # protective stop looks identical except for time_in_force).
+        orders = [
+            _FakeOrderObj("SHRT", "protect-1", OrderSide.BUY, AlpacaOrderType.TRAILING_STOP, TimeInForce.GTC),
+        ]
+        s = _PendingStub(orders)
+        _check_ema_trend_alignment = lambda sig, is_long, force_fresh=False: (False, "trend not aligned")
+        s.check_pending_entries_ema()
+        assert s.client.cancelled == [], \
+            f"a GTC trailing stop must never be cancelled by this check (it's a protective exit, not an entry), got {s.client.cancelled}"
+
+        # Case 3: a short entry (side=sell) must be evaluated with
+        # is_long=False, not assumed long.
+        captured = []
+        def _capture_gate(sig, is_long, force_fresh=False):
+            captured.append(is_long)
+            return (True, None)  # gate passes -> no cancel, just checking the arg
+        orders = [
+            _FakeOrderObj("SHORTENT", "id-s", OrderSide.SELL, AlpacaOrderType.TRAILING_STOP, TimeInForce.DAY),
+        ]
+        s = _PendingStub(orders)
+        _check_ema_trend_alignment = _capture_gate
+        s.check_pending_entries_ema()
+        assert captured == [False], f"a sell-side entry order must be checked as a short (is_long=False), got {captured}"
+        assert s.client.cancelled == [], "gate-pass must not cancel"
+
+        # Case 4: order_cache/_pending_entry_signals references for a
+        # symbol with no resting entry order left at the broker (filled
+        # or cancelled elsewhere) are stale -- must be swept even though
+        # nothing was cancelled THIS poll.
+        s = _PendingStub(orders=[])  # broker reports nothing resting at all
+        s.order_cache["GONE"] = "stale-id"
+        s._pending_entry_signals["GONE"] = {"signal": None, "order_type": None}
+        _check_ema_trend_alignment = lambda sig, is_long, force_fresh=False: (True, None)
+        s.check_pending_entries_ema()
+        assert "GONE" not in s.order_cache, "a stale order_cache entry with nothing resting at the broker must be swept"
+        assert "GONE" not in s._pending_entry_signals, "a stale pending-signal entry must be swept the same way"
+
+        # Case 5: broker listing itself fails -- must not raise, must not
+        # touch any state (fail closed / no-op, not fail open).
+        class _FailingClient(_PendingClient):
+            def get_orders(self, filter=None):
+                raise RuntimeError("simulated broker outage")
+        s = _PendingStub(orders=[])
+        s.client = _FailingClient([])
+        s.order_cache["SAFE"] = "id-safe"
+        s.check_pending_entries_ema()  # must not raise
+        assert s.order_cache.get("SAFE") == "id-safe", "a broker-listing failure must leave existing state untouched, not wipe it"
+
+        print("check_pending_entries_ema: all checks passed")
+    finally:
+        _check_ema_trend_alignment = _orig_gate2
+
 
 
 
@@ -876,7 +984,21 @@ class EnhancedExecutor:
         recovered order that later gets cancelled by check_pending_entries_ema
         just won't requeue, same graceful degradation that already applies
         to every check_ema9_exit-armed re-entry (which never had a stored
-        signal either -- see that method's docstring)."""
+        signal either -- see that method's docstring).
+
+        2026-08-27, found while hardening check_pending_entries_ema
+        ("ensure 1min checks are robust to cancel unfilled order if
+        conditions change"): side=="buy" + trailing_stop alone is NOT
+        enough to identify an entry order -- a SHORT position's protective
+        buy-to-cover stop is submitted with the exact same side and order
+        type (see _create_bracket_order/protect_positions), differing only
+        in time_in_force (GTC for the protective stop, DAY for a real
+        entry). LONG_ONLY_MODE=False on this account, so shorts are live:
+        without this check, a held short's protective stop could get
+        registered here as if it were a stale pending entry, and later
+        genuinely CANCELLED by check_pending_entries_ema on an EMA-gate
+        miss -- leaving a live short position completely unprotected.
+        time_in_force==DAY is the actual distinguishing signal, not side."""
         try:
             from alpaca.trading.requests import GetOrdersRequest
             from alpaca.trading.enums import QueryOrderStatus
@@ -884,12 +1006,12 @@ class EnhancedExecutor:
             open_orders = self.client.get_orders(filter=req)
             recovered = []
             for order in open_orders:
-                raw_side = getattr(order, "side", "")
-                side = str(getattr(raw_side, "value", raw_side)).lower()
                 raw_type = getattr(order, "order_type", "")
                 otype = str(getattr(raw_type, "value", raw_type)).lower()
-                if side != "buy" or "trailing_stop" not in otype:
-                    continue  # only entry-side trailing-buys belong in order_cache
+                if "trailing_stop" not in otype:
+                    continue
+                if getattr(order, "time_in_force", None) != TimeInForce.DAY:
+                    continue  # GTC trailing stop == protective exit order, never an entry
                 self.order_cache[order.symbol] = str(order.id)
                 recovered.append(order.symbol)
             if recovered:
@@ -4094,31 +4216,50 @@ class EnhancedExecutor:
         stored signal (e.g. check_ema9_exit's re-entry re-arm, which has
         no real Signal to requeue with) -- just cancels, same as before.
 
-        Only touches orders in self.order_cache -- that dict is populated
-        by entry submissions (_create_bracket_order and its re-chase path)
-        and, as of 2026-08-25, check_ema9_exit's gated re-entry re-arm too
-        (see that method's docstring) -- never by exit/protective orders,
-        so there's no risk of this cancelling a stop or a closing order.
-        A re-armed re-entry gets exactly the same per-minute EMA7-delta +
-        EMA7-vs-EMA15 recheck-and-cancel treatment as any other pending
-        entry, with no special-casing needed here."""
-        for sym, order_id in list(self.order_cache.items()):
-            try:
-                order = self.client.get_order_by_id(order_id)
-            except Exception as e:
-                # 2026-08-27, user request ("improve the 1min checks to have
-                # better reliability"): was log.debug -- APEXTRADER_LOG_LEVEL
-                # defaults to INFO, so a repeated lookup failure here was
-                # completely invisible; this order would just sit pending,
-                # never rechecked, never cancelled, with zero trace in the
-                # log of why. Elevated to warning so a real failure pattern
-                # (vs. one transient blip) is at least visible going forward.
-                log.warning(f"check_pending_entries_ema {sym}: order lookup failed, skipping this recheck: {e}")
+        2026-08-27, user request ("ensure 1min checks are robust to cancel
+        unfilled order if conditions change"): used to iterate
+        self.order_cache (Dict[str, str], one order id per symbol) --
+        confirmed live that two genuinely separate entry paths (a fresh
+        scan-cycle signal and a check_blocked_entries_ema re-fire, ~45s
+        apart) can each submit their own trailing-buy for the SAME symbol;
+        the second write silently overwrote the first in order_cache, so
+        only the newer order was ever rechecked here -- the older one, if
+        still resting, was invisible to this whole function and would
+        fill unconditionally regardless of what fresh EMA data said.
+
+        Queries the broker directly instead -- one open-orders list call
+        covers every resting entry order regardless of how many exist per
+        symbol or whether order_cache's bookkeeping is complete. Filters
+        on trailing_stop + time_in_force==DAY specifically: that combination
+        is what every entry order in this file submits (_create_bracket_order,
+        its re-chase path, check_ema9_exit's re-arm, _maybe_rearm_reentry).
+        A GTC trailing_stop is a protective exit stop, not an entry --
+        see _rebuild_order_cache_from_broker's docstring for the live risk
+        of conflating the two (a held short's buy-to-cover protective stop
+        looks identical to a long entry's buy order except for this field).
+        side determines is_long per order (buy=long entry, sell=short
+        entry) rather than assuming buy, so short entries get the same
+        coverage as long ones."""
+        try:
+            from alpaca.trading.requests import GetOrdersRequest
+            from alpaca.trading.enums import QueryOrderStatus
+            req = GetOrdersRequest(status=QueryOrderStatus.OPEN)
+            open_orders = self.client.get_orders(filter=req)
+        except Exception as e:
+            log.warning(f"check_pending_entries_ema: could not list open orders, skipping this recheck: {e}")
+            return
+
+        pending_syms_seen = set()
+        for order in open_orders:
+            raw_type = getattr(order, "order_type", "")
+            otype = str(getattr(raw_type, "value", raw_type)).lower()
+            if "trailing_stop" not in otype:
                 continue
-            status = str(getattr(order, "status", "")).lower()
-            if status not in {"new", "partially_filled", "pending_new", "accepted", "held"}:
-                self._pending_entry_signals.pop(sym, None)  # no longer pending -- stale reference
-                continue  # already filled, cancelled, or expired elsewhere -- nothing to re-check
+            if getattr(order, "time_in_force", None) != TimeInForce.DAY:
+                continue  # GTC == protective exit stop, never touch it here
+            sym = order.symbol
+            order_id = str(order.id)
+            pending_syms_seen.add(sym)
             raw_side = getattr(order, "side", "")
             side = str(getattr(raw_side, "value", raw_side)).lower()
             is_long = side == "buy"
@@ -4128,7 +4269,8 @@ class EnhancedExecutor:
                 continue
             try:
                 self.client.cancel_order_by_id(order_id)
-                self.order_cache.pop(sym, None)
+                if self.order_cache.get(sym) == order_id:
+                    self.order_cache.pop(sym, None)
                 pending = self._pending_entry_signals.pop(sym, None)
                 if pending is not None:
                     self._ema_blocked_entries[sym] = {
@@ -4140,6 +4282,18 @@ class EnhancedExecutor:
                     log.warning(f"PENDING ENTRY CANCELLED {sym}: still unfilled and {reason}")
             except Exception as e:
                 log.warning(f"check_pending_entries_ema {sym}: cancel failed: {e}")
+
+        # order_cache/_pending_entry_signals entries for symbols with no
+        # resting entry order left at the broker are stale references
+        # (filled, or cancelled elsewhere) -- drop them so a future
+        # _validate_trade pending-order-guard check doesn't block on a
+        # dead order id.
+        for sym in list(self.order_cache.keys()):
+            if sym not in pending_syms_seen:
+                self.order_cache.pop(sym, None)
+        for sym in list(self._pending_entry_signals.keys()):
+            if sym not in pending_syms_seen:
+                self._pending_entry_signals.pop(sym, None)
 
     @staticmethod
     def _blocked_entry_action(gate_ok: bool, past_window: bool, in_universe: bool) -> str:
