@@ -30,7 +30,7 @@ from engine.ti.ti import get_scans, is_valid_ti_ticker, scrape_tradeideas
 
 log = logging.getLogger("ApexTrader")
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent  # engine/equity/discovery.py -> equity -> engine -> repo root
 
 # ── Module-level state ─────────────────────────────────────────────────────
 trending_stocks:           List[Dict] = []
