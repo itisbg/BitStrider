@@ -22,6 +22,7 @@ from __future__ import annotations
 import concurrent.futures
 import datetime
 import logging
+import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -87,6 +88,11 @@ _logging.getLogger("webdriver_manager").setLevel(_logging.ERROR)
 # reliability as the whole logic is dependent on it"): liveness tracking
 # for the SoftwareStopPoller thread -- see _start_software_stop_thread and
 # _poller_staleness_job.
+#
+# Same date, separate issue ("why the 3mins web scrapping is not
+# happening"): TI capture liveness/trigger state -- see _ti_capture_job.
+_last_ti_capture_ts: float = 0.0
+_ti_capture_proc: Optional[subprocess.Popen] = None
 _last_poller_tick: float = 0.0
 _poller_stale_alerted: bool = False
 
@@ -291,7 +297,7 @@ def _build_scan_targets(ctx: AppContext) -> Tuple[List[str], set]:
     # marketable chase, so it's safe to let it be re-scanned/re-signaled.
     # _validate_trade's cooldown check was removed the same way -- see there
     # for the SOXS precedent (22 rapid re-entries, -$605) this replaces.
-    targets = filter_universe_by_positions(get_scan_targets(), excluded)
+    targets = filter_universe_by_positions(get_scan_targets(market_state=ctx.market_state), excluded)
     log.info(
         f"[SCAN] {len(targets)} symbols (filtered, {cfg.SCAN_WORKERS} workers): "
         f"{', '.join(targets)}"
@@ -917,7 +923,7 @@ def scan_top3_only(ctx: AppContext) -> None:
     log.info(f"Market sentiment: {sentiment}")
     _run_discovery(ctx, market_state)
     _, _, excluded = get_live_holdings(ctx.client)
-    scan_targets   = get_scan_targets(excluded)
+    scan_targets   = get_scan_targets(excluded, market_state=market_state)
     log.info(f"Top3 mode: scanning {len(scan_targets)} symbols ({len(excluded)} pre-excluded)")
     signals, _, scan_errors = scan_universe(scan_targets, sentiment, market_state)
     log.info(f"Scan errors: {scan_errors} | Signals: {len(signals)}")
@@ -1087,6 +1093,104 @@ def _poller_staleness_job() -> None:
         _poller_stale_alerted = True
 
 
+# (start_ET, end_ET, interval_minutes) as (hour, minute) pairs -- same 4-tier
+# cadence previously configured on the Windows Scheduled Task
+# ApexTraderTICapture (scripts/update_ti_capture_schedule_4tier.ps1): fast
+# 3-min sweeps right after the open and into the close, wider spacing
+# through the midday lull.
+_TI_CAPTURE_TIERS = [
+    ((9, 25),  (10, 30), 3),
+    ((10, 30), (12, 30), 5),
+    ((12, 30), (14, 50), 10),
+    ((14, 50), (15, 50), 3),
+]
+
+_TI_CAPTURE_MAX_RUNTIME_SEC = 300  # generous vs. the ~15-45s observed normal runtime
+
+
+def _ti_capture_interval_min(now_et: datetime.datetime) -> Optional[int]:
+    """Return the configured interval (minutes) for now_et's tier, or None if
+    outside all tiers (no capture window right now)."""
+    hm = (now_et.hour, now_et.minute)
+    for start, end, interval in _TI_CAPTURE_TIERS:
+        if start <= hm < end:
+            return interval
+    return None
+
+
+def _ti_capture_job(now_et: Optional[datetime.datetime] = None) -> None:
+    """Scheduled every minute (see run()) -- launches the TI-capture wrapper
+    directly from this (already-reliable, long-running) process instead of
+    via the Windows Scheduled Task.
+
+    2026-08-27, user report ("why the 3mins web scrapping is not happening" /
+    "I am concerned now why the TI scrapping stopped"): ApexTraderTICapture
+    (Task Scheduler) was found hanging on effectively every launch that day
+    -- confirmed via the Task Scheduler event log (every Task-Scheduler-
+    launched instance stalled at 0% CPU with zero children spawned, eventually
+    force-killed by its own 10-minute ExecutionTimeLimit, then the next
+    trigger reused the same wedged state and hung again) while the IDENTICAL
+    script launched directly (python -m equivalent, or PowerShell's own
+    Start-Process) completed cleanly in 15-45s every single time, no
+    exceptions. Root cause in the Windows Task Scheduler launch path itself
+    was not pinned down (OneDrive Files-On-Demand hydration was checked and
+    ruled out -- the repo's files are already pinned/local); user chose to
+    route around it rather than keep debugging Windows internals. This job
+    reuses the exact same wrapper script Task Scheduler was invoking
+    (scripts/run_ti_capture_task.ps1, which itself calls
+    engine/ti/capture_tradeideas.py) via subprocess.Popen -- the launch
+    mechanism already proven reliable -- so the Task Scheduler task itself
+    should be disabled once this is live (see scripts/disable_ti_task.ps1)
+    to stop it silently hanging every cycle in parallel.
+
+    Overlap/hang guard: since Task Scheduler's own ExecutionTimeLimit no
+    longer applies, this job now owns that responsibility -- a prior
+    instance still running past _TI_CAPTURE_MAX_RUNTIME_SEC is treated as
+    wedged and killed (whole process tree, since Edge/msedgedriver survive
+    under the PowerShell parent) before a fresh one is launched.
+    """
+    global _last_ti_capture_ts, _ti_capture_proc
+
+    if now_et is None:
+        now_et = datetime.datetime.now(pytz.timezone("America/New_York"))
+    interval_min = _ti_capture_interval_min(now_et)
+    if interval_min is None:
+        return  # outside all capture windows today
+
+    if _ti_capture_proc is not None and _ti_capture_proc.poll() is None:
+        age = time.time() - _last_ti_capture_ts
+        if age < _TI_CAPTURE_MAX_RUNTIME_SEC:
+            return  # still within its normal runtime budget -- let it finish
+        log.warning(
+            f"[TI-CAPTURE] previous run still alive after {age:.0f}s "
+            f"(> {_TI_CAPTURE_MAX_RUNTIME_SEC}s budget) -- treating as wedged, killing tree"
+        )
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(_ti_capture_proc.pid)],
+                capture_output=True, timeout=15,
+            )
+        except Exception as e:
+            log.warning(f"[TI-CAPTURE] failed to kill wedged instance: {e}")
+        _ti_capture_proc = None
+
+    if time.time() - _last_ti_capture_ts < interval_min * 60:
+        return
+
+    script = Path(__file__).resolve().parent.parent / "scripts" / "run_ti_capture_task.ps1"
+    try:
+        _ti_capture_proc = subprocess.Popen(
+            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+             "-WindowStyle", "Hidden", "-File", str(script)],
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        _last_ti_capture_ts = time.time()
+        log.info(f"[TI-CAPTURE] launched (tier interval={interval_min}min, pid={_ti_capture_proc.pid})")
+    except Exception as e:
+        log.error(f"[TI-CAPTURE] failed to launch: {e}")
+        _last_ti_capture_ts = time.time()  # don't hot-loop retrying every minute on a persistent failure
+
+
 def _start_options_scan_thread(ctx: AppContext) -> None:
     """Spawn a daemon thread that runs the options monitor + new-entry cycle
     (_run_options_cycle) on its own OPTIONS_SCAN_INTERVAL_MIN timer,
@@ -1214,6 +1318,7 @@ def start() -> None:
     schedule.every(1).minutes.do(_guardrail_close_job, ctx)
     schedule.every(1).minutes.do(_eod_close_job, ctx)
     schedule.every(1).minutes.do(_poller_staleness_job)
+    schedule.every(1).minutes.do(_ti_capture_job)
     _schedule_on_clock_grid(cfg.PRICE_DRIFT_CHECK_INTERVAL_MIN, _price_drift_stop_job, ctx)
     _schedule_on_clock_grid(cfg.SWING_DRIFT_STOP_CHECK_INTERVAL_MIN, _swing_drift_stop_job, ctx)
     # Per-minute EMA exit check (check_ema9_exit) runs on the
@@ -1370,6 +1475,89 @@ def _demo() -> None:
         print("_poller_staleness_job: all checks passed")
     finally:
         _last_poller_tick, _poller_stale_alerted, send_email = _orig_tick, _orig_alerted, _orig_email
+
+    # ── _ti_capture_job / _ti_capture_interval_min ──────────────────────────
+    global _last_ti_capture_ts, _ti_capture_proc
+    _orig_ts, _orig_proc = _last_ti_capture_ts, _ti_capture_proc
+    _orig_popen, _orig_run = subprocess.Popen, subprocess.run
+    ET = pytz.timezone("America/New_York")
+
+    class _FakeProc:
+        def __init__(self, pid, alive=True):
+            self.pid = pid
+            self._alive = alive
+        def poll(self):
+            return None if self._alive else 0
+
+    try:
+        # Tier lookup: inside each tier, and the gaps between/around them.
+        assert _ti_capture_interval_min(ET.localize(datetime.datetime(2026, 8, 27, 9, 24))) is None, "before first tier"
+        assert _ti_capture_interval_min(ET.localize(datetime.datetime(2026, 8, 27, 9, 25))) == 3, "tier 1 start (inclusive)"
+        assert _ti_capture_interval_min(ET.localize(datetime.datetime(2026, 8, 27, 10, 29))) == 3, "tier 1 end (exclusive upper)"
+        assert _ti_capture_interval_min(ET.localize(datetime.datetime(2026, 8, 27, 10, 30))) == 5, "tier 2 start"
+        assert _ti_capture_interval_min(ET.localize(datetime.datetime(2026, 8, 27, 11, 45))) == 5, "mid tier 2"
+        assert _ti_capture_interval_min(ET.localize(datetime.datetime(2026, 8, 27, 12, 30))) == 10, "tier 3 start"
+        assert _ti_capture_interval_min(ET.localize(datetime.datetime(2026, 8, 27, 14, 49))) == 10, "tier 3 end"
+        assert _ti_capture_interval_min(ET.localize(datetime.datetime(2026, 8, 27, 14, 50))) == 3, "tier 4 start"
+        assert _ti_capture_interval_min(ET.localize(datetime.datetime(2026, 8, 27, 15, 49))) == 3, "tier 4 end"
+        assert _ti_capture_interval_min(ET.localize(datetime.datetime(2026, 8, 27, 15, 50))) is None, "after last tier"
+        assert _ti_capture_interval_min(ET.localize(datetime.datetime(2026, 8, 27, 3, 0))) is None, "middle of the night"
+
+        popen_calls = []
+        def _fake_popen(*a, **kw):
+            popen_calls.append((a, kw))
+            return _FakeProc(pid=len(popen_calls) + 1000)
+        run_calls = []
+        subprocess.Popen = _fake_popen
+        subprocess.run = lambda *a, **kw: run_calls.append((a, kw))
+
+        t9_25 = ET.localize(datetime.datetime(2026, 8, 27, 9, 25))
+
+        # Outside any tier -> never launches, regardless of state.
+        _last_ti_capture_ts, _ti_capture_proc = 0.0, None
+        _ti_capture_job(now_et=ET.localize(datetime.datetime(2026, 8, 27, 3, 0)))
+        assert popen_calls == [], "must not launch outside a capture window"
+
+        # Due (never run before) -> launches.
+        _last_ti_capture_ts, _ti_capture_proc = 0.0, None
+        _ti_capture_job(now_et=t9_25)
+        assert len(popen_calls) == 1, "first-ever call inside a tier must launch"
+        assert _ti_capture_proc is not None and _ti_capture_proc.pid == 1001
+
+        # Not due yet (last run 1 min ago, tier interval 3 min) -> no launch.
+        _last_ti_capture_ts = time.time() - 60
+        _ti_capture_job(now_et=t9_25)
+        assert len(popen_calls) == 1, "must not launch again before the tier interval elapses"
+
+        # Due again (last run past the tier interval) -> launches.
+        _last_ti_capture_ts = time.time() - 200  # > 3min tier
+        _ti_capture_proc = None
+        _ti_capture_job(now_et=t9_25)
+        assert len(popen_calls) == 2, "must launch once the tier interval has elapsed"
+
+        # Previous instance still alive but within its runtime budget -> skip,
+        # no new launch, no kill.
+        _ti_capture_proc = _FakeProc(pid=99, alive=True)
+        _last_ti_capture_ts = time.time() - 30  # well under _TI_CAPTURE_MAX_RUNTIME_SEC
+        _ti_capture_job(now_et=t9_25)
+        assert len(popen_calls) == 2, "must not launch a second instance while one is still running normally"
+        assert run_calls == [], "must not kill an instance still within its runtime budget"
+
+        # Previous instance still alive PAST its runtime budget -> treated as
+        # wedged: killed, then a fresh one launched. This is the exact
+        # scenario found live 2026-08-27 (Task Scheduler instances hanging
+        # indefinitely) -- this job now owns that recovery itself.
+        _ti_capture_proc = _FakeProc(pid=42, alive=True)
+        _last_ti_capture_ts = time.time() - (_TI_CAPTURE_MAX_RUNTIME_SEC + 30)
+        _ti_capture_job(now_et=t9_25)
+        assert len(run_calls) == 1, "a wedged (past-budget) instance must be killed"
+        assert "42" in [str(x) for x in run_calls[0][0][0]], f"must kill the actual wedged PID, got {run_calls[0]}"
+        assert len(popen_calls) == 3, "a fresh instance must launch after killing the wedged one"
+
+        print("_ti_capture_job: all checks passed")
+    finally:
+        _last_ti_capture_ts, _ti_capture_proc = _orig_ts, _orig_proc
+        subprocess.Popen, subprocess.run = _orig_popen, _orig_run
 
 
 if __name__ == "__main__":
