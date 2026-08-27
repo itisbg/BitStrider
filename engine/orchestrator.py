@@ -751,9 +751,10 @@ def get_adaptive_interval(ctx: AppContext) -> int:
 
     if cfg.USE_MARKET_HOURS_TUNING:
         mkt_interval, market_phase = get_market_hours_interval(market_state.hour, {
-            "PREMARKET_SCAN_INTERVAL":     cfg.PREMARKET_SCAN_INTERVAL,
-            "REGULAR_HOURS_SCAN_INTERVAL": cfg.REGULAR_HOURS_SCAN_INTERVAL,
-            "AFTERHOURS_SCAN_INTERVAL":    cfg.AFTERHOURS_SCAN_INTERVAL,
+            "PREMARKET_SCAN_INTERVAL":      cfg.PREMARKET_SCAN_INTERVAL,
+            "LATE_PREMARKET_SCAN_INTERVAL": cfg.LATE_PREMARKET_SCAN_INTERVAL,
+            "REGULAR_HOURS_SCAN_INTERVAL":  cfg.REGULAR_HOURS_SCAN_INTERVAL,
+            "AFTERHOURS_SCAN_INTERVAL":     cfg.AFTERHOURS_SCAN_INTERVAL,
         })
         if mkt_interval is not None:
             interval = mkt_interval

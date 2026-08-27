@@ -566,6 +566,10 @@ KILL_MODE_TRAIL_PCT    =  0.5   # PDT-safe hairpin trailing stop % placed on tod
 # Market Hours Tuning
 USE_MARKET_HOURS_TUNING    = True
 PREMARKET_SCAN_INTERVAL    = 10
+# 2026-08-26, user request: the last stretch of premarket (8:25-9:30 ET, run-up
+# to the open) scans every 3 min instead of the flat 10-min premarket cadence --
+# this is when premarket volume/gaps actually firm up into real signals.
+LATE_PREMARKET_SCAN_INTERVAL = 3
 # 2026-08-24, user request: regular-hours discovery scan every 1 min (was 3) --
 # so a position that exits gets a re-entry shot within the same minute
 # instead of waiting up to 3-5 min, to actually catch a swing back in.

@@ -229,8 +229,10 @@ def get_vix_interval(vix: float, config: dict) -> Tuple[int, str]:
 
 def get_market_hours_interval(hour: float, config: dict) -> Tuple[Optional[int], str]:
     """Map current hour (decimal, ET) to scan interval and phase label."""
-    if 7 <= hour < 9.5:
+    if 7 <= hour < 8 + 25 / 60:  # 7:00-8:25 ET
         return config.get("PREMARKET_SCAN_INTERVAL",     5), "PRE-MARKET"
+    if 8 + 25 / 60 <= hour < 9.5:  # 8:25-9:30 ET -- run-up to the open, scan faster
+        return config.get("LATE_PREMARKET_SCAN_INTERVAL", 3), "PRE-MARKET (late)"
     if 9.5 <= hour < 16:
         return config.get("REGULAR_HOURS_SCAN_INTERVAL", 3), "REGULAR HOURS"
     if 16 <= hour < 20:
