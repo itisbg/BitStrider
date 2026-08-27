@@ -372,6 +372,7 @@ def _trail_pct_for(symbol: str, price: float, entry_log: Dict, gain_pct: float =
 def _demo() -> None:
     """python -m engine.execution.enhanced — asserts the ratchet math holds
     at its key points before it's trusted against a live account."""
+    global _get_scan_targets, _check_ema_trend_alignment, get_bars, ENTRY_WINDOW_END_ET
     assert ratchet_scale(0.0) == 1.0, "below floor -> no tightening"
     assert ratchet_scale(0.75) == 1.0, "at floor -> no tightening"
     assert abs(ratchet_scale(1.0) - CONF_RATCHET_MAX_TIGHTEN) < 1e-9, "at 1.0 -> max tightening"
@@ -493,6 +494,107 @@ def _demo() -> None:
     stub._entries_today_date = datetime.date(2000, 1, 1)  # force a date rollover
     assert count(stub, "PFSA") == 0, "a new day must reset the count"
     print("_entries_today_count: all checks passed")
+
+    # _maybe_rearm_reentry / detect_stopped_out_positions' _no_rearm gate:
+    # 2026-08-26, user request ("the reentry is key to success... ensure it
+    # goes to work for sure") -- mocked end-to-end rather than re-reading
+    # the code again, since these two need a live client/broker to exercise
+    # for real. Monkeypatches the module globals _maybe_rearm_reentry itself
+    # calls (_get_scan_targets, _check_ema_trend_alignment, get_bars,
+    # ENTRY_WINDOW_END_ET) and restores them in a finally so this can't leak
+    # into any other test or a real run.
+    _orig_scan_targets, _orig_gate, _orig_bars, _orig_window = (
+        _get_scan_targets, _check_ema_trend_alignment, get_bars, ENTRY_WINDOW_END_ET
+    )
+    try:
+        import pandas as _pd
+
+        class _FakeOrder:
+            id = "fake-order-id"
+
+        class _FakeClient:
+            def __init__(self):
+                self.submitted = []
+                self.positions = []
+            def submit_order(self, req):
+                self.submitted.append(req)
+                return _FakeOrder()
+            def get_all_positions(self):
+                return self.positions
+
+        class _ReentryStub:
+            # detect_stopped_out_positions calls self._maybe_rearm_reentry(...)
+            # internally -- needs the real bound method, not just the stub's
+            # own attributes.
+            _maybe_rearm_reentry = EnhancedExecutor._maybe_rearm_reentry
+
+            def __init__(self):
+                self.client = _FakeClient()
+                self.order_cache = {}
+                self._no_rearm = set()
+                self._ema_blocked_entries = {}
+                self._entry_log = {}
+                self._ratchet_done = set()
+                self._ema9_trail_peak = {}
+                self._last_known_positions = {}
+
+        ENTRY_WINDOW_END_ET = "23:59"  # never "past window" during this test run
+        _get_scan_targets = lambda: ["FOO", "BAR"]  # FOO in top-30, BAZ is not
+        get_bars = lambda *a, **k: _pd.DataFrame({"close": [1.23]})
+
+        rearm = EnhancedExecutor._maybe_rearm_reentry
+        stopped_out = EnhancedExecutor.detect_stopped_out_positions
+
+        # Case 1: gate agrees -> submits a real re-entry order.
+        _check_ema_trend_alignment = lambda sig, is_long: (True, None)
+        s = _ReentryStub()
+        rearm(s, "FOO", True, 10, "TEST")
+        assert len(s.client.submitted) == 1, "gate-ok must submit exactly one order"
+        assert s.order_cache.get("FOO") == "fake-order-id", "must register the order in order_cache"
+        assert "FOO" in s._no_rearm, "must self-mark _no_rearm so detect_stopped_out_positions doesn't double-process this close"
+        assert "FOO" not in s._ema_blocked_entries, "a successful arm must not also queue a retry"
+
+        # Case 2: gate disagrees -> queues for per-minute retry instead of giving up.
+        _check_ema_trend_alignment = lambda sig, is_long: (False, "trend not aligned")
+        s = _ReentryStub()
+        rearm(s, "FOO", True, 10, "TEST")
+        assert len(s.client.submitted) == 0, "gate-fail must not submit an order"
+        assert "FOO" in s._no_rearm, "must still self-mark even on a failed immediate check"
+        assert "FOO" in s._ema_blocked_entries, "gate-fail must queue into _ema_blocked_entries for per-minute retry"
+        q = s._ema_blocked_entries["FOO"]
+        assert q["signal"].symbol == "FOO" and q["order_type"] == OrderType.LONG, "queued signal must carry the right symbol/direction"
+
+        # Case 3: symbol not in the top-30 scan universe -> no order, no queue.
+        _check_ema_trend_alignment = lambda sig, is_long: (True, None)  # would pass if it got there
+        s = _ReentryStub()
+        rearm(s, "BAZ", True, 10, "TEST")
+        assert len(s.client.submitted) == 0, "outside top-30 must not submit"
+        assert "BAZ" not in s._ema_blocked_entries, "outside top-30 must not queue either"
+        assert "BAZ" in s._no_rearm, "self-mark still happens even when the top-30 check is what blocked it"
+
+        # Case 4: detect_stopped_out_positions respects _no_rearm (intentional close) --
+        # must NOT re-arm, and must clear the mark.
+        s = _ReentryStub()
+        s._last_known_positions = {"FOO": {"entry_price": 1.0, "last_price": 1.0, "is_long": True, "qty": 10}}
+        s._no_rearm.add("FOO")
+        stopped_out(s)
+        assert len(s.client.submitted) == 0, "a _no_rearm-marked close must not re-arm"
+        assert "FOO" not in s._no_rearm, "the mark must be consumed (discarded) once seen, not left dangling"
+
+        # Case 5: detect_stopped_out_positions re-arms an UNMARKED close (a
+        # genuine broker-side stop firing on its own, with no explicit
+        # _no_rearm from any closing path).
+        _check_ema_trend_alignment = lambda sig, is_long: (True, None)
+        s = _ReentryStub()
+        s._last_known_positions = {"FOO": {"entry_price": 1.0, "last_price": 1.0, "is_long": True, "qty": 10}}
+        stopped_out(s)
+        assert len(s.client.submitted) == 1, "an unmarked disappeared position must be treated as a genuine stop and re-armed"
+        assert s.order_cache.get("FOO") == "fake-order-id"
+    finally:
+        _get_scan_targets, _check_ema_trend_alignment, get_bars, ENTRY_WINDOW_END_ET = (
+            _orig_scan_targets, _orig_gate, _orig_bars, _orig_window
+        )
+    print("_maybe_rearm_reentry / detect_stopped_out_positions: all checks passed")
 
 
 
