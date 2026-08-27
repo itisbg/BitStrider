@@ -78,7 +78,7 @@ from engine.config import (
     LIVE,
 )
 from engine.equity.strategies import Signal, _get_float_shares, _get_market_cap
-from engine.equity.universe import get_ti_primary
+from engine.equity.scan import get_scan_targets as _get_scan_targets
 from engine.utils import MarketState, calculate_risk_adjusted_size, check_vix_roc_filter, get_dynamic_tier
 from engine.utils.bars import get_bars, get_daily_volume_bars
 from engine.never_trade import is_never_trade
@@ -1003,7 +1003,7 @@ class EnhancedExecutor:
             return False, f"Swap close failed: {e}"
 
     # -- Validation --------------------------------------------------------
-    def _validate_trade(self, signal: Signal, acct: AccountSnapshot, order_type: OrderType, swap_only: bool = False) -> Tuple[bool, Optional[str]]:
+    def _validate_trade(self, signal: Signal, acct: AccountSnapshot, order_type: OrderType, swap_only: bool = False, bypass_pdt: bool = False) -> Tuple[bool, Optional[str]]:
         if USE_VIX_ROC_FILTER:
             allow, roc = check_vix_roc_filter()
             if not allow:
@@ -1013,6 +1013,18 @@ class EnhancedExecutor:
         # Block only when the count EXCEEDS the limit (4+) — an actual PDT violation.
         # At exactly 3/3: new buys are allowed because they are held overnight (not same-day
         # round-trips) and therefore do NOT count as additional day trades.
+        #
+        # 2026-08-26, user request ("remove cool off or any other software
+        # blocks for stock reentries such as pdt or other blocks if any"):
+        # bypass_pdt (set by check_blocked_entries_ema only when
+        # _is_reentry_signal says this really is a re-entry, not a fresh
+        # first-time signal) skips the BLOCK below but still logs/alerts --
+        # this is the bot's own, extra-cautious ceiling on top of what the
+        # broker itself enforces; the trailing-buy re-entry path
+        # (_maybe_rearm_reentry) already never had this check at all, so
+        # this just makes check_blocked_entries_ema's retry path consistent
+        # with it. Alpaca's actual PDT enforcement is untouched -- a real
+        # violation still gets rejected broker-side regardless of this flag.
         if acct.pattern_day_trader and acct.equity < PDT_ACCOUNT_MIN and acct.daytrade_count > PDT_MAX_TRADES:
             msg = (
                 f"PDT VIOLATION: {acct.daytrade_count} day trades used "
@@ -1023,7 +1035,9 @@ class EnhancedExecutor:
             if not getattr(self, "_pdt_violation_alerted", False):
                 send_email("[APEXTRADER] PDT VIOLATION ALERT", msg)
                 self._pdt_violation_alerted = True
-            return False, f"PDT violation: {acct.daytrade_count}/{PDT_MAX_TRADES} day trades exceeded"
+            if not bypass_pdt:
+                return False, f"PDT violation: {acct.daytrade_count}/{PDT_MAX_TRADES} day trades exceeded"
+            log.warning(f"{signal.symbol}: PDT ceiling exceeded but this is a re-entry — bypassing the bot's own limit, letting the broker decide")
         dt_left = self.pdt.remaining(acct.equity, acct.daytrade_count, acct.pattern_day_trader)
         if acct.pattern_day_trader and dt_left <= PDT_WARN_AT_REMAINING and acct.equity < PDT_ACCOUNT_MIN:
             log.warning(f"PDT WARNING: only {dt_left} day trade(s) remaining (equity ${acct.equity:,.0f})")
@@ -1529,8 +1543,8 @@ class EnhancedExecutor:
             return False
 
     # -- Entry (unified) ---------------------------------------------------
-    def _execute_entry(self, signal: Signal, acct: AccountSnapshot, order_type: OrderType, swap_only: bool = False) -> bool:
-        valid, reason = self._validate_trade(signal, acct, order_type, swap_only=swap_only)
+    def _execute_entry(self, signal: Signal, acct: AccountSnapshot, order_type: OrderType, swap_only: bool = False, bypass_pdt: bool = False) -> bool:
+        valid, reason = self._validate_trade(signal, acct, order_type, swap_only=swap_only, bypass_pdt=bypass_pdt)
         if not valid:
             if reason:
                 log.info(f"Skip {signal.symbol}: {reason}")
@@ -1718,7 +1732,6 @@ class EnhancedExecutor:
                     symbol=signal.symbol, qty=qty, side=OrderSide.BUY,
                     time_in_force=TimeInForce.DAY,
                 )
-            self._no_rearm.add(signal.symbol)  # a contradicting strategy signal, not a passive stop
             self.client.submit_order(req)
             # Closing a short that was opened today is a day trade round-trip
             self.pdt.add(datetime.date.today())
@@ -1762,7 +1775,6 @@ class EnhancedExecutor:
             # is_market_open window, not just 09:30-16:00. Its sibling
             # _close_short_position already branches on regular-hours a few lines
             # above; this one didn't. _submit_closing_order handles both cases.
-            self._no_rearm.add(signal.symbol)  # a contradicting strategy signal, not a passive stop
             self._submit_closing_order(signal.symbol, qty, OrderSide.SELL, signal.price)
             # NOTE: closing an existing position is NOT a new day trade.
             # Alpaca counts the round-trip (open+close same day) as one trade;
@@ -2111,19 +2123,28 @@ class EnhancedExecutor:
         2026-08-26, user request ("I have put in 1% on the hope the new
         orders will be placed immediately after the exit with conditions
         check every minute, but it doesn't seem to work"): this is where
-        that gap actually lived. Every OTHER stop-loss-type close
-        (check_ema9_exit, check_software_stops, check_afterhours_stops,
-        check_price_drift_stop) now calls _maybe_rearm_reentry() directly,
-        synchronously, right after its own close — but a genuine broker-side
-        GTC trailing stop filling entirely on its own never goes through any
-        of those; this poll is the only place that ever notices it happened
-        at all. Confirmed 2026-08-26: this was the dominant exit route (~51
-        of 73 trades), and it had zero re-entry logic. Now checks self._no_rearm
-        (set by every deliberate/intentional close path — EOD, guardrail-fail,
-        stale-swing, no-gain, portfolio-rebalance/concentration/leverage,
-        emergency, take-profit, a contradicting strategy signal — right
-        before they submit their own close) to tell "this was a real stop"
-        apart from "this was on purpose, leave it flat."
+        that gap actually lived. check_ema9_exit, check_software_stops,
+        check_afterhours_stops, check_price_drift_stop all now call
+        _maybe_rearm_reentry() directly, synchronously, right after their
+        own close — but a genuine broker-side GTC trailing stop filling
+        entirely on its own never goes through any of those; this poll is
+        the only place that ever notices it happened at all. Confirmed
+        2026-08-26: this was the dominant exit route (~51 of 73 trades), and
+        it had zero re-entry logic.
+
+        Same day, follow-up request ("irrespective of exit type reentry
+        should happen for the top 30 list... catch the missed gains after
+        the dips"): widened further -- now checks self._no_rearm, which
+        only THREE closing paths still mark (see _maybe_rearm_reentry's
+        docstring for the full reasoning): close_guardrail_fail_positions
+        (structurally unsafe), the portfolio-rebalance paths
+        (enforce_position_concentration/enforce_correlation_concentration/
+        enforce_portfolio_leverage/_attempt_swap/_execute_entry's weakest-
+        position swap), and emergency_close_all (kill-switch). Every other
+        close in the file — EOD, stale-swing, no-gain, swing-drift, take-
+        profit, a contradicting strategy signal — is unmarked on purpose, so
+        it falls through here and gets the same re-entry check as a genuine
+        stop.
         """
         try:
             positions = self.client.get_all_positions()
@@ -2633,7 +2654,13 @@ class EnhancedExecutor:
                 # this expires worthless and the position carries overnight under its
                 # existing GTC trailing stop; _sweep_force_closes (below) gives up
                 # the same way once regular hours end instead of re-chasing.
-                self._no_rearm.add(sym)  # day is ending — never re-enter off an EOD close
+                # 2026-08-26, user request ("irrespective of exit type
+                # reentry should happen for the top 30 list"): NOT marked
+                # _no_rearm -- the ENTRY_WINDOW_END_ET check inside
+                # _maybe_rearm_reentry already blocks re-arming this late in
+                # the day anyway (EOD closes fire at/after 15:50, exactly
+                # when that gate says no), so this was always a no-op
+                # exclusion in practice.
                 self._submit_closing_order(sym, abs(qty), side, float(pos.current_price), no_extended_hours=True)
                 self._entry_log.pop(sym, None)
                 self._force_close_pending[sym] = {"reason": f"eod:{entry_info.get('strategy', 'unknown')}", "chase_count": 0}
@@ -3200,7 +3227,6 @@ class EnhancedExecutor:
 
                 # _submit_closing_order handles the after-hours case (plain
                 # MarketOrderRequest gets rejected outside regular hours).
-                self._no_rearm.add(sym)  # deliberately giving up on a stale hold, not "wrong, try again"
                 self._submit_closing_order(sym, abs(qty), OrderSide.SELL, float(pos.current_price))
                 _strategy = self._entry_log.get(sym, {}).get("strategy", "unknown")
                 try:
@@ -3343,7 +3369,6 @@ class EnhancedExecutor:
             try:
                 chase_n  = self._no_gain_chase_count.get(sym, 0)
                 slip_pct = min(0.5 * (chase_n + 1), 3.0)
-                self._no_rearm.add(sym)  # deliberately giving up on an underperformer, not "wrong, try again"
                 self._submit_closing_order(sym, abs(qty), close_side, float(pos.current_price), slip_pct=slip_pct)
                 self._no_gain_chase_count[sym] = chase_n + 1
                 _strategy = self._entry_log.get(sym, {}).get("strategy", "unknown")
@@ -3637,26 +3662,31 @@ class EnhancedExecutor:
         check_software_stops) had zero re-entry path regardless of whether
         conditions still held afterward.
 
-        Deliberately NOT wired into every closing path in this file --
-        only ones that close a position because ITS OWN price/trend
-        broke down (a stop, in substance), where "is the setup still
-        valid" is the right question to ask immediately after. Excluded on
-        purpose: close_eod_positions (day is ending), emergency_close_all
-        (kill-switch), close_guardrail_fail_positions (structurally
-        unsafe -- re-entering defeats the guardrail), close_stale_swing_positions
-        /close_no_gain_positions (deliberately giving up on an underperformer,
-        not "wrong, try again"), enforce_position_concentration/
-        enforce_correlation_concentration/enforce_portfolio_leverage and the
-        weakest-position swap in _attempt_swap/_execute_entry (portfolio-level
-        capital reallocation, not a verdict on this symbol), _close_long_position
-        (driven by an active contradicting strategy signal -- a fresh entry
-        would come through the normal scan pipeline if warranted), and
-        check_swing_drift_stop (explicitly multi-day carried positions, not
-        the same-day momentum setups this gate is calibrated for).
-
-        Also NOT wired into check_tp_targets (a take-profit hit is a win,
-        not a stop -- "ride the continuation after taking profit" is a
-        different, separate question the user hasn't asked for).
+        2026-08-26, user request ("irrespective of exit type reentry should
+        happen for the top 30 list during the every minute check after
+        exit... this should catch the missed gains after the dips"):
+        widened from "stop-loss-type closes only" to every close EXCEPT
+        three categories where re-entering would undo a different, real
+        protection built earlier the same day/session -- user explicitly
+        confirmed keeping these three excluded when asked:
+          - close_guardrail_fail_positions: closes because the stock just
+            failed a structural safety check (dollar_vol/avg_volume/
+            low_float/low_mcap) -- the RPGL fix from earlier 2026-08-26.
+            Re-entering the same symbol immediately would undo it.
+          - enforce_position_concentration/enforce_correlation_concentration/
+            enforce_portfolio_leverage, and the weakest-position swap in
+            _attempt_swap/_execute_entry: portfolio-level capital
+            reallocation, not a verdict on the symbol -- re-entering fights
+            the very reason for the trim (risks a trim-reenter-trim thrash
+            loop).
+          - emergency_close_all: the market-wide kill switch (VIX spike/SPY
+            crash). Re-entering right after defeats its entire purpose.
+        Everything else -- close_eod_positions, close_stale_swing_positions,
+        close_no_gain_positions, check_swing_drift_stop, check_tp_targets,
+        _close_long_position/_close_short_position -- now re-arms the same
+        as any stop-loss close, via the generic catch in
+        detect_stopped_out_positions() (below): NOT marking self._no_rearm
+        for these is what lets that generic path pick them up.
 
         Registers in self.order_cache so check_pending_entries_ema's
         per-minute recheck covers the new order like any other entry.
@@ -3680,8 +3710,17 @@ class EnhancedExecutor:
             if _now_et.strftime("%H:%M") > ENTRY_WINDOW_END_ET:
                 log.info(f"{tag} {sym}: past entry window ({ENTRY_WINDOW_END_ET} ET) — not re-arming a re-entry")
                 return
-            if sym not in get_ti_primary():
-                log.info(f"{tag} {sym}: no longer in top TI universe — not re-arming a re-entry")
+            # 2026-08-26, user request ("reentry should happen for the top 30
+            # list" / "trade only top 30 stocks, but update the top 30 based
+            # on the new scans included"): check against the ACTUAL scan
+            # universe (Alpaca-movers + TI, capped/deduped at
+            # TI_PRIMARY_SCAN_BATCH_LIMIT=30 -- see get_scan_targets(),
+            # engine/equity/scan.py), not the raw, uncapped get_ti_primary()
+            # (routinely 90-100+ tickers) -- a symbol could be "somewhere in
+            # TI" without being one of the 30 the equity scan is actually
+            # trading right now.
+            if sym not in _get_scan_targets():
+                log.info(f"{tag} {sym}: no longer in the top-30 scan universe — not re-arming a re-entry")
                 return
             sig_stub = SimpleNamespace(symbol=sym)
             gate_ok, gate_reason = _check_ema_trend_alignment(sig_stub, is_long)
@@ -3940,15 +3979,22 @@ class EnhancedExecutor:
         TI-universe check added here).
 
         Every signal reaching this queue already came from the normal
-        scan (which draws from the TI top-N universe), so under normal
+        scan (which draws from the top-30 scan universe), so under normal
         conditions this is already scoped to whatever the scan actually
-        flagged -- the explicit get_ti_primary() check here is what keeps
-        a queued entry from waiting indefinitely on a name that's since
-        dropped off that list entirely."""
+        flagged -- the explicit universe check here is what keeps a queued
+        entry from waiting indefinitely on a name that's since dropped off
+        that list entirely.
+
+        2026-08-26, user request ("trade only top 30 stocks, but update the
+        top 30 based on the new scans included"): checks the actual scan
+        universe (get_scan_targets(), same as _maybe_rearm_reentry) rather
+        than the raw, uncapped get_ti_primary() -- was checking membership
+        in a ~90-100-ticker list when the equity scan itself only ever
+        trades 30 of them."""
         import pytz as _pytz
         _now_et = datetime.datetime.now(_pytz.timezone("America/New_York"))
         past_window = _now_et.strftime("%H:%M") > ENTRY_WINDOW_END_ET
-        ti_universe = set(get_ti_primary())
+        ti_universe = set(_get_scan_targets())
 
         for sym, info in list(self._ema_blocked_entries.items()):
             signal, order_type = info["signal"], info["order_type"]
@@ -3962,7 +4008,17 @@ class EnhancedExecutor:
                 continue
             try:
                 acct = self._get_account(force_refresh=True)
-                if self._execute_entry(signal, acct, order_type):
+                # 2026-08-26, user request ("remove cool off or any other
+                # software blocks for stock reentries such as pdt"): only
+                # bypass the bot's own PDT ceiling when this genuinely IS a
+                # re-entry (already traded sym today, or has broker fill
+                # history at all -- same definition _create_bracket_order
+                # uses to pick the trailing-buy path) -- a fresh first-time
+                # signal blocked purely on the EMA gate still gets the
+                # normal PDT check.
+                is_long = order_type == OrderType.LONG
+                bypass_pdt = self._is_reentry_signal(sym, is_long)
+                if self._execute_entry(signal, acct, order_type, bypass_pdt=bypass_pdt):
                     log.info(f"BLOCKED ENTRY RE-FIRED {sym}: EMA condition realigned")
             except Exception as e:
                 log.warning(f"check_blocked_entries_ema {sym}: retry failed: {e}")
@@ -4039,10 +4095,6 @@ class EnhancedExecutor:
 
             side = OrderSide.SELL if is_long else OrderSide.BUY
             try:
-                # Multi-day carried position, not a same-day momentum setup --
-                # the fast EMA re-entry gate isn't calibrated for this, unlike
-                # check_price_drift_stop's same-day sibling.
-                self._no_rearm.add(sym)
                 self._submit_closing_order(sym, abs(qty), side, current)
                 log.warning(f"SWING DRIFT STOP {sym}: {abs(qty)} shares | {reason}")
             except Exception as e:
@@ -4323,10 +4375,10 @@ class EnhancedExecutor:
                     # hours (07:00-20:00 is_market_open spans well past 09:30-16:00,
                     # and this method runs on every cycle in that whole window) —
                     # _submit_closing_order already handles the extended-hours case.
-                    # A take-profit hit is a win, not a stop -- "ride the
-                    # continuation after taking profit" is a different,
-                    # separate question, not what this re-arm gate is for.
-                    self._no_rearm.add(sym)
+                    # 2026-08-26, user request ("irrespective of exit type"):
+                    # NOT marked _no_rearm -- a take-profit hit followed by a
+                    # re-arm is exactly "catch the continuation" if the trend
+                    # gate still agrees.
                     self._submit_closing_order(sym, abs(qty), side, cur_price)
                     _strategy = self._entry_log.get(sym, {}).get("strategy", "unknown")
                     try:
