@@ -59,9 +59,23 @@ _priority_scan_queue:      Dict[str, float] = {}
 _PRIORITY_QUEUE_TTL_MIN = int(os.getenv("PRIORITY_QUEUE_TTL_MIN", "60"))
 # 2026-08-26, user request: Alpaca-movers tickers get their OWN queue so the
 # equity scan can include movers while still excluding EDGAR/sympathy/
-# watchlist, which share _priority_scan_queue above. Same TTL-prune shape,
-# same "no refresh on repeat match" rule.
+# watchlist, which share _priority_scan_queue above.
+# 2026-08-27, user request ("the top 30 list seems to be not aligned with
+# the morning runners"): originally shared the same 60-min TTL as
+# _priority_scan_queue -- confirmed live this evicted genuinely still-active
+# movers, not just dead ones (WKSP/WNW/BTCT/CRM: added 08:35 ET, aged out
+# 09:35, RE-QUALIFIED as movers again at 09:55 -- proving they were still
+# real, just absent from the scan universe for a ~20-min gap in between --
+# and NOWL's re-entry got explicitly blocked at 10:27 ET because the TTL had
+# dropped it from the top-30 at 10:14). Alpaca-movers entries are already
+# activity-confirmed at add time (trade_count >= 10K, real price/move bands)
+# unlike a one-off EDGAR/sympathy news trigger, and is_dead_ticker() (engine/
+# utils/bars.py, immediate-suppression as of last night) already prunes
+# genuinely inactive names on the very next fetch -- the TTL added no real
+# safety on top of that, just an unwanted eviction. Now reset once per
+# trading day (see _alpaca_movers_day below) instead of rolling-windowed.
 _alpaca_movers_queue:      Dict[str, float] = {}
+_alpaca_movers_day: Optional[datetime.date] = None  # date of the last reset -- see scan_alpaca_movers
 last_alpaca_mover_scan:    float      = 0.0
 _ti_started_at:            float      = 0.0
 _ti_warned_running:        bool       = False
@@ -83,8 +97,14 @@ def _prune_queue(queue: Dict[str, float], label: str) -> List[str]:
 
 
 def get_alpaca_movers_queue() -> List[str]:
-    """Return current Alpaca-movers tickers (read-only peek), TTL-pruned."""
-    return _prune_queue(_alpaca_movers_queue, "ALPACA-MOVERS-QUEUE")
+    """Return current Alpaca-movers tickers (read-only peek).
+
+    2026-08-27: no longer TTL-pruned here -- see the module comment above
+    _alpaca_movers_queue's declaration. Reset once per trading day by
+    scan_alpaca_movers instead; is_dead_ticker (engine/utils/bars.py) prunes
+    genuinely inactive names.
+    """
+    return list(_alpaca_movers_queue.keys())
 
 
 def get_priority_scan_queue() -> List[str]:
@@ -953,10 +973,23 @@ def scan_alpaca_movers(*, interval_min: float = 10.0, market_state: MarketState)
     The endpoint resets at market open — data before 09:30 ET is from the
     previous session, so we only run during regular market hours.
     """
-    global last_alpaca_mover_scan, _priority_scan_queue, _alpaca_movers_queue
+    global last_alpaca_mover_scan, _priority_scan_queue, _alpaca_movers_queue, _alpaca_movers_day
 
     if not market_state.is_market_open:
         return
+
+    # 2026-08-27, user request ("the top 30 list seems to be not aligned
+    # with the morning runners"): reset the movers-only queue once per
+    # trading day, matching the endpoint's own "resets at market open"
+    # behavior -- replaces the old rolling 60-min TTL, which was evicting
+    # genuinely still-active movers mid-session (see the module comment
+    # above _alpaca_movers_queue's declaration for the live evidence).
+    today = market_state.now.date()
+    if _alpaca_movers_day != today:
+        if _alpaca_movers_queue:
+            log.info(f"[ALPACA-MOVERS-QUEUE] New trading day — clearing {len(_alpaca_movers_queue)} ticker(s) from the previous session: {list(_alpaca_movers_queue.keys())}")
+        _alpaca_movers_queue = {}
+        _alpaca_movers_day = today
 
     now = time.time()
     if now - last_alpaca_mover_scan < interval_min * 60:
@@ -1148,6 +1181,16 @@ def _demo() -> None:
     assert movers == ["MOVR"], f"expected only MOVR in the movers queue, got {movers}"
     assert "MOVR" not in _priority_scan_queue, "movers queue must not leak into the EDGAR/sympathy queue"
     assert "FRESH" not in _alpaca_movers_queue, "EDGAR/sympathy queue must not leak into the movers queue"
+
+    # 2026-08-27, user request ("the top 30 list seems to be not aligned
+    # with the morning runners"): the movers queue must NOT time-prune --
+    # confirmed live this evicted still-active movers (CRM/OKTA/CRWD/NVDX:
+    # added 08:35 ET, evicted 09:35 ET, still active). A very old timestamp
+    # must survive get_alpaca_movers_queue() -- only a new trading day
+    # (scan_alpaca_movers) or is_dead_ticker (engine/utils/bars.py, applied
+    # downstream in get_scan_targets) may remove it.
+    _alpaca_movers_queue["OLDMOVR"] = 1.0  # 1970 -- as old as a timestamp gets
+    assert "OLDMOVR" in get_alpaca_movers_queue(), "movers queue must not age out entries by elapsed time"
 
     print("discovery._demo: all assertions passed")
 

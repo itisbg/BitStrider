@@ -519,6 +519,9 @@ def get_scan_targets(excluded: Set[str] = None) -> List[str]:
 
     delisted = set(_cfg.DELISTED_STOCKS)
 
+    def _live(s: str) -> bool:
+        return s not in excluded and s not in delisted and not is_dead_ticker(s) and not _is_thinly_traded(s)
+
     ti_primary = [s for s in _get_ti_primary() if s not in delisted]
 
     # Universe health check
@@ -529,26 +532,30 @@ def get_scan_targets(excluded: Set[str] = None) -> List[str]:
         else:
             _log.warning(f"[UNIVERSE HEALTH] ti_primary.json too small ({len(ti_primary)}). Falling back to static config lists.")
         p1, p2, _ = _cfg.get_dynamic_universe()
-        ti_slice = list(dict.fromkeys(p2 + p1))
-        if len(ti_slice) == 0:
+        ti_pool = list(dict.fromkeys(p2 + p1))
+        if len(ti_pool) == 0:
             _log.error("[UNIVERSE HEALTH] Static universe lists are empty! No tickers to scan. Check config/universe sources.")
     else:
-        ti_slice = list(dict.fromkeys(ti_primary))[:_cfg.TI_PRIMARY_SCAN_BATCH_LIMIT]
+        ti_pool = list(dict.fromkeys(ti_primary))
 
     movers = [s for s in _get_alpaca_movers_queue() if s not in delisted]
+    # 2026-08-27, user request ("the top 30 list seems to be not aligned with
+    # the morning runners"): filter dead/thin/excluded BEFORE capping to 30,
+    # not after -- with the movers queue no longer TTL-evicted mid-day (see
+    # scan_alpaca_movers), it can hold more names for longer, so a handful of
+    # names that went dead earlier in the session could otherwise fill scan
+    # slots the cap should have handed to live TI candidates instead, with no
+    # backfill. is_dead_ticker/_is_thinly_traded/excluded/delisted are now
+    # applied here, per-source, before either the merge or the cap.
+    movers = [s for s in movers if _live(s)]
+    ti_pool = [s for s in ti_pool if _live(s)]
+    ti_slice = ti_pool[:_cfg.TI_PRIMARY_SCAN_BATCH_LIMIT]
+
     # 2026-08-26, user request ("keep it to top 30 signals together"): cap the
     # COMBINED (movers + TI) list at TI_PRIMARY_SCAN_BATCH_LIMIT, not each
     # source separately -- movers get priority (fresher/news-driven) and TI
     # fills whatever's left, up to the shared cap.
-    base = list(dict.fromkeys(movers + ti_slice))[:_cfg.TI_PRIMARY_SCAN_BATCH_LIMIT]
-
-    targets = []
-    for s in base:
-        if s in excluded or s in delisted or is_dead_ticker(s):
-            continue
-        if _is_thinly_traded(s):
-            continue
-        targets.append(s)
+    targets = list(dict.fromkeys(movers + ti_slice))[:_cfg.TI_PRIMARY_SCAN_BATCH_LIMIT]
     return targets
 
 
