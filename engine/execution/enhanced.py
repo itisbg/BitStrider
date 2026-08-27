@@ -4059,7 +4059,14 @@ class EnhancedExecutor:
             try:
                 order = self.client.get_order_by_id(order_id)
             except Exception as e:
-                log.debug(f"check_pending_entries_ema {sym}: order lookup failed: {e}")
+                # 2026-08-27, user request ("improve the 1min checks to have
+                # better reliability"): was log.debug -- APEXTRADER_LOG_LEVEL
+                # defaults to INFO, so a repeated lookup failure here was
+                # completely invisible; this order would just sit pending,
+                # never rechecked, never cancelled, with zero trace in the
+                # log of why. Elevated to warning so a real failure pattern
+                # (vs. one transient blip) is at least visible going forward.
+                log.warning(f"check_pending_entries_ema {sym}: order lookup failed, skipping this recheck: {e}")
                 continue
             status = str(getattr(order, "status", "")).lower()
             if status not in {"new", "partially_filled", "pending_new", "accepted", "held"}:

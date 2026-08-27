@@ -45,7 +45,7 @@ from .equity.strategies import Signal
 from .equity.scan import get_scan_targets, scan_universe
 from .equity.universe import filter_universe_by_positions
 from .equity import discovery as _discovery
-from .notifications import notify_scan_results, notify_eod
+from .notifications import notify_scan_results, notify_eod, send_email
 from .predictions import save_day_picks
 
 # 2026-08-18, user request (daily P&L stuck at $0.00 all session despite real
@@ -82,6 +82,13 @@ log = setup_logging()
 import logging as _logging
 _logging.getLogger("WDM").setLevel(_logging.ERROR)
 _logging.getLogger("webdriver_manager").setLevel(_logging.ERROR)
+
+# 2026-08-27, user request ("improve the 1min checks to have better
+# reliability as the whole logic is dependent on it"): liveness tracking
+# for the SoftwareStopPoller thread -- see _start_software_stop_thread and
+# _poller_staleness_job.
+_last_poller_tick: float = 0.0
+_poller_stale_alerted: bool = False
 
 
 # ── AppContext ────────────────────────────────────────────────────────────────
@@ -963,62 +970,121 @@ def _start_software_stop_thread(ctx: AppContext) -> None:
     docstring for the current logic)."""
     import threading
 
+    def _tick(last_ema15: float) -> float:
+        """One iteration's worth of checks. Returns the (possibly updated)
+        last_ema15 timestamp. Each check keeps its own try/except so one
+        failing check doesn't block the rest running this same tick."""
+        try:
+            ctx.executor._cover_naked_positions()
+        except Exception as e:
+            log.error(f"[STOP-THREAD] _cover_naked_positions error: {e}", exc_info=True)
+        try:
+            if ctx.executor._pdt_stop_blocked:
+                ctx.executor.check_software_stops()
+        except Exception as e:
+            log.error(f"[STOP-THREAD] check_software_stops error: {e}", exc_info=True)
+        try:
+            ctx.executor.check_afterhours_stops()
+        except Exception as e:
+            log.error(f"[STOP-THREAD] check_afterhours_stops error: {e}", exc_info=True)
+        try:
+            ctx.executor._sweep_force_closes()
+        except Exception as e:
+            log.error(f"[STOP-THREAD] _sweep_force_closes error: {e}", exc_info=True)
+        try:
+            ctx.executor._sweep_pending_entries()
+        except Exception as e:
+            log.error(f"[STOP-THREAD] _sweep_pending_entries error: {e}", exc_info=True)
+        try:
+            ctx.executor.detect_stopped_out_positions()
+        except Exception as e:
+            log.error(f"[STOP-THREAD] detect_stopped_out_positions error: {e}", exc_info=True)
+        if time.time() - last_ema15 >= cfg.STAGNANT_STOP_CHECK_INTERVAL_MIN * 60:
+            try:
+                # 2026-08-25, user request: "remove the ema15 delta check,
+                # only keep the ema3 and ema7 positive slope" -- the
+                # EMA15-based exit check (method, helpers, config
+                # constants, self-tests) was deleted outright, not just
+                # unwired. check_ema9_exit (EMA9 delta now, was EMA7) is
+                # the only per-minute exit check now.
+                ctx.executor.check_ema9_exit()
+            except Exception as e:
+                log.error(f"[STOP-THREAD] check_ema9_exit error: {e}", exc_info=True)
+            try:
+                ctx.executor.check_pending_entries_ema()
+            except Exception as e:
+                log.error(f"[STOP-THREAD] check_pending_entries_ema error: {e}", exc_info=True)
+            try:
+                # 2026-08-25, user request: "each blocked trade should wait
+                # for next minute recheck not to completely discard the
+                # order" -- see check_blocked_entries_ema.
+                ctx.executor.check_blocked_entries_ema()
+            except Exception as e:
+                log.error(f"[STOP-THREAD] check_blocked_entries_ema error: {e}", exc_info=True)
+            last_ema15 = time.time()
+        return last_ema15
+
     def _loop() -> None:
+        global _last_poller_tick
         last_ema15 = 0.0
         while True:
+            # 2026-08-27, user request ("improve the 1min checks to have
+            # better reliability as the whole logic is dependent on it"):
+            # outer catch-all around the whole tick, on top of _tick()'s own
+            # per-call try/excepts. Those already stop one check's failure
+            # from blocking the rest this tick, but nothing previously
+            # caught a failure in the glue code around them (the timing
+            # logic, a future edit adding an unwrapped line, etc.) -- any of
+            # that would have silently killed this daemon thread forever,
+            # with no sign anything was wrong until positions went
+            # unmanaged. Now even an unanticipated failure just logs and the
+            # loop keeps going next tick.
             try:
-                ctx.executor._cover_naked_positions()
+                last_ema15 = _tick(last_ema15)
             except Exception as e:
-                log.error(f"[STOP-THREAD] _cover_naked_positions error: {e}", exc_info=True)
-            try:
-                if ctx.executor._pdt_stop_blocked:
-                    ctx.executor.check_software_stops()
-            except Exception as e:
-                log.error(f"[STOP-THREAD] check_software_stops error: {e}", exc_info=True)
-            try:
-                ctx.executor.check_afterhours_stops()
-            except Exception as e:
-                log.error(f"[STOP-THREAD] check_afterhours_stops error: {e}", exc_info=True)
-            try:
-                ctx.executor._sweep_force_closes()
-            except Exception as e:
-                log.error(f"[STOP-THREAD] _sweep_force_closes error: {e}", exc_info=True)
-            try:
-                ctx.executor._sweep_pending_entries()
-            except Exception as e:
-                log.error(f"[STOP-THREAD] _sweep_pending_entries error: {e}", exc_info=True)
-            try:
-                ctx.executor.detect_stopped_out_positions()
-            except Exception as e:
-                log.error(f"[STOP-THREAD] detect_stopped_out_positions error: {e}", exc_info=True)
-            if time.time() - last_ema15 >= cfg.STAGNANT_STOP_CHECK_INTERVAL_MIN * 60:
-                try:
-                    # 2026-08-25, user request: "remove the ema15 delta
-                    # check, only keep the ema3 and ema7 positive slope" --
-                    # the EMA15-based exit check (method, helpers, config
-                    # constants, self-tests) was deleted outright, not just
-                    # unwired. check_ema9_exit (EMA9 delta now, was EMA7) is
-                    # the only per-minute exit check now.
-                    ctx.executor.check_ema9_exit()
-                except Exception as e:
-                    log.error(f"[STOP-THREAD] check_ema9_exit error: {e}", exc_info=True)
-                try:
-                    ctx.executor.check_pending_entries_ema()
-                except Exception as e:
-                    log.error(f"[STOP-THREAD] check_pending_entries_ema error: {e}", exc_info=True)
-                try:
-                    # 2026-08-25, user request: "each blocked trade should
-                    # wait for next minute recheck not to completely
-                    # discard the order" -- see check_blocked_entries_ema.
-                    ctx.executor.check_blocked_entries_ema()
-                except Exception as e:
-                    log.error(f"[STOP-THREAD] check_blocked_entries_ema error: {e}", exc_info=True)
-                last_ema15 = time.time()
+                log.error(f"[STOP-THREAD] unhandled tick error (loop continues): {e}", exc_info=True)
+            # Liveness marker read by _poller_staleness_job (below) -- proves
+            # this thread is actually still ticking, not just presumed alive
+            # because the process's own heartbeat.txt (written by the main
+            # loop, a different thread) is unaffected by this one dying.
+            _last_poller_tick = time.time()
             time.sleep(10)
 
     t = threading.Thread(target=_loop, name="SoftwareStopPoller", daemon=True)
     t.start()
     log.info("[STOP-THREAD] Software-stop fast-poll thread started (10s interval, EMA9 exit + pending-entry + blocked-entry EMA re-check every 1 min)")
+
+
+def _poller_staleness_job() -> None:
+    """Scheduled every minute (see run()) -- alerts if SoftwareStopPoller
+    hasn't ticked in a while, since a silently-dead poller thread otherwise
+    has zero observable symptom until positions go unmanaged: the main
+    loop's own heartbeat.txt keeps updating fine (different thread), and
+    the exit-stack functions this thread is the only trigger for
+    (check_ema9_exit, check_pending_entries_ema, check_blocked_entries_ema,
+    detect_stopped_out_positions, ...) just quietly stop running. Threshold
+    (3 min) is generous versus the thread's own 10s tick / 1min EMA cadence
+    -- only fires on a genuine stall, not routine scheduling jitter."""
+    global _last_poller_tick, _poller_stale_alerted
+    if _last_poller_tick == 0.0:
+        return  # thread hasn't started yet
+    age = time.time() - _last_poller_tick
+    if age < 180:
+        _poller_stale_alerted = False
+        return
+    if not _poller_stale_alerted:
+        msg = (
+            f"[STOP-THREAD] SoftwareStopPoller has not ticked in {age:.0f}s "
+            f"(expected every ~10s) -- re-entry/exit checks (check_ema9_exit, "
+            f"check_pending_entries_ema, check_blocked_entries_ema, "
+            f"detect_stopped_out_positions) have stopped running. Restart required."
+        )
+        log.error(msg)
+        try:
+            send_email("[APEXTRADER] SoftwareStopPoller stalled", msg)
+        except Exception as e:
+            log.error(f"[STOP-THREAD] stall alert email failed: {e}")
+        _poller_stale_alerted = True
 
 
 def _start_options_scan_thread(ctx: AppContext) -> None:
@@ -1147,6 +1213,7 @@ def start() -> None:
     schedule.every(30).minutes.do(_prune_universe_job)
     schedule.every(1).minutes.do(_guardrail_close_job, ctx)
     schedule.every(1).minutes.do(_eod_close_job, ctx)
+    schedule.every(1).minutes.do(_poller_staleness_job)
     _schedule_on_clock_grid(cfg.PRICE_DRIFT_CHECK_INTERVAL_MIN, _price_drift_stop_job, ctx)
     _schedule_on_clock_grid(cfg.SWING_DRIFT_STOP_CHECK_INTERVAL_MIN, _swing_drift_stop_job, ctx)
     # Per-minute EMA exit check (check_ema9_exit) runs on the
@@ -1254,3 +1321,56 @@ def run(*, force: bool = False, once: bool = False, top3_only: bool = False) -> 
         return
 
     start()
+
+
+def _demo() -> None:
+    """python -m engine.orchestrator -- asserts _poller_staleness_job's
+    alert state machine holds before it's trusted to actually catch a
+    stalled SoftwareStopPoller thread. Monkeypatches send_email (real
+    network I/O otherwise) and the module's own liveness globals, restored
+    in a finally."""
+    global _last_poller_tick, _poller_stale_alerted, send_email
+    _orig_tick, _orig_alerted, _orig_email = _last_poller_tick, _poller_stale_alerted, send_email
+    sent = []
+    try:
+        send_email = lambda subject, text, html=None: sent.append((subject, text))
+
+        # No tick yet (thread hasn't started) -> never alert.
+        _last_poller_tick, _poller_stale_alerted = 0.0, False
+        _poller_staleness_job()
+        assert sent == [], "must not alert before the poller thread has ever ticked"
+
+        # Fresh tick -> no alert.
+        _last_poller_tick, _poller_stale_alerted = time.time(), False
+        _poller_staleness_job()
+        assert sent == [], "a fresh tick must not alert"
+
+        # Stale tick -> alerts exactly once.
+        _last_poller_tick, _poller_stale_alerted = time.time() - 200, False
+        _poller_staleness_job()
+        assert len(sent) == 1, f"a stale tick (200s > 180s threshold) must alert, got {len(sent)}"
+        assert _poller_stale_alerted is True, "must latch alerted=True so it doesn't re-alert every minute"
+
+        # Still stale next check -> does NOT re-alert (already latched).
+        _poller_staleness_job()
+        assert len(sent) == 1, "must not re-alert every check while still stale -- one alert per stall, not spam"
+
+        # Recovers (tick becomes fresh again) -> clears the latch.
+        _last_poller_tick = time.time()
+        _poller_staleness_job()
+        assert _poller_stale_alerted is False, "recovering must clear the latch so a FUTURE stall alerts again"
+
+        # Stalls a second time after recovering -> alerts again (proves the
+        # latch-clear above actually re-arms it, not just resets a flag that's
+        # never read again).
+        _last_poller_tick = time.time() - 200
+        _poller_staleness_job()
+        assert len(sent) == 2, "a second, separate stall after recovery must alert again"
+
+        print("_poller_staleness_job: all checks passed")
+    finally:
+        _last_poller_tick, _poller_stale_alerted, send_email = _orig_tick, _orig_alerted, _orig_email
+
+
+if __name__ == "__main__":
+    _demo()
