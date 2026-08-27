@@ -625,10 +625,11 @@ TRADEIDEAS_UPDATE_CONFIG_FILE                     = True
 # for advanced starts where background TI loading is acceptable.
 STARTUP_TI_CAPTURE_TIMEOUT_S                     = int(__import__('os').getenv('STARTUP_TI_CAPTURE_TIMEOUT_S', '90'))
 # 2026-08-26, user request ("top 20... universe should limit to the latest
-# trade ideas scrapping"): this IS the equity scan universe size now (was 50,
-# when it was just a guaranteed-minimum slice inside a much larger combined
-# universe — see get_scan_targets() in equity/scan.py).
-TI_PRIMARY_SCAN_BATCH_LIMIT                       = int(__import__('os').getenv('TI_PRIMARY_SCAN_BATCH_LIMIT', '20'))
+# trade ideas scrapping", then same-day follow-up "keep alpaca movers... top
+# 30 signals together"): this is now the COMBINED cap on (Alpaca-movers queue
+# + TI primary), not TI alone — see get_scan_targets() in equity/scan.py.
+# Movers get priority; TI fills whatever's left, up to this shared ceiling.
+TI_PRIMARY_SCAN_BATCH_LIMIT                       = int(__import__('os').getenv('TI_PRIMARY_SCAN_BATCH_LIMIT', '30'))
 
 # Sector sympathy scanner — injects peer tickers when a leader stock fires
 USE_SECTOR_SYMPATHY          = False  # disabled — EDGAR 8-K is the primary discovery signal

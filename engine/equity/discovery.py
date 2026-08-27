@@ -42,8 +42,12 @@ last_ti_options_scan:      float      = 0.0
 last_ti_toplists_scan:     float      = 0.0
 last_sympathy_scan:        float      = 0.0
 last_edgar_scan:           float      = 0.0
-# Sympathy + EDGAR/movers/watchlist tickers queued for upcoming scan cycles.
-# get_scan_targets() pops these to the front so they are guaranteed to be scanned.
+# Sympathy + EDGAR + pre-open watchlist tickers queued for upcoming scan
+# cycles. 2026-08-26, user request ("remove edgar and sympathy but keep
+# alpaca movers"): equity scan (get_scan_targets(), engine/equity/scan.py)
+# no longer reads this queue at all -- it's TI top-N + _alpaca_movers_queue
+# (below) only now. This queue still feeds the OPTIONS scan
+# (engine/options/strategies.py), which is unaffected by that request.
 # Symbol -> epoch time it was first queued. Never refreshed by repeat matches
 # (a re-trigger of an already-queued symbol is not a "new" signal) so a name
 # that fires once and then goes quiet ages out instead of getting scanned —
@@ -53,6 +57,11 @@ last_edgar_scan:           float      = 0.0
 # IEX/yfinance prints after ~10:50 ET).
 _priority_scan_queue:      Dict[str, float] = {}
 _PRIORITY_QUEUE_TTL_MIN = int(os.getenv("PRIORITY_QUEUE_TTL_MIN", "60"))
+# 2026-08-26, user request: Alpaca-movers tickers get their OWN queue so the
+# equity scan can include movers while still excluding EDGAR/sympathy/
+# watchlist, which share _priority_scan_queue above. Same TTL-prune shape,
+# same "no refresh on repeat match" rule.
+_alpaca_movers_queue:      Dict[str, float] = {}
 last_alpaca_mover_scan:    float      = 0.0
 _ti_started_at:            float      = 0.0
 _ti_warned_running:        bool       = False
@@ -60,21 +69,37 @@ _ti_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 _ti_future: Optional[concurrent.futures.Future] = None
 
 
+def _prune_queue(queue: Dict[str, float], label: str) -> List[str]:
+    """Drop entries older than _PRIORITY_QUEUE_TTL_MIN from *queue* in place;
+    return the surviving symbols. Shared by get_priority_scan_queue() and
+    get_alpaca_movers_queue() so both age out the same way."""
+    cutoff = time.time() - _PRIORITY_QUEUE_TTL_MIN * 60
+    expired = [s for s, added in queue.items() if added < cutoff]
+    for s in expired:
+        del queue[s]
+    if expired:
+        log.info(f"[{label}] Aged out {len(expired)} ticker(s) after {_PRIORITY_QUEUE_TTL_MIN}min: {expired}")
+    return list(queue.keys())
+
+
+def get_alpaca_movers_queue() -> List[str]:
+    """Return current Alpaca-movers tickers (read-only peek), TTL-pruned."""
+    return _prune_queue(_alpaca_movers_queue, "ALPACA-MOVERS-QUEUE")
+
+
 def get_priority_scan_queue() -> List[str]:
-    """Return the current sympathy/EDGAR/screener tickers (read-only peek),
+    """Return the current sympathy/EDGAR/watchlist tickers (read-only peek),
     pruning entries older than _PRIORITY_QUEUE_TTL_MIN as a side effect.
+    Feeds the options scan only as of 2026-08-26 -- see module comment above
+    _priority_scan_queue's declaration. Alpaca-movers has its own queue
+    (get_alpaca_movers_queue) so equity scan can include movers without EDGAR/
+    sympathy/watchlist.
 
     Does NOT drain fresh entries — symbols remain until they age out (TTL) or
     a fetch marks them dead (is_dead_ticker), so both equity and options scans
     see the same set.
     """
-    cutoff = time.time() - _PRIORITY_QUEUE_TTL_MIN * 60
-    expired = [s for s, added in _priority_scan_queue.items() if added < cutoff]
-    for s in expired:
-        del _priority_scan_queue[s]
-    if expired:
-        log.info(f"[PRIORITY-QUEUE] Aged out {len(expired)} ticker(s) after {_PRIORITY_QUEUE_TTL_MIN}min: {expired}")
-    return list(_priority_scan_queue.keys())
+    return _prune_queue(_priority_scan_queue, "PRIORITY-QUEUE")
 
 
 @dataclass
@@ -921,12 +946,14 @@ def scan_sympathy_and_edgar(
 
 def scan_alpaca_movers(*, interval_min: float = 10.0, market_state: MarketState) -> None:
     """Fetch Alpaca Most Actives + Market Movers and inject qualifying symbols
-    into the priority scan queue.
+    into both the shared priority scan queue (options scan) and the dedicated
+    _alpaca_movers_queue (equity scan) -- see the module comment above
+    _priority_scan_queue's declaration for why movers get their own queue.
 
     The endpoint resets at market open — data before 09:30 ET is from the
     previous session, so we only run during regular market hours.
     """
-    global last_alpaca_mover_scan, _priority_scan_queue
+    global last_alpaca_mover_scan, _priority_scan_queue, _alpaca_movers_queue
 
     if not market_state.is_market_open:
         return
@@ -995,9 +1022,14 @@ def scan_alpaca_movers(*, interval_min: float = 10.0, market_state: MarketState)
             # Volume confirmation: must also appear in most actives
             if sym not in active_syms:
                 continue
-            if sym in _priority_scan_queue or sym in delisted:
+            if sym in delisted:
                 continue
-            _priority_scan_queue[sym] = time.time()
+            is_new = sym not in _priority_scan_queue and sym not in _alpaca_movers_queue
+            now_ts = time.time()
+            _priority_scan_queue.setdefault(sym, now_ts)
+            _alpaca_movers_queue.setdefault(sym, now_ts)
+            if not is_new:
+                continue  # already tracked -- nothing new to log
             injected.append(sym)
             log.info(
                 f"[ALPACA-MOVERS] Adding {sym} to P2 + scan queue for monitoring"
@@ -1096,9 +1128,10 @@ def scan_tradeideas_toplists(
 
 
 def _demo() -> None:
-    """Self-check for the priority-scan-queue TTL pruning."""
+    """Self-check for the priority-scan-queue / alpaca-movers-queue TTL pruning."""
     global _PRIORITY_QUEUE_TTL_MIN
     _priority_scan_queue.clear()
+    _alpaca_movers_queue.clear()
     _PRIORITY_QUEUE_TTL_MIN = 60
 
     now = time.time()
@@ -1107,6 +1140,14 @@ def _demo() -> None:
     live = get_priority_scan_queue()
     assert live == ["FRESH"], f"expected only FRESH to survive TTL prune, got {live}"
     assert "OLD" not in _priority_scan_queue, "expired entry must be deleted, not just filtered"
+
+    # Alpaca-movers queue is independent of the EDGAR/sympathy queue above --
+    # a symbol can live in one without the other.
+    _alpaca_movers_queue["MOVR"] = now
+    movers = get_alpaca_movers_queue()
+    assert movers == ["MOVR"], f"expected only MOVR in the movers queue, got {movers}"
+    assert "MOVR" not in _priority_scan_queue, "movers queue must not leak into the EDGAR/sympathy queue"
+    assert "FRESH" not in _alpaca_movers_queue, "EDGAR/sympathy queue must not leak into the movers queue"
 
     print("discovery._demo: all assertions passed")
 

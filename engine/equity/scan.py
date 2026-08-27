@@ -67,6 +67,7 @@ from engine.utils import MarketState, clear_bar_cache, get_bars, get_daily_volum
 from engine.utils.bars import get_data_client as _get_data_client
 from alpaca.data import StockSnapshotRequest as _StockSnapshotRequest
 from .universe import get_tier as _get_tier_live, get_latest_batch as _get_latest_batch, get_ti_primary as _get_ti_primary
+from .discovery import get_alpaca_movers_queue as _get_alpaca_movers_queue
 
 _ET  = pytz.timezone("America/New_York")
 _log = logging.getLogger("ApexTrader")
@@ -441,19 +442,31 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
 
 
 def get_scan_targets(excluded: Set[str] = None) -> List[str]:
-    """Equity scan universe = top TI_PRIMARY_SCAN_BATCH_LIMIT tickers from the
-    latest Trade Ideas capture (data/ti_primary.json), in TI's own rank order.
+    """Equity scan universe = Alpaca-movers queue + top TI_PRIMARY_SCAN_BATCH_LIMIT
+    tickers from the latest Trade Ideas capture (data/ti_primary.json), TI in
+    its own rank order.
 
     2026-08-26, user request ("reduce the number of signals to what TI
     provides... top 20... the universe of stocks should limit to the latest
     trade ideas scrapping"): replaced the old multi-source assembly (EDGAR/
     sympathy/Alpaca-movers/watchlist priority queue, an inverse-ETF/
     BEAR_SHORT_UNIVERSE bear-regime seed, and an ~80-symbol rotating fallback
-    universe — routinely 90-150+ symbols/cycle, confirmed live) with just
-    this. ti_primary.json is refreshed in place by the ApexTraderTICapture
+    universe — routinely 90-150+ symbols/cycle, confirmed live) with just TI
+    top-N. ti_primary.json is refreshed in place by the ApexTraderTICapture
     scheduled task (3 min 8:25-9:30 ET, 10 min 9:30-14:50 ET), so this
     naturally tracks TI's latest read all day — no separate freeze/snapshot
     needed; whatever's newest in the file each cycle IS the universe.
+
+    Same day, follow-up request ("remove edgar and sympathy but keep alpaca
+    movers along with trade ideas.com"): Alpaca-movers added back in via its
+    own dedicated queue (_alpaca_movers_queue / get_alpaca_movers_queue(),
+    engine/equity/discovery.py) — separate from the EDGAR/sympathy/watchlist
+    queue, which stays excluded from equity scan (still feeds the options
+    scan). Backtest evidence for keeping movers: 2026-08-26 fills showed
+    Alpaca-movers-sourced trades at 58.8% win rate / +$15.10 net vs.
+    TI/other's 34.7% / -$17.82 (small sample, one outlier trade drove most of
+    the movers P&L — not a confident signal, just the reason this wasn't
+    reverted with EDGAR/sympathy).
 
     Falls back to the static config lists (get_dynamic_universe) only when
     ti_primary.json is critically thin/empty (_MIN_TI) — a TI-outage safety
@@ -475,11 +488,18 @@ def get_scan_targets(excluded: Set[str] = None) -> List[str]:
         else:
             _log.warning(f"[UNIVERSE HEALTH] ti_primary.json too small ({len(ti_primary)}). Falling back to static config lists.")
         p1, p2, _ = _cfg.get_dynamic_universe()
-        base = list(dict.fromkeys(p2 + p1))
-        if len(base) == 0:
+        ti_slice = list(dict.fromkeys(p2 + p1))
+        if len(ti_slice) == 0:
             _log.error("[UNIVERSE HEALTH] Static universe lists are empty! No tickers to scan. Check config/universe sources.")
     else:
-        base = list(dict.fromkeys(ti_primary))[:_cfg.TI_PRIMARY_SCAN_BATCH_LIMIT]
+        ti_slice = list(dict.fromkeys(ti_primary))[:_cfg.TI_PRIMARY_SCAN_BATCH_LIMIT]
+
+    movers = [s for s in _get_alpaca_movers_queue() if s not in delisted]
+    # 2026-08-26, user request ("keep it to top 30 signals together"): cap the
+    # COMBINED (movers + TI) list at TI_PRIMARY_SCAN_BATCH_LIMIT, not each
+    # source separately -- movers get priority (fresher/news-driven) and TI
+    # fills whatever's left, up to the shared cap.
+    base = list(dict.fromkeys(movers + ti_slice))[:_cfg.TI_PRIMARY_SCAN_BATCH_LIMIT]
 
     targets = []
     for s in base:
