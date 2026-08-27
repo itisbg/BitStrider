@@ -97,7 +97,14 @@ _option_data_client = None
 # once IEX/yfinance have shown zero fresh prints for an hour+ — pure wasted
 # Alpaca calls on structurally thin names (confirmed 2026-08-26: SAJ staleness
 # climbing every cycle with no reset after ~10:50 ET).
-_DEAD_TICKER_THRESHOLD = int(os.getenv("DEAD_TICKER_THRESHOLD", "5"))
+# 2026-08-26, user request ("stale data failure should remove the tickers
+# immediately instead of keep wasting time on them"): 5 -> 1. Was a
+# deliberate buffer against a single transient blip wrongly suppressing a
+# real ticker, but the recovery path (_DEAD_TICKER_RECHECK_SEC below) already
+# un-suppresses the moment a real fetch succeeds again, so the buffer was
+# only ever costing wasted cycles, never preventing a bad suppression for
+# more than one cycle either way.
+_DEAD_TICKER_THRESHOLD = int(os.getenv("DEAD_TICKER_THRESHOLD", "1"))
 # Once suppressed, let one real fetch back through every N seconds so a name
 # that starts trading again recovers on its own instead of being dead for the
 # rest of the process's life.
