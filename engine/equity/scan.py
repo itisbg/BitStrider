@@ -482,10 +482,27 @@ def _is_thinly_traded(symbol: str) -> bool:
     return is_thin
 
 
-def get_scan_targets(excluded: Set[str] = None) -> List[str]:
+def get_scan_targets(excluded: Set[str] = None, market_state: Optional[MarketState] = None) -> List[str]:
     """Equity scan universe = Alpaca-movers queue + top TI_PRIMARY_SCAN_BATCH_LIMIT
     tickers from the latest Trade Ideas capture (data/ti_primary.json), TI in
     its own rank order.
+
+    2026-08-27, user request ("the top 30 list should only keep after all
+    the guardrails also passed not just ti scrapper and alpaca movers"):
+    when market_state is provided, candidates also have to clear
+    _passes_guardrails() (price/RVOL/dollar-volume/avg-volume/float/
+    market-cap/gap-chase -- the same checks a signal has to pass to
+    execute) BEFORE the [:TI_PRIMARY_SCAN_BATCH_LIMIT] cap, not just the
+    existing dead/thin/excluded/delisted filter. Confirmed live: roughly
+    half a 24-symbol roster was a guaranteed reject every single cycle
+    (RVOL: FSLY/GTM/CLSK/UMAC/OMER/ZENA, price floor: GCTK/WKSP/UPXI, float
+    floor: BTCT/YYGH/BIRD) -- those permanently occupied scan slots a real
+    candidate further down TI's ranking never got a chance to fill.
+    market_state is optional and defaults to the old dead/thin/excluded/
+    delisted-only filter: two callers (enhanced.py's expiry/membership
+    checks) ask "is this symbol still on the list" many times a minute and
+    shouldn't pay for a full guardrail pass (snapshot prefetch, daily-volume/
+    float/mcap lookups) just for that.
 
     2026-08-26, user request ("reduce the number of signals to what TI
     provides... top 20... the universe of stocks should limit to the latest
@@ -549,6 +566,25 @@ def get_scan_targets(excluded: Set[str] = None) -> List[str]:
     # applied here, per-source, before either the merge or the cap.
     movers = [s for s in movers if _live(s)]
     ti_pool = [s for s in ti_pool if _live(s)]
+
+    if market_state is not None:
+        pool = list(dict.fromkeys(movers + ti_pool))
+        try:
+            _prefetch_snapshots(pool)
+        except Exception as e:
+            _log.debug(f"[GUARDRAIL] pre-filter snapshot prefetch failed, guardrail checks fail open: {e}")
+        bull = market_state.resolve_regime()
+
+        def _quality_ok(s: str) -> bool:
+            try:
+                return _passes_guardrails(s, bull_regime=bull, market_state=market_state)
+            except Exception as e:
+                _log.debug(f"{s}: guardrail pre-filter errored, failing open: {e}")
+                return True
+
+        movers = [s for s in movers if _quality_ok(s)]
+        ti_pool = [s for s in ti_pool if _quality_ok(s)]
+
     ti_slice = ti_pool[:_cfg.TI_PRIMARY_SCAN_BATCH_LIMIT]
 
     # 2026-08-26, user request ("keep it to top 30 signals together"): cap the
@@ -754,3 +790,61 @@ def filter_signals(signals, long_only: bool = False, min_conf: float = 0.0, cap:
     if cap is not None:
         signals = signals[:cap]
     return signals
+
+
+def _demo() -> None:
+    """Self-check for get_scan_targets()'s market_state-gated guardrail
+    pre-filter (2026-08-27, user request: "the top 30 list should only keep
+    after all the guardrails also passed not just ti scrapper and alpaca
+    movers"). Monkeypatches the module's own network-touching globals so
+    this runs with no live calls; restored in a finally."""
+    global _get_ti_primary, _get_alpaca_movers_queue, is_dead_ticker, _is_thinly_traded
+    global _prefetch_snapshots, _passes_guardrails
+    _orig = (_get_ti_primary, _get_alpaca_movers_queue, is_dead_ticker, _is_thinly_traded,
+             _prefetch_snapshots, _passes_guardrails)
+    try:
+        # GOOD passes every check; RVOLBAD/PRICEBAD/FLOATBAD each fail one
+        # of the structural guardrails -- exactly the pattern confirmed live
+        # 2026-08-27 (FSLY/GTM/etc on RVOL, GCTK/WKSP/UPXI on price,
+        # BTCT/YYGH/BIRD on float).
+        _get_ti_primary = lambda: ["RVOLBAD", "GOOD1", "PRICEBAD", "GOOD2", "FLOATBAD", "GOOD3"]
+        _get_alpaca_movers_queue = lambda: []
+        is_dead_ticker = lambda s: False
+        _is_thinly_traded = lambda s: False
+        _prefetch_snapshots = lambda symbols: None
+        _passes_guardrails = lambda s, bull_regime=None, market_state=None, return_reason=False: not s.endswith("BAD")
+
+        # market_state=None (existing callers that don't have one) -> old
+        # behavior, guardrails not applied at all.
+        targets = get_scan_targets(market_state=None)
+        assert targets == ["RVOLBAD", "GOOD1", "PRICEBAD", "GOOD2", "FLOATBAD", "GOOD3"], \
+            f"market_state=None must skip the guardrail pre-filter entirely, got {targets}"
+
+        # market_state provided -> the *BAD candidates must be filtered out
+        # before the cap, not just left in place.
+        class _FakeMarketState:
+            def resolve_regime(self): return True
+        targets = get_scan_targets(market_state=_FakeMarketState())
+        assert targets == ["GOOD1", "GOOD2", "GOOD3"], \
+            f"guardrail-failing candidates must be dropped before the cap when market_state is given, got {targets}"
+
+        # A doomed candidate ranked ABOVE good ones must not consume a scan
+        # slot that a lower-ranked-but-tradeable candidate could fill --
+        # the whole point of filtering before the cap, not after.
+        orig_limit = _cfg.TI_PRIMARY_SCAN_BATCH_LIMIT
+        _cfg.TI_PRIMARY_SCAN_BATCH_LIMIT = 2
+        try:
+            targets = get_scan_targets(market_state=_FakeMarketState())
+            assert targets == ["GOOD1", "GOOD2"], \
+                f"a doomed top-ranked candidate must not occupy a capped slot, got {targets}"
+        finally:
+            _cfg.TI_PRIMARY_SCAN_BATCH_LIMIT = orig_limit
+
+        print("scan._demo: all assertions passed")
+    finally:
+        (_get_ti_primary, _get_alpaca_movers_queue, is_dead_ticker, _is_thinly_traded,
+         _prefetch_snapshots, _passes_guardrails) = _orig
+
+
+if __name__ == "__main__":
+    _demo()
