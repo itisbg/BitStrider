@@ -624,7 +624,11 @@ TRADEIDEAS_UPDATE_CONFIG_FILE                     = True
 # Default 90s preserves fresh TI tickers for the initial universe. Set to 0 only
 # for advanced starts where background TI loading is acceptable.
 STARTUP_TI_CAPTURE_TIMEOUT_S                     = int(__import__('os').getenv('STARTUP_TI_CAPTURE_TIMEOUT_S', '90'))
-TI_PRIMARY_SCAN_BATCH_LIMIT                       = int(__import__('os').getenv('TI_PRIMARY_SCAN_BATCH_LIMIT', '50'))
+# 2026-08-26, user request ("top 20... universe should limit to the latest
+# trade ideas scrapping"): this IS the equity scan universe size now (was 50,
+# when it was just a guaranteed-minimum slice inside a much larger combined
+# universe — see get_scan_targets() in equity/scan.py).
+TI_PRIMARY_SCAN_BATCH_LIMIT                       = int(__import__('os').getenv('TI_PRIMARY_SCAN_BATCH_LIMIT', '20'))
 
 # Sector sympathy scanner — injects peer tickers when a leader stock fires
 USE_SECTOR_SYMPATHY          = False  # disabled — EDGAR 8-K is the primary discovery signal
@@ -991,19 +995,14 @@ SCAN_WORKERS        = 16   # Threads scanning symbols concurrently. Was capped a
                             # us actually checking it — pure throughput, doesn't change what gets
                             # traded, so it's not another variable in reading tomorrow's results.
 SCAN_SYMBOL_TIMEOUT = 15   # Max seconds per symbol before it is skipped
-SCAN_MAX_SYMBOLS    = 150  # Max symbols to scan per cycle. Was 75 — doubled 2026-08-11 to pair with
-                            # the SCAN_WORKERS 8->16 change above. get_scan_targets() only guarantees
-                            # TI_PRIMARY_SCAN_BATCH_LIMIT (50) of ti_primary.json's tickers into every
-                            # cycle; with the file regularly holding 90-200+ (checked live: 92 right
-                            # now), the other 40-150+ only get scanned via rotation sharing whatever's
-                            # left of this budget after the guaranteed batch — at the old 75, that was
-                            # ~20-25 rotation slots per cycle, so a given overflow ticker could sit
-                            # several cycles before its next check. Doubling this alongside the worker
-                            # count keeps per-worker load the same (75/8 ~= 150/16 ~= 9.4 symbols each)
-                            # instead of just finishing the old-size scan faster — this is the fix for
-                            # the actual bottleneck, not a priority queue for TI (it already IS the
-                            # primary driver of get_scan_targets() whenever ti_primary.json has 5+
-                            # tickers; there was nothing to prioritize it against).
+# SCAN_MAX_SYMBOLS: unused as of 2026-08-26. Used to cap a much larger
+# multi-source combined universe (EDGAR/sympathy/movers/watchlist + an
+# ~80-symbol rotating fallback list on top of the TI batch) that
+# get_scan_targets() (engine/equity/scan.py) no longer assembles — the scan
+# universe is just the top TI_PRIMARY_SCAN_BATCH_LIMIT tickers from
+# ti_primary.json now, so every cycle scans all of them, no rotation/cap
+# needed. Left defined (not deleted) in case that assembly comes back.
+SCAN_MAX_SYMBOLS    = 150
 BEAR_SHORT_TARGET_RESERVE = 30  # In bear regime, reserve more scan slots for short universe backups
 
 # ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ

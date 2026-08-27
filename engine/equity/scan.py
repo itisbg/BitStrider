@@ -43,7 +43,6 @@ from typing import List, Dict, Tuple, Set, Optional
 
 from engine import config as _cfg
 from engine.config import (
-    SCAN_MAX_SYMBOLS,
     SCAN_WORKERS,
     SCAN_SYMBOL_TIMEOUT,
     MIN_DOLLAR_VOLUME,
@@ -58,7 +57,6 @@ from engine.config import (
     MAX_GAP_CHASE_PCT,
     GAP_CHASE_CONSOL_BARS,
     GAP_CHASE_GUARD_ENABLED,
-    BEAR_SHORT_UNIVERSE,
     HMM_REGIME_LOOKBACK_DAYS,
     HMM_REGIME_CONFIDENCE_BOOST,
     TRADE_THIN_LIQUIDITY_REJECTS,
@@ -69,7 +67,6 @@ from engine.utils import MarketState, clear_bar_cache, get_bars, get_daily_volum
 from engine.utils.bars import get_data_client as _get_data_client
 from alpaca.data import StockSnapshotRequest as _StockSnapshotRequest
 from .universe import get_tier as _get_tier_live, get_latest_batch as _get_latest_batch, get_ti_primary as _get_ti_primary
-from .discovery import get_priority_scan_queue as _get_priority_scan_queue
 
 _ET  = pytz.timezone("America/New_York")
 _log = logging.getLogger("ApexTrader")
@@ -86,11 +83,6 @@ _ADAPTIVE_MIN_CONF = 0.60
 _ADAPTIVE_STEP_RVOL = 0.2
 _ADAPTIVE_STEP_CONF = 0.03
 from .strategies import get_strategy_instances, MomentumStrategy, TechnicalStrategy, SentimentStrategy, _get_float_shares, _get_market_cap
-from engine.utils.market import _is_bull_regime, _INVERSE_ETFS
-
-# Rotating scan offset — advances by SCAN_MAX_SYMBOLS each call so different
-# slices of the universe are covered across consecutive cycles.
-_scan_offset: int = 0
 
 # ── Batch snapshot cache ──────────────────────────────────────────────────────
 # Populated once at the start of each scan_universe() call via a single
@@ -449,16 +441,30 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
 
 
 def get_scan_targets(excluded: Set[str] = None) -> List[str]:
-    global _scan_offset
+    """Equity scan universe = top TI_PRIMARY_SCAN_BATCH_LIMIT tickers from the
+    latest Trade Ideas capture (data/ti_primary.json), in TI's own rank order.
 
+    2026-08-26, user request ("reduce the number of signals to what TI
+    provides... top 20... the universe of stocks should limit to the latest
+    trade ideas scrapping"): replaced the old multi-source assembly (EDGAR/
+    sympathy/Alpaca-movers/watchlist priority queue, an inverse-ETF/
+    BEAR_SHORT_UNIVERSE bear-regime seed, and an ~80-symbol rotating fallback
+    universe — routinely 90-150+ symbols/cycle, confirmed live) with just
+    this. ti_primary.json is refreshed in place by the ApexTraderTICapture
+    scheduled task (3 min 8:25-9:30 ET, 10 min 9:30-14:50 ET), so this
+    naturally tracks TI's latest read all day — no separate freeze/snapshot
+    needed; whatever's newest in the file each cycle IS the universe.
+
+    Falls back to the static config lists (get_dynamic_universe) only when
+    ti_primary.json is critically thin/empty (_MIN_TI) — a TI-outage safety
+    net, not a routine noise source. is_dead_ticker() (engine/utils/bars.py)
+    still strips out names with persistent stale/empty data.
+    """
     if excluded is None:
         excluded = set()
 
     delisted = set(_cfg.DELISTED_STOCKS)
 
-
-    # PRIMARY: latest captured TI tickers from ti_primary.json.
-    # FALLBACK: active TI tickers from universe.json tiers 1+2.
     ti_primary = [s for s in _get_ti_primary() if s not in delisted]
 
     # Universe health check
@@ -469,64 +475,17 @@ def get_scan_targets(excluded: Set[str] = None) -> List[str]:
         else:
             _log.warning(f"[UNIVERSE HEALTH] ti_primary.json too small ({len(ti_primary)}). Falling back to static config lists.")
         p1, p2, _ = _cfg.get_dynamic_universe()
-        # Alert if static lists are also empty
-        if len(p1) + len(p2) == 0:
+        base = list(dict.fromkeys(p2 + p1))
+        if len(base) == 0:
             _log.error("[UNIVERSE HEALTH] Static universe lists are empty! No tickers to scan. Check config/universe sources.")
     else:
-        p1, p2 = ti_primary, []
+        base = list(dict.fromkeys(ti_primary))[:_cfg.TI_PRIMARY_SCAN_BATCH_LIMIT]
 
-    # Limit how many fresh TI primary tickers are guaranteed into each cycle.
-    # This keeps the scan set tight and avoids scanning excessively large TI batches.
-    max_fresh = min(_cfg.TI_PRIMARY_SCAN_BATCH_LIMIT, SCAN_MAX_SYMBOLS)
-    latest_batch = list(dict.fromkeys(ti_primary))[:max_fresh]
-
-    # Rotate through the combined universe so every cycle scans a different slice.
-    # TI-promoted tickers sit at the front and always make it in regardless of offset.
-    combined_base = list(dict.fromkeys(p2 + p1))   # tier-2 first in bear, then tier-1
-    if len(combined_base) > 0:
-        off = _scan_offset % len(combined_base)
-        rotated_base = combined_base[off:] + combined_base[:off]
-        _scan_offset = (_scan_offset + SCAN_MAX_SYMBOLS) % len(combined_base)
-    else:
-        rotated_base = []
-
-    in_bear = not _is_bull_regime()
     targets = []
-    seen = set()
-
-    # Inverse ETFs guaranteed first in bear — they profit from market decline
-    # and are valid LONG buys with LONG_ONLY_MODE=True.
-
-    def _push(symbols: List[str], limit: int = None) -> None:
-        for s in symbols:
-            if limit is not None and len(targets) >= limit:
-                break
-            if s in seen or s in excluded or s in delisted:
-                continue
-            if is_dead_ticker(s):
-                continue
-            seen.add(s)
-            targets.append(s)
-
-    if in_bear:
-        # Always seed with inverse ETFs first — they are valid longs in bear regime
-        _push(_INVERSE_ETFS)
-        # Sympathy + EDGAR tickers queued this cycle — push before TI batch
-        _push(_get_priority_scan_queue())
-        # Push capped TI batch (respects max_fresh so bear-universe gets slots)
-        _push(latest_batch)
-        # Guarantee bear short universe symbols get into every bear cycle scan.
-        # These large/mid-cap names are what BearBreakdownStrategy fires on.
-        # Use SCAN_MAX_SYMBOLS as the ceiling so all slots up to the max are filled.
-        _push(list(BEAR_SHORT_UNIVERSE), limit=SCAN_MAX_SYMBOLS)
-        # Fill any remaining capacity from the rotating universe
-        _push(rotated_base, limit=SCAN_MAX_SYMBOLS)
-    else:
-        # Bull/neutral: sympathy/EDGAR tickers first, then latest batch + rotating universe
-        _push(_get_priority_scan_queue())
-        _push(latest_batch)
-        _push(rotated_base, limit=SCAN_MAX_SYMBOLS)
-
+    for s in base:
+        if s in excluded or s in delisted or is_dead_ticker(s):
+            continue
+        targets.append(s)
     return targets
 
 
