@@ -3733,7 +3733,39 @@ class EnhancedExecutor:
             sig_stub = SimpleNamespace(symbol=sym)
             gate_ok, gate_reason = _check_ema_trend_alignment(sig_stub, is_long)
             if not gate_ok:
-                log.info(f"{tag} {sym}: entry conditions not currently met ({gate_reason}) — not re-arming")
+                # 2026-08-26, user request ("will the 1 minute check will
+                # reenter the exited runners" -- confirmed this needed
+                # fixing): this used to just give up here. The gate not
+                # being aligned at the EXACT instant of exit doesn't mean it
+                # won't align a few minutes later -- backtested against
+                # today's actual exits: 58 of 73 would have re-aligned
+                # within 30 min, but 36 of those 58 only aligned AFTER the
+                # instant of exit, so the old one-shot check would have
+                # missed them entirely. Queue into the same
+                # _ema_blocked_entries structure a fresh blocked signal
+                # uses (see _validate_trade) so check_blocked_entries_ema's
+                # existing per-minute retry loop keeps checking until it
+                # aligns, the entry window closes, or the symbol drops out
+                # of the top-30 -- genuinely "every minute check after
+                # exit," not just once.
+                log.info(f"{tag} {sym}: entry conditions not currently met ({gate_reason}) — queuing for per-minute recheck")
+                if sym not in self._ema_blocked_entries:
+                    try:
+                        _bars = get_bars(sym, period="1d", interval="1m")
+                        _px = float(_bars["close"].iloc[-1]) if not _bars.empty else 0.0
+                    except Exception:
+                        _px = 0.0
+                    if _px > 0:
+                        _strategy = self._entry_log.get(sym, {}).get("strategy", "reentry")
+                        _reentry_signal = Signal(
+                            symbol=sym, action="buy" if is_long else "short", price=_px,
+                            confidence=0.70, reason=f"re-entry after {tag}", strategy=_strategy,
+                        )
+                        self._ema_blocked_entries[sym] = {
+                            "signal": _reentry_signal,
+                            "order_type": OrderType.LONG if is_long else OrderType.SHORT,
+                            "queued_at": datetime.datetime.now(datetime.timezone.utc),
+                        }
                 return
             reentry_side = OrderSide.BUY if is_long else OrderSide.SELL
             reentry_order = self.client.submit_order(TrailingStopOrderRequest(
@@ -3968,12 +4000,14 @@ class EnhancedExecutor:
         signal queued in self._ema_blocked_entries (blocked by
         _check_ema_trend_alignment at signal time, or cancelled out of
         self.order_cache by check_pending_entries_ema once conditions
-        turned) -- the moment the gate agrees, fires _execute_entry fresh
-        with a current account snapshot (re-validates and re-sizes from
-        scratch; nothing about the original signal's price/sizing is
-        assumed still current). Drops a queued entry once the entry window
-        closes, or once the symbol falls out of the top-15 TI universe --
-        no separate staleness timer, see _blocked_entry_action.
+        turned, or -- 2026-08-26 -- a just-exited symbol whose immediate
+        re-entry gate check in _maybe_rearm_reentry failed) -- the moment
+        the gate agrees, fires _execute_entry fresh with a current account
+        snapshot (re-validates and re-sizes from scratch; nothing about the
+        original signal's price/sizing is assumed still current). Drops a
+        queued entry once the entry window closes, or once the symbol
+        falls out of the top-30 scan universe -- no separate staleness
+        timer, see _blocked_entry_action.
 
         2026-08-25, user request chain: "each blocked trade should wait
         for next minute recheck not to completely discard the order" ->
