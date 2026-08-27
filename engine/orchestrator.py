@@ -1141,6 +1141,7 @@ def start() -> None:
     last_vix_check    = time.time()
     current_interval  = get_adaptive_interval(ctx)
     last_scan         = time.time()
+    _, last_market_phase = get_market_hours_interval(MarketState.from_now().hour, {})
 
     schedule.every(30).minutes.do(log_status, ctx)
     schedule.every(30).minutes.do(_prune_universe_job)
@@ -1156,13 +1157,24 @@ def start() -> None:
     try:
         while True:
             try:
-                # Refresh interval every 15 min
-                if cfg.ADAPTIVE_INTERVALS and (time.time() - last_vix_check) >= 900:
+                # Refresh interval every 15 min, OR immediately on a market-phase
+                # transition (PRE-MARKET/REGULAR HOURS/AFTER-HOURS/OFF-HOURS).
+                # The 15-min timer alone let a stale premarket interval (10 min)
+                # ride up to 15 min past the 9:30 ET open before recomputing --
+                # confirmed 2026-08-26: one scan at 9:27:44 ET, next not until
+                # 9:38:12 ET, an ~8 min dead zone spanning the open. This phase
+                # check is a local hour lookup (get_market_hours_interval), no
+                # API call, so it's cheap to run every loop tick.
+                _, market_phase_now = get_market_hours_interval(MarketState.from_now().hour, {})
+                phase_changed = cfg.USE_MARKET_HOURS_TUNING and market_phase_now != last_market_phase
+                if cfg.ADAPTIVE_INTERVALS and (phase_changed or (time.time() - last_vix_check) >= 900):
                     new_interval = get_adaptive_interval(ctx)
                     if new_interval != current_interval:
-                        log.info(f"Scan interval: {current_interval} → {new_interval} min")
+                        log.info(f"Scan interval: {current_interval} → {new_interval} min"
+                                 + (f" (phase: {last_market_phase} → {market_phase_now})" if phase_changed else ""))
                         current_interval = new_interval
                     last_vix_check = time.time()
+                last_market_phase = market_phase_now
 
                 if (time.time() - last_scan) >= (current_interval * 60):
                     try:
