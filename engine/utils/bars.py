@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import datetime
 import logging
+import os
 import threading
 import time
 from typing import Dict, Tuple
@@ -86,26 +87,56 @@ def _staleness_threshold(interval: str) -> float:
 _data_client = None
 _option_data_client = None
 
-# ── Dead ticker suppression (disabled — all tickers eligible) ─────────────────
-_DEAD_TICKER_THRESHOLD = 999_999
+# ── Dead ticker suppression ─────────────────────────────────────────────────
+# A symbol that comes back stale/empty this many *consecutive* fetches (across
+# both the Alpaca and yfinance paths, whichever runs) gets suppressed from
+# further scans for a while instead of getting hit every cycle for nothing.
+# Root cause this addresses: names like SAJ get added to the scan universe on
+# a one-off signal (EDGAR 8-K match, sympathy, mover) and, with no data-driven
+# filter, keep getting queried every cycle for the rest of the session even
+# once IEX/yfinance have shown zero fresh prints for an hour+ — pure wasted
+# Alpaca calls on structurally thin names (confirmed 2026-08-26: SAJ staleness
+# climbing every cycle with no reset after ~10:50 ET).
+_DEAD_TICKER_THRESHOLD = int(os.getenv("DEAD_TICKER_THRESHOLD", "5"))
+# Once suppressed, let one real fetch back through every N seconds so a name
+# that starts trading again recovers on its own instead of being dead for the
+# rest of the process's life.
+_DEAD_TICKER_RECHECK_SEC = int(os.getenv("DEAD_TICKER_RECHECK_SEC", "900"))
 _dead_ticker_hits: Dict[str, int] = {}
-_dead_tickers: set = set()
+_dead_tickers: Dict[str, float] = {}  # symbol -> epoch time last marked dead
 _dead_ticker_lock = threading.Lock()
 
 
 def _record_empty_bars(symbol: str) -> None:
-    """No-op stub — suppression disabled."""
-    return
+    """Count a stale/empty fetch; suppress after _DEAD_TICKER_THRESHOLD in a row."""
+    with _dead_ticker_lock:
+        hits = _dead_ticker_hits.get(symbol, 0) + 1
+        _dead_ticker_hits[symbol] = hits
+        if hits >= _DEAD_TICKER_THRESHOLD:
+            newly = symbol not in _dead_tickers
+            _dead_tickers[symbol] = time.time()
+    if hits >= _DEAD_TICKER_THRESHOLD and newly:
+        logging.getLogger("ApexTrader").warning(
+            f"{symbol}: {hits} consecutive stale/empty bar fetches — suppressing from scans"
+        )
 
 
 def _record_ok_bars(symbol: str) -> None:
-    """No-op stub."""
-    return
+    """A usable, fresh bar came back — clear any suppression immediately."""
+    with _dead_ticker_lock:
+        _dead_ticker_hits.pop(symbol, None)
+        _dead_tickers.pop(symbol, None)
 
 
 def is_dead_ticker(symbol: str) -> bool:
-    """Always False — dead-ticker suppression is disabled."""
-    return False
+    """True if symbol is currently suppressed for persistent stale/empty data."""
+    with _dead_ticker_lock:
+        marked_at = _dead_tickers.get(symbol)
+        if marked_at is None:
+            return False
+        if time.time() - marked_at >= _DEAD_TICKER_RECHECK_SEC:
+            return False  # let one probe through; _record_* will re-mark or clear it
+        return True
 
 
 def clear_bar_cache() -> None:
@@ -558,3 +589,34 @@ def calculate_atr(bars: pd.DataFrame, period: int = 14) -> float:
         return float(atr) if not pd.isna(atr) else 0.0
     except Exception:
         return 0.0
+
+
+def _demo() -> None:
+    """Self-check for the dead-ticker suppression state machine."""
+    global _DEAD_TICKER_THRESHOLD, _DEAD_TICKER_RECHECK_SEC
+    _dead_ticker_hits.clear()
+    _dead_tickers.clear()
+    _DEAD_TICKER_THRESHOLD = 3
+    _DEAD_TICKER_RECHECK_SEC = 900
+
+    assert not is_dead_ticker("XYZ"), "fresh symbol must not start suppressed"
+    for _ in range(2):
+        _record_empty_bars("XYZ")
+    assert not is_dead_ticker("XYZ"), "below threshold must not suppress yet"
+    _record_empty_bars("XYZ")  # 3rd consecutive miss
+    assert is_dead_ticker("XYZ"), "threshold hits must suppress"
+
+    _record_ok_bars("XYZ")
+    assert not is_dead_ticker("XYZ"), "a fresh bar must clear suppression immediately"
+
+    for _ in range(3):
+        _record_empty_bars("ABC")
+    assert is_dead_ticker("ABC")
+    _dead_tickers["ABC"] = time.time() - _DEAD_TICKER_RECHECK_SEC - 1
+    assert not is_dead_ticker("ABC"), "recheck window must let a probe back through"
+
+    print("bars._demo: all assertions passed")
+
+
+if __name__ == "__main__":
+    _demo()

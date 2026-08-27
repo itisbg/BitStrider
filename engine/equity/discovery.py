@@ -9,6 +9,7 @@ from __future__ import annotations
 import concurrent.futures
 import datetime
 import logging
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,9 +42,17 @@ last_ti_options_scan:      float      = 0.0
 last_ti_toplists_scan:     float      = 0.0
 last_sympathy_scan:        float      = 0.0
 last_edgar_scan:           float      = 0.0
-# Sympathy + EDGAR tickers queued for the NEXT scan cycle.
+# Sympathy + EDGAR/movers/watchlist tickers queued for upcoming scan cycles.
 # get_scan_targets() pops these to the front so they are guaranteed to be scanned.
-_priority_scan_queue:      List[str]  = []
+# Symbol -> epoch time it was first queued. Never refreshed by repeat matches
+# (a re-trigger of an already-queued symbol is not a "new" signal) so a name
+# that fires once and then goes quiet ages out instead of getting scanned —
+# and hitting Alpaca — forever. Was an unbounded, never-pruned List[str]
+# before 2026-08-26 (confirmed: SAJ, added once via an EDGAR 8-K match,
+# stayed in every scan cycle for the rest of the session with zero fresh
+# IEX/yfinance prints after ~10:50 ET).
+_priority_scan_queue:      Dict[str, float] = {}
+_PRIORITY_QUEUE_TTL_MIN = int(os.getenv("PRIORITY_QUEUE_TTL_MIN", "60"))
 last_alpaca_mover_scan:    float      = 0.0
 _ti_started_at:            float      = 0.0
 _ti_warned_running:        bool       = False
@@ -52,12 +61,20 @@ _ti_future: Optional[concurrent.futures.Future] = None
 
 
 def get_priority_scan_queue() -> List[str]:
-    """Return the current sympathy/EDGAR/screener tickers (read-only peek).
+    """Return the current sympathy/EDGAR/screener tickers (read-only peek),
+    pruning entries older than _PRIORITY_QUEUE_TTL_MIN as a side effect.
 
-    Does NOT drain the queue — symbols remain until the next screener/discovery
-    refresh replaces them, so both equity and options scans see the same set.
+    Does NOT drain fresh entries — symbols remain until they age out (TTL) or
+    a fetch marks them dead (is_dead_ticker), so both equity and options scans
+    see the same set.
     """
-    return list(_priority_scan_queue)
+    cutoff = time.time() - _PRIORITY_QUEUE_TTL_MIN * 60
+    expired = [s for s, added in _priority_scan_queue.items() if added < cutoff]
+    for s in expired:
+        del _priority_scan_queue[s]
+    if expired:
+        log.info(f"[PRIORITY-QUEUE] Aged out {len(expired)} ticker(s) after {_PRIORITY_QUEUE_TTL_MIN}min: {expired}")
+    return list(_priority_scan_queue.keys())
 
 
 @dataclass
@@ -403,13 +420,12 @@ class PreopenIntelligenceScanner:
 
     def _inject_watchlist_to_priority_queue(self, priority_1: list, priority_2: list) -> None:
         added = []
-        qset = set(_priority_scan_queue)
+        now = time.time()
         for item in self.watchlist:
             sym = item["symbol"]
-            if sym in qset or sym in priority_1 or sym in priority_2:
+            if sym in _priority_scan_queue or sym in priority_1 or sym in priority_2:
                 continue
-            _priority_scan_queue.append(sym)
-            qset.add(sym)
+            _priority_scan_queue[sym] = now
             added.append(sym)
         if added:
             log.info(f"[PREOPEN] Injected {len(added)} pre-open watchlist tickers into priority queue")
@@ -869,15 +885,14 @@ def scan_sympathy_and_edgar(
             sympathies = get_active_sympathies()
             if sympathies:
                 p1_set = set(priority_1)
-                queue_set = set(_priority_scan_queue)
                 new_syms = [s for s in sympathies if s not in p1_set and s not in delisted]
                 if new_syms:
                     log.info(f"[SYMPATHY] Injecting {len(new_syms)} sympathy tickers into P1 + scan queue: {new_syms}")
                     priority_1.extend(new_syms)
+                    now = time.time()
                     for s in new_syms:
-                        if s not in queue_set:
-                            _priority_scan_queue.append(s)
-                            queue_set.add(s)
+                        if s not in _priority_scan_queue:
+                            _priority_scan_queue[s] = now
         except Exception as exc:
             log.debug(f"[SYMPATHY] Scan error: {exc}")
         finally:
@@ -891,14 +906,13 @@ def scan_sympathy_and_edgar(
             if edgar_tickers:
                 p2_set = set(priority_2)
                 p1_set = set(priority_1)
-                queue_set = set(_priority_scan_queue)
+                now = time.time()
                 for sym in edgar_tickers:
                     if sym not in delisted and sym not in p2_set and sym not in p1_set:
                         log.info(f"[EDGAR] Adding {sym} to P2 + scan queue for monitoring")
                         priority_2.append(sym)
-                    if sym not in delisted and sym not in queue_set:
-                        _priority_scan_queue.append(sym)
-                        queue_set.add(sym)
+                    if sym not in delisted and sym not in _priority_scan_queue:
+                        _priority_scan_queue[sym] = now
         except Exception as exc:
             log.debug(f"[EDGAR] Scan error: {exc}")
         finally:
@@ -965,7 +979,6 @@ def scan_alpaca_movers(*, interval_min: float = 10.0, market_state: MarketState)
                 return
 
         injected: List[str] = []
-        queue_set = set(_priority_scan_queue)
         delisted  = set(_cfg.DELISTED_STOCKS)
 
         for m in movers_resp.gainers:
@@ -982,10 +995,9 @@ def scan_alpaca_movers(*, interval_min: float = 10.0, market_state: MarketState)
             # Volume confirmation: must also appear in most actives
             if sym not in active_syms:
                 continue
-            if sym in queue_set or sym in delisted:
+            if sym in _priority_scan_queue or sym in delisted:
                 continue
-            _priority_scan_queue.append(sym)
-            queue_set.add(sym)
+            _priority_scan_queue[sym] = time.time()
             injected.append(sym)
             log.info(
                 f"[ALPACA-MOVERS] Adding {sym} to P2 + scan queue for monitoring"
@@ -1081,3 +1093,23 @@ def scan_tradeideas_toplists(
         scan_keys=["toplists"],
         remote_debug_port=remote_debug_port,
     )
+
+
+def _demo() -> None:
+    """Self-check for the priority-scan-queue TTL pruning."""
+    global _PRIORITY_QUEUE_TTL_MIN
+    _priority_scan_queue.clear()
+    _PRIORITY_QUEUE_TTL_MIN = 60
+
+    now = time.time()
+    _priority_scan_queue["FRESH"] = now
+    _priority_scan_queue["OLD"] = now - (_PRIORITY_QUEUE_TTL_MIN * 60) - 1
+    live = get_priority_scan_queue()
+    assert live == ["FRESH"], f"expected only FRESH to survive TTL prune, got {live}"
+    assert "OLD" not in _priority_scan_queue, "expired entry must be deleted, not just filtered"
+
+    print("discovery._demo: all assertions passed")
+
+
+if __name__ == "__main__":
+    _demo()

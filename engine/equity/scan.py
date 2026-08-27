@@ -123,7 +123,7 @@ def _prefetch_snapshots(symbols: List[str]) -> None:
 
 
 # Every guardrail-rejection reason _passes_guardrails() can return that this
-# path is allowed to rescue. Deliberately excludes two things:
+# path is allowed to rescue. Deliberately excludes:
 #   - 'other': not a guardrail at all, the catch-all for non-guardrail skips
 #     (stale data, symbol errors, etc.) this path was never meant to override.
 #   - 'min_price': penny stocks stay hard-blocked even intraday, 2026-08-13
@@ -131,8 +131,20 @@ def _prefetch_snapshots(symbols: List[str]) -> None:
 #     that's about instrument quality (poor fill quality, wide spreads on
 #     sub-MIN_STOCK_PRICE names) rather than liquidity/volume/momentum
 #     thresholds this widening is meant to relax.
+#   - 'dollar_vol', 'avg_volume', 'low_float', 'low_mcap' -- 2026-08-26, user
+#     request ("shouldn't meet the non-negotiable limits of volume"):
+#     removed. These four describe the security's actual tradability --
+#     how much of it exists and how much really changes hands -- not a
+#     noisy momentary reading, so admitting a signal that fails one of
+#     them isn't "the setup looked thin for a second," it's "this stock
+#     structurally doesn't have the volume to trade safely." Confirmed
+#     live: RPGL admitted via dollar_vol (12x under the $900K floor,
+#     0.0M float) and round-tripped for a real loss. rvol and gap_chase
+#     stay admittable -- both are momentum-shape reads that can
+#     legitimately wobble under/over their threshold minute to minute on
+#     an otherwise normal-liquidity name.
 _ALL_GUARDRAIL_REASONS = frozenset({
-    'dollar_vol', 'rvol', 'gap_chase', 'avg_volume', 'low_float', 'low_mcap',
+    'rvol', 'gap_chase',
 })
 
 
@@ -157,17 +169,25 @@ def _should_admit_thin_liquidity(reason: Optional[str], market_state: Optional[M
     day... check before closing end of day if the tickers pass guardrail,
     keep them overnight" -- refined same day to "only avoid penny stocks"):
     widened from avg_volume/low_float to every real guardrail reason except
-    min_price (_ALL_GUARDRAIL_REASONS) -- RVOL, dollar_vol, gap_chase, and
-    market cap are no longer hard-blocked at entry; penny stocks still are.
-    The overnight side already enforces the real safety boundary regardless
-    of which reasons got waived at entry: close_guardrail_fail_positions
-    checks every open position, any strategy, against avg_volume/float/mcap
-    at 15:45 ET and force-closes anything still failing -- that's the "check
-    before closing end of day" the user asked for, already built (2026-08-12
+    min_price -- RVOL, dollar_vol, gap_chase, avg_volume, and market cap were
+    no longer hard-blocked at entry; penny stocks still are. The overnight
+    side already enforces the real safety boundary regardless of which
+    reasons got waived at entry: close_guardrail_fail_positions checks every
+    open position, any strategy, against avg_volume/float/mcap at 15:45 ET
+    and force-closes anything still failing -- that's the "check before
+    closing end of day" the user asked for, already built (2026-08-12
     guardrail-fail overnight exit feature). This just stops the entry-side
     gate from being stricter than the exit-side one for intraday trades that
     are getting flattened by the close regardless.
     market_state=None (caller didn't pass one) fails closed -- no admit.
+
+    2026-08-26, user request ("shouldn't meet the non-negotiable limits of
+    volume"): narrowed back down. dollar_vol/avg_volume/low_float/low_mcap
+    removed from _ALL_GUARDRAIL_REASONS -- those four describe actual
+    tradability, not a momentary reading, and admitting a signal that fails
+    one of them isn't the "thin for a second" case this path exists for.
+    Only rvol and gap_chase remain admittable. See _ALL_GUARDRAIL_REASONS'
+    own comment for the RPGL case this was measured against.
 
     2026-08-17, user request: also cut off at EOD_CLOSE_TIME (15:45 ET).
     is_regular_hours alone wasn't enough -- ASST and NUAI both got admitted
