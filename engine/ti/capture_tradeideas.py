@@ -1094,7 +1094,32 @@ def _ensure_logged_in(driver) -> bool:
     mean the element is the VISIBLE one; the page has other hidden/
     off-screen inputs matching the same broad selectors (a decoy field,
     a collapsed alternate form, etc.) that matched first. Now filters to
-    is_displayed() and takes the first genuinely visible match."""
+    is_displayed() and takes the first genuinely visible match.
+
+    2026-08-27, user report (screenshot: "Your Free Use Has Expired" modal,
+    "Continue With A Paid Account" / "View Plans & Subscribe" / "Log In To
+    Your Account"): an unauthenticated/expired-trial visit doesn't drop
+    straight into a login form -- it's gated behind this interstitial
+    first, which has no password field of its own, so the old detection
+    silently passed it through as "not a login page". Click the "Log In"
+    entry point first (matched by visible text, not TI-specific markup,
+    same principle as the password-field detection above) if present, THEN
+    look for the password field it reveals.
+    """
+    try:
+        login_links = [
+            e for e in driver.find_elements(By.XPATH, "//*[self::button or self::a][contains(translate(., 'LOGIN', 'login'), 'log in')]")
+            if e.is_displayed()
+        ]
+        if login_links:
+            print("[....] 'Free Use Has Expired' interstitial detected -- clicking through to login form")
+            login_links[0].click()
+            WebDriverWait(driver, 5).until(
+                lambda d: any(e.is_displayed() for e in d.find_elements(By.CSS_SELECTOR, "input[type='password']"))
+            )
+    except Exception:
+        pass  # no interstitial, or it didn't reveal a password field -- fall through to the normal check
+
     try:
         pw_fields = [e for e in driver.find_elements(By.CSS_SELECTOR, "input[type='password']") if e.is_displayed()]
     except Exception:
