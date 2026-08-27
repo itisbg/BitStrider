@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import datetime
+import json
 import logging
 import os
 import time
@@ -76,6 +77,57 @@ _PRIORITY_QUEUE_TTL_MIN = int(os.getenv("PRIORITY_QUEUE_TTL_MIN", "60"))
 # trading day (see _alpaca_movers_day below) instead of rolling-windowed.
 _alpaca_movers_queue:      Dict[str, float] = {}
 _alpaca_movers_day: Optional[datetime.date] = None  # date of the last reset -- see scan_alpaca_movers
+
+# 2026-08-27, user request ("I have lost most of my gains due to these
+# bugs"): _alpaca_movers_queue was pure in-memory with zero disk
+# persistence -- every one of today's several restarts silently wiped the
+# ENTIRE queue back to empty, independent of the TTL bug fixed just above.
+# CRM/CRWD and 13 other names confirmed as real movers earlier today
+# (DAIC, NCPL, OKTA, CELU, YJ, BRNX, NVDX, NVDL, NMTC, MERC, NOWL, AZIO,
+# WNW, PURR) were lost this way, not just by the TTL. Persisted the same
+# way universe.json/ti_primary.json already are (engine/equity/universe.py)
+# -- load once at import, save on every mutation (add + daily reset) --
+# so a restart mid-session no longer costs the day's confirmed movers.
+_MOVERS_QUEUE_FILE = REPO_ROOT / "data" / "alpaca_movers_queue.json"
+
+
+def _load_movers_queue_from_disk() -> None:
+    """Populate _alpaca_movers_queue/_alpaca_movers_day from disk at import
+    time. A file from a PRIOR trading day is intentionally ignored here
+    (left for scan_alpaca_movers's own date check to clear on its next
+    call) rather than special-cased twice -- same "only today's date
+    counts" rule, one place."""
+    global _alpaca_movers_queue, _alpaca_movers_day
+    if not _MOVERS_QUEUE_FILE.exists():
+        return
+    try:
+        raw = json.loads(_MOVERS_QUEUE_FILE.read_text(encoding="utf-8"))
+        saved_date = datetime.date.fromisoformat(raw["date"])
+        if saved_date != datetime.date.today():
+            return  # stale (yesterday or older) -- leave empty, don't restore
+        _alpaca_movers_queue = {str(k): float(v) for k, v in raw.get("tickers", {}).items()}
+        _alpaca_movers_day = saved_date
+        if _alpaca_movers_queue:
+            log.info(f"[ALPACA-MOVERS-QUEUE] Restored {len(_alpaca_movers_queue)} ticker(s) from disk after restart: {list(_alpaca_movers_queue.keys())}")
+    except Exception as e:
+        log.warning(f"[ALPACA-MOVERS-QUEUE] Failed to load {_MOVERS_QUEUE_FILE.name} (non-fatal, starting empty): {e}")
+
+
+def _save_movers_queue_to_disk() -> None:
+    """Write the current queue to disk. Best-effort -- a save failure must
+    never block the caller (an add or a daily reset) from completing."""
+    try:
+        _MOVERS_QUEUE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _MOVERS_QUEUE_FILE.write_text(
+            json.dumps({"date": str(datetime.date.today()), "tickers": _alpaca_movers_queue}, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        log.warning(f"[ALPACA-MOVERS-QUEUE] Failed to save {_MOVERS_QUEUE_FILE.name} (non-fatal): {e}")
+
+
+_load_movers_queue_from_disk()
+
 last_alpaca_mover_scan:    float      = 0.0
 _ti_started_at:            float      = 0.0
 _ti_warned_running:        bool       = False
@@ -990,6 +1042,7 @@ def scan_alpaca_movers(*, interval_min: float = 10.0, market_state: MarketState)
             log.info(f"[ALPACA-MOVERS-QUEUE] New trading day — clearing {len(_alpaca_movers_queue)} ticker(s) from the previous session: {list(_alpaca_movers_queue.keys())}")
         _alpaca_movers_queue = {}
         _alpaca_movers_day = today
+        _save_movers_queue_to_disk()
 
     now = time.time()
     if now - last_alpaca_mover_scan < interval_min * 60:
@@ -1063,6 +1116,7 @@ def scan_alpaca_movers(*, interval_min: float = 10.0, market_state: MarketState)
             _alpaca_movers_queue.setdefault(sym, now_ts)
             if not is_new:
                 continue  # already tracked -- nothing new to log
+            _save_movers_queue_to_disk()
             injected.append(sym)
             log.info(
                 f"[ALPACA-MOVERS] Adding {sym} to P2 + scan queue for monitoring"
@@ -1191,6 +1245,47 @@ def _demo() -> None:
     # downstream in get_scan_targets) may remove it.
     _alpaca_movers_queue["OLDMOVR"] = 1.0  # 1970 -- as old as a timestamp gets
     assert "OLDMOVR" in get_alpaca_movers_queue(), "movers queue must not age out entries by elapsed time"
+
+    # 2026-08-27, disk-persistence fix ("I have lost most of my gains due to
+    # these bugs"): the movers queue was pure in-memory -- every restart
+    # wiped it, stranding legitimately-active movers. Round-trip through a
+    # temp file (never the real data/alpaca_movers_queue.json) to verify
+    # save -> load survives a process restart, and that a stale (yesterday's)
+    # file is correctly ignored rather than resurrected.
+    import tempfile
+    global _MOVERS_QUEUE_FILE
+    real_file = _MOVERS_QUEUE_FILE
+    tmpdir = tempfile.mkdtemp()
+    try:
+        _MOVERS_QUEUE_FILE = Path(tmpdir) / "movers_test.json"
+
+        _alpaca_movers_queue.clear()
+        _alpaca_movers_queue["PERSIST"] = now
+        _save_movers_queue_to_disk()
+        assert _MOVERS_QUEUE_FILE.exists(), "save must write the file"
+
+        _alpaca_movers_queue.clear()
+        _load_movers_queue_from_disk()
+        assert _alpaca_movers_queue == {"PERSIST": now}, \
+            f"load must restore exactly what was saved, got {_alpaca_movers_queue}"
+
+        # A file from a prior trading day must be ignored (daily reset owns
+        # clearing it, not the loader silently resurrecting stale movers).
+        stale = {"date": "2020-01-01", "tickers": {"STALE": now}}
+        _MOVERS_QUEUE_FILE.write_text(json.dumps(stale), encoding="utf-8")
+        _alpaca_movers_queue.clear()
+        _load_movers_queue_from_disk()
+        assert _alpaca_movers_queue == {}, \
+            f"a stale-dated file must not be loaded, got {_alpaca_movers_queue}"
+
+        # A missing/corrupt file must not raise -- restart must still boot.
+        _MOVERS_QUEUE_FILE.write_text("not json", encoding="utf-8")
+        _alpaca_movers_queue.clear()
+        _load_movers_queue_from_disk()  # must not raise
+        assert _alpaca_movers_queue == {}, "corrupt file must load as empty, not raise"
+    finally:
+        _MOVERS_QUEUE_FILE = real_file
+        _alpaca_movers_queue.clear()
 
     print("discovery._demo: all assertions passed")
 

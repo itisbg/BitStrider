@@ -769,6 +769,7 @@ class EnhancedExecutor:
         self._no_history_cache: set = set()
         self.market_state: Optional[MarketState] = None
         self._rebuild_entry_log_from_orders()
+        self._rebuild_order_cache_from_broker()
 
     def update_market_state(self, market_state: MarketState) -> None:
         """Store the active market snapshot for per-cycle execution decisions."""
@@ -849,6 +850,52 @@ class EnhancedExecutor:
                 )
         except Exception as e:
             log.warning(f"_rebuild_entry_log_from_orders failed (non-fatal): {e}")
+
+    def _rebuild_order_cache_from_broker(self) -> None:
+        """On startup, reconstruct self.order_cache from any BUY trailing-stop
+        orders still open at the broker.
+
+        2026-08-27, user request ("make the 1 min checks more robust"):
+        self.order_cache starts empty every process restart, with nothing to
+        repopulate it -- check_pending_entries_ema only ever looks at
+        `for sym, order_id in self.order_cache.items()`, so any resting
+        re-entry order placed by a PRIOR run (check_ema9_exit's re-arm,
+        _maybe_rearm_reentry, a fresh entry's own trailing-buy) silently
+        drops out of the per-minute EMA recheck the instant the bot
+        restarts -- it just sits there, completely unmonitored, until it
+        either fills on its own or someone notices. Confirmed live:
+        SAIL/MARA/ASAN were all resting BUY trailing-stop orders from
+        earlier today, invisible to a freshly-restarted process, on a day
+        this bot restarted more than half a dozen times. Same fix shape as
+        _rebuild_entry_log_from_orders right above -- reconstruct from
+        broker truth instead of assuming in-memory state survived.
+
+        Can't recover self._pending_entry_signals (the original Signal
+        that would let a cancelled order requeue into _ema_blocked_entries
+        for retry) -- that context doesn't exist in the order itself. A
+        recovered order that later gets cancelled by check_pending_entries_ema
+        just won't requeue, same graceful degradation that already applies
+        to every check_ema9_exit-armed re-entry (which never had a stored
+        signal either -- see that method's docstring)."""
+        try:
+            from alpaca.trading.requests import GetOrdersRequest
+            from alpaca.trading.enums import QueryOrderStatus
+            req = GetOrdersRequest(status=QueryOrderStatus.OPEN)
+            open_orders = self.client.get_orders(filter=req)
+            recovered = []
+            for order in open_orders:
+                raw_side = getattr(order, "side", "")
+                side = str(getattr(raw_side, "value", raw_side)).lower()
+                raw_type = getattr(order, "order_type", "")
+                otype = str(getattr(raw_type, "value", raw_type)).lower()
+                if side != "buy" or "trailing_stop" not in otype:
+                    continue  # only entry-side trailing-buys belong in order_cache
+                self.order_cache[order.symbol] = str(order.id)
+                recovered.append(order.symbol)
+            if recovered:
+                log.info(f"order_cache rebuilt from broker: {', '.join(recovered)}")
+        except Exception as e:
+            log.warning(f"_rebuild_order_cache_from_broker failed (non-fatal): {e}")
 
     def _current_market_state(self) -> MarketState:
         if self.market_state is not None:
