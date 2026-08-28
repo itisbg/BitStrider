@@ -2,13 +2,13 @@
 # Run in PowerShell as Administrator.
 
 $taskName = 'ApexTraderTICapture'
-$taskDescription = 'Refresh data/ti_primary.json: every 3 min 08:25-09:30 (9:25-10:30am ET), then every 10 min until 14:50 (3:50pm ET, matches ENTRY_WINDOW_END_ET), Mon-Fri — single-shot runs owned by Task Scheduler'
+$taskDescription = 'Refresh Yahoo Finance data/ti_primary.json: every 3 min 09:09-10:30 ET, every 10 min 10:30-14:50 ET, every 3 min 14:50-15:50 ET, Mon-Fri — single-shot runs owned by Task Scheduler'
 $BaseDir = $PSScriptRoot
 
 $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$BaseDir\scripts\run_ti_capture_task.ps1`""
 
-# 2026-08-22, user request: the FIRST trade-ideas.com call of the day must land
-# at 08:30 (market open, this machine's Central clock) — not earlier. Dropped
+# The first Yahoo refresh must land at 09:09 ET (08:09 Central on this
+# machine), not earlier. Dropped
 # the old AtLogOn trigger: it fired an immediate scrape at whatever time the
 # user happened to log into Windows, which could be well before 08:30 and made
 # "first call" unpredictable. The weekly trigger below is Task-Scheduler-owned
@@ -16,28 +16,18 @@ $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfil
 # after a crashed run — no logon-trigger safety net needed for that anymore.
 $repetitionClass = Get-CimClass -ClassName MSFT_TaskRepetitionPattern -Namespace Root/Microsoft/Windows/TaskScheduler
 
-# 2026-08-22, user request: "trade ideas scrapping for the time 9.25am to
-# 10.30 am will be every 5minutes" -- single trigger covering the whole
-# 08:25-09:30 Central window (9:25-10:30am ET), first fire doubling as the
-# old separate kickstart run (was a one-shot 08:25 trigger plus a separate
-# 08:30-09:30 repeating one; merged since the kickstart time is now just
-# this block's first tick).
-# 2026-08-24, user request: "first 1hour run every 3 mins" -- interval
-# 5min -> 3min. Window boundaries (08:25-09:30 Central) left untouched on
-# purpose: it's actually 1h5m, not a flat 1h, but trimming it to a literal
-# 1h would open a 5-min gap before the 09:30 trigger picks up -- said so,
-# didn't do it; ask if you actually want that gap instead.
-$openingTrigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday,Tuesday,Wednesday,Thursday,Friday -At 08:25
+# Yahoo refresh: 09:09-10:30 ET = 08:09-09:30 Central, every 3 minutes.
+$openingTrigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday,Tuesday,Wednesday,Thursday,Friday -At 08:09
 # .Repetition isn't settable in place (returns a fresh, disconnected CIM instance
 # each access) — build the repetition pattern separately and assign it whole.
 $openingRepetition = New-CimInstance -CimClass $repetitionClass -ClientOnly
 $openingRepetition.Interval = 'PT3M'
-$openingRepetition.Duration = 'PT1H5M'   # 08:25 -> 09:30 (9:25-10:30am ET)
+$openingRepetition.Duration = 'PT1H21M'  # 08:09 -> 09:30 (9:09-10:30am ET)
 $openingRepetition.StopAtDurationEnd = $false
 $openingTrigger.Repetition = $openingRepetition
 
-# Rest of the session: back to every 10 min, 09:30 -> 14:50 Central (3:50pm
-# ET, matches ENTRY_WINDOW_END_ET/EOD_CLOSE_TIME in config.py -- no new
+# Rest of the session: every 10 minutes, 09:30 -> 13:50 Central
+# (10:30am-2:50pm ET).
 # entries fire after that, so fresh universe data past that point is
 # pointless). 2026-08-22, user request: "even the webscrapping for universe
 # should stop at 3.50ET" -- was PT5H30M out to 15:00 Central (market close,
@@ -45,11 +35,19 @@ $openingTrigger.Repetition = $openingRepetition
 $weekdayTrigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday,Tuesday,Wednesday,Thursday,Friday -At 09:30
 $repetition = New-CimInstance -CimClass $repetitionClass -ClientOnly
 $repetition.Interval = 'PT10M'
-$repetition.Duration = 'PT5H20M'   # 09:30 -> 14:50 (3:50pm ET)
+$repetition.Duration = 'PT4H20M'   # 09:30 -> 13:50 (10:30am-2:50pm ET)
 $repetition.StopAtDurationEnd = $false
 $weekdayTrigger.Repetition = $repetition
 
-$trigger = @($openingTrigger, $weekdayTrigger)
+# Evening refresh: 14:50-15:50 ET = 13:50-14:50 Central, every 3 minutes.
+$closingTrigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday,Tuesday,Wednesday,Thursday,Friday -At 13:50
+$closingRepetition = New-CimInstance -CimClass $repetitionClass -ClientOnly
+$closingRepetition.Interval = 'PT3M'
+$closingRepetition.Duration = 'PT1H'
+$closingRepetition.StopAtDurationEnd = $false
+$closingTrigger.Repetition = $closingRepetition
+
+$trigger = @($openingTrigger, $weekdayTrigger, $closingTrigger)
 
 # 2026-08-13: RunLevel Highest (elevated) with no documented reason -- this
 # task only browses a public website and writes to files under the user's

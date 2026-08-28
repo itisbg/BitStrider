@@ -366,8 +366,9 @@ class MomentumStrategy:
             return Signal(symbol, "buy", price, confidence,
                           f"Strong momentum ({momentum:.1f}%) + volume x{vol_ratio:.1f} + above SMA20", "Momentum")
 
-        # Bear-market momentum reversal short signal
-        if market_regime == "bear" and not LONG_ONLY_MODE:
+        # Individual-stock momentum reversal short signal. Market regime does
+        # not decide direction; the stock's own momentum, volume, and SMA do.
+        if not LONG_ONLY_MODE:
             if (momentum <= -MOMENTUM["min_momentum"] * 0.8
                     and vol_ratio >= MOMENTUM["volume_surge"]
                     and price < sma20):
@@ -1090,7 +1091,7 @@ class BearBreakdownStrategy:
     """
 
     def scan(self, symbol: str) -> Optional[Signal]:
-        if LONG_ONLY_MODE or _is_bull_regime():
+        if LONG_ONLY_MODE:
             return None
         # Never short inverse ETFs — they're already bearish instruments
         if symbol in _INVERSE_ETFS:
@@ -1285,8 +1286,8 @@ def get_strategy_instances(bull_regime: bool = True):
     if LIQUIDITY_SWEEP_ENABLED:
         strategies.append(LiquiditySweepStrategy())
 
-    # Only add bear-regime strategies when we are actually in a bear regime
-    if not bull_regime:
-        strategies.append(BearBreakdownStrategy())
+    # Stock-level breakdown conditions decide whether this strategy emits a
+    # short; do not disable it just because the broad market is bullish.
+    strategies.append(BearBreakdownStrategy())
     return strategies
 

@@ -10,6 +10,7 @@ Optimized trade executor with consolidated logic:
 import logging
 import datetime
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import deque
@@ -173,10 +174,9 @@ def _check_ema_trend_alignment(signal: Signal, is_long: bool, force_fresh: bool 
     leading the slow one), the classic fast-over-slow crossover reading
     of "in an uptrend." Both conditions must hold together.
 
-    Fail-open on missing/insufficient bar data (fewer than
-    EMA_TREND_MIN_BARS of 1-min history) -- same philosophy as
-    _check_momentum_freshness: never block a trade on data the bot doesn't
-    have, only on data that actively contradicts it.
+    Missing/insufficient bar data (fewer than EMA_TREND_MIN_BARS of 1-min
+    history) blocks the entry. EMA alignment is a required entry condition,
+    so an unavailable reading must not be treated as approval.
 
     force_fresh=True bypasses get_bars()'s per-scan-cycle cache (see its
     2026-08-27 docstring update). Pass it from any per-minute recheck
@@ -192,11 +192,12 @@ def _check_ema_trend_alignment(signal: Signal, is_long: bool, force_fresh: bool 
     the scan cycle that just populated the cache, so it's already correct
     and re-fetching would just waste an API call.
     """
-    if not EMA_TREND_FILTER_ENABLED:
-        return True, None
     bars = get_bars(signal.symbol, period="1d", interval="1m", bypass_cache=force_fresh)
     if bars.empty or "close" not in bars.columns or len(bars) < EMA_TREND_MIN_BARS:
-        return True, None
+        return False, (
+            f"{signal.symbol}: EMA trend unavailable "
+            f"(need {EMA_TREND_MIN_BARS} 1-min bars)"
+        )
     closes     = bars["close"]
     ema7       = closes.ewm(span=7, adjust=False).mean()
     ema7_delta = float(ema7.diff().iloc[-1])
@@ -445,8 +446,9 @@ def _demo() -> None:
     print("_ema9_trail_exit_reason: all checks passed")
 
     # _check_ema_trend_alignment: EMA7 delta must confirm the trade
-    # direction AND EMA7 must sit on the right side of EMA15, fail-open on
-    # missing/insufficient data. 2026-08-22, user request; EMA9 -> EMA7
+    # direction AND EMA7 must sit on the right side of EMA15. Missing or
+    # insufficient data blocks the entry because EMA alignment is required.
+    # 2026-08-22, user request; EMA9 -> EMA7
     # 2026-08-24; EMA3 added alongside EMA7 2026-08-25, then removed
     # 2026-08-25 ("remove ema3 delta positive"); EMA7-vs-EMA15 crossover
     # added 2026-08-25 (see the function's own docstring).
@@ -477,7 +479,7 @@ def _demo() -> None:
     assert ok is False and reason is not None, "falling EMA7 delta but EMA7 still above EMA15 must reject a short"
     globals()["get_bars"] = lambda symbol, period, interval, bypass_cache=False: _pd.DataFrame()
     ok, reason = _check_ema_trend_alignment(_sig_stub, is_long=True)
-    assert ok is True and reason is None, "empty bars must fail open, never block"
+    assert ok is False and reason is not None, "empty bars must block because EMA alignment is required"
     globals()["get_bars"] = _orig_get_bars
     print("_check_ema_trend_alignment: all checks passed")
 
@@ -553,6 +555,14 @@ def _demo() -> None:
                 self._ratchet_done = set()
                 self._ema9_trail_peak = {}
                 self._last_known_positions = {}
+
+            def _get_account(self, force_refresh=False):
+                return SimpleNamespace(equity=10000.0, buying_power=10000.0)
+
+            def _execute_entry(self, signal, acct, order_type, bypass_pdt=False):
+                order = self.client.submit_order(SimpleNamespace(symbol=signal.symbol))
+                self.order_cache[signal.symbol] = order.id
+                return True
 
         ENTRY_WINDOW_END_ET = "23:59"  # never "past window" during this test run
         _get_scan_targets = lambda: ["FOO", "BAR"]  # FOO in top-30, BAZ is not
@@ -944,6 +954,7 @@ class EnhancedExecutor:
         self._cache_ttl:       float = 5.0
         self._account_cache:  Optional[AccountSnapshot] = None
         self._account_ttl:    float = 2.0   # tight TTL — buying power must be fresh between orders
+        self._entry_submission_lock = threading.RLock()
         self._htb_cache:      set   = set()   # hard-to-borrow symbols — skip shorts this session
         self._entry_log:   Dict[str, dict] = {}  # {symbol: {"strategy": str, "date": date}}
         self._swap_cycle_closed: set = set()     # positions already swapped this scan cycle
@@ -1022,6 +1033,36 @@ class EnhancedExecutor:
     def update_market_state(self, market_state: MarketState) -> None:
         """Store the active market snapshot for per-cycle execution decisions."""
         self.market_state = market_state
+
+    def _submit_entry_order(self, symbol: str, request) -> Optional[object]:
+        """Submit at most one active DAY trailing entry per symbol."""
+        lock = getattr(self, "_entry_submission_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._entry_submission_lock = lock
+        with lock:
+            try:
+                active_statuses = {"new", "partially_filled", "pending_new", "accepted", "held"}
+                get_orders = getattr(self.client, "get_orders", None)
+                if get_orders is None:
+                    return self.client.submit_order(request)
+                for order in get_orders() or []:
+                    raw_type = getattr(order, "order_type", "")
+                    order_type = str(getattr(raw_type, "value", raw_type)).lower()
+                    raw_status = getattr(order, "status", "")
+                    status = str(getattr(raw_status, "value", raw_status)).lower()
+                    if (
+                        getattr(order, "symbol", None) == symbol
+                        and "trailing_stop" in order_type
+                        and getattr(order, "time_in_force", None) == TimeInForce.DAY
+                        and status in active_statuses
+                    ):
+                        log.warning(f"Duplicate entry blocked {symbol}: active order {order.id}")
+                        return None
+            except Exception as e:
+                log.warning(f"Entry duplicate check failed for {symbol}: {e} — refusing submission")
+                return None
+            return self.client.submit_order(request)
 
     # -- Entry Log Rebuild (survive restarts) ----------------------------
     def _rebuild_entry_log_from_orders(self) -> None:
@@ -1646,7 +1687,7 @@ class EnhancedExecutor:
         cash available" -- `desired` rounds to the NEAREST share instead of
         always truncating down, so a 1.8-share target becomes 2 rather than
         1 (silently using only 56% of the intended allocation). The caps
-        below (max_bp, max_concentration, max_leverage) stay floored with
+        below (max_bp, max_concentration) stay floored with
         int() -- those are hard capacity ceilings, not targets, so "if
         there is cash available" is enforced by the min() below: rounding
         desired up only sticks when a cap doesn't clamp it back down."""
@@ -1658,29 +1699,23 @@ class EnhancedExecutor:
         account_snapshot = self._account_cache or self._get_account()  # use cached if available
         max_concentration = int(account_snapshot.equity * MAX_POSITION_CONCENTRATION_PCT / 100.0 / signal.price)
 
-        # 2026-08-17, user request: cap TOTAL exposure across every open
-        # position at MAX_PORTFOLIO_LEVERAGE x equity, independent of
-        # whatever margin the broker's own buying_power would otherwise
-        # allow (max_bp above already reflects margin -- this is a
-        # separate, usually-stricter ceiling on the whole book at once,
-        # not per-symbol). See enforce_portfolio_leverage() for the
-        # periodic backstop covering a position that drifts over the cap
-        # through price appreciation alone.
-        current_exposure   = self._get_positions().total_market_value()
-        leverage_cap_value = account_snapshot.equity * MAX_PORTFOLIO_LEVERAGE
-        leverage_headroom  = max(0.0, leverage_cap_value - current_exposure)
-        max_leverage        = int(leverage_headroom / (signal.price * margin))
-
-        shares  = min(desired, max_bp, max_concentration, max_leverage)
+        # 2026-08-17, user request: originally capped TOTAL exposure at order-
+        # placement time too (independent of whatever margin buying_power
+        # would allow). 2026-08-28, user request ("max leverage check only
+        # for the positions actually entered not for the new orders"):
+        # removed that preemptive throttle -- orders now size against the
+        # broker's own margin (max_bp/max_concentration only), same as
+        # Alpaca's up-to-4x order-placement limit. MAX_PORTFOLIO_LEVERAGE
+        # (1.5x) is enforced purely reactively now, on actual filled
+        # positions only, by enforce_portfolio_leverage() -- which trims the
+        # largest positions AND cancels outstanding entry orders the moment
+        # actual exposure crosses the cap, rather than throttling every
+        # order below it preemptively.
+        shares  = min(desired, max_bp, max_concentration)
 
         min_position = SMALL_ACCOUNT_MIN_POSITION_DOLLARS if account_snapshot.equity < SMALL_ACCOUNT_EQUITY_THRESHOLD else MIN_POSITION_DOLLARS
 
         if shares < 1:
-            if max_leverage < 1:
-                return 0, (
-                    f"Portfolio leverage cap: ${current_exposure:,.0f} exposure already at/above "
-                    f"{MAX_PORTFOLIO_LEVERAGE:.1f}x equity (${leverage_cap_value:,.0f} cap) for {signal.symbol}"
-                )
             return 0, (
                 f"Insufficient BP: ${buying_power:,.0f} usable ${usable:,.0f} "
                 f"for {signal.symbol} @ ${signal.price:.2f} (x{margin:.0f} margin)"
@@ -1831,7 +1866,9 @@ class EnhancedExecutor:
                 trail_percent   = REENTRY_TRAIL_PCT,
                 client_order_id = f"apex-entry-{signal.strategy}-{signal.symbol}-{int(time.time())}",
             )
-            order = self.client.submit_order(entry_req)
+            order = self._submit_entry_order(signal.symbol, entry_req)
+            if order is None:
+                return False
             self.order_cache[signal.symbol] = order.id
             self._pending_entry_signals[signal.symbol] = {"signal": signal, "order_type": order_type}
             log.info(
@@ -1859,33 +1896,35 @@ class EnhancedExecutor:
                 log.error(f"Bracket order failed {signal.symbol}: {e}")
             return False
 
-        # ── Step 2: Trailing stop — best-effort; entry already filled ────────
-        # On live accounts, skip the same-day trailing stop — PDT rules block GTC
-        # SELL legs on shares entered today.  protect_positions() re-places it next
-        # session when the position is no longer same-day restricted.
-        # Inverse ETFs (SOXS, DUST, UVXY …) may also reject a GTC trailing stop
-        # with 40310000.  This must NOT cancel the entry or disable shorting.
-        if LIVE:
-            log.info(
-                f"Trailing stop deferred {signal.symbol} (live same-day entry) — "
-                "protect_positions() will place it next session"
-            )
-        else:
-            try:
-                ts_req = TrailingStopOrderRequest(
-                    symbol        = signal.symbol,
-                    qty           = shares,
-                    side          = stop_side,
-                    type          = AlpacaOrderType.TRAILING_STOP,
-                    time_in_force = TimeInForce.GTC,
-                    trail_percent = trail_pct,
-                )
-                self.client.submit_order(ts_req)
-            except Exception as e:
-                log.warning(
-                    f"Trailing stop skipped {signal.symbol} (entry filled): {e} — "
-                    "protect_positions() will re-place next cycle"
-                )
+        # ── Step 2: Trailing stop ─────────────────────────────────────────
+        # 2026-08-28, user: no SEC/FINRA PDT rule blocks a GTC SELL stop on
+        # shares bought same-day (PDT restricts day-trade *count*, not order
+        # placement) -- the old "if LIVE: skip" here was an untested guess.
+        # BUT the entry order placed in Step 1 is itself a resting
+        # TRAILING-STOP BUY (0.5% pullback trigger, not a market fill) -- so
+        # attempting the protective SELL stop synchronously right here, before
+        # the entry has actually filled, is structurally guaranteed to fail
+        # every time ("cannot open a short sell while a long buy order is
+        # open", confirmed live 2026-08-28: AGQ/UMC/PALL/BEKE/SBSW all hit
+        # this on every entry). No point paying for a doomed API call.
+        # _cover_naked_positions (the 5s fast-thread, enhanced.py) is the
+        # correct place for this: it checks get_all_positions() /
+        # get_orders() and only attempts the real broker stop once the
+        # position genuinely exists and the entry order has cleared.
+        #
+        # 2026-08-28, user request ("fix the trail stop exit order immediately
+        # after the order is placed, check it with the 5sec check rule"): run
+        # that same check right here too, not just on the standing 5s timer --
+        # covers the (rare but real) case where the trailing-buy entry fills
+        # near-instantly, so the stop attaches this tick instead of waiting up
+        # to 5s for the background thread's next pass. Best-effort/swallowed:
+        # the recurring 5s thread is still the real safety net if this
+        # immediate call errors or the entry hasn't filled yet (normal case --
+        # it'll just see the order still open and skip, same as always).
+        try:
+            self._cover_naked_positions()
+        except Exception as e:
+            log.debug(f"{signal.symbol}: immediate post-entry protection check failed (5s thread will retry): {e}")
 
         self._log_bracket(signal, shares, risk_info, trail_pct, None, order_type)
         return True
@@ -1944,7 +1983,9 @@ class EnhancedExecutor:
                 trail_percent   = REENTRY_TRAIL_PCT,
                 client_order_id = coid,
             )
-            order = self.client.submit_order(req)
+            order = self._submit_entry_order(signal.symbol, req)
+            if order is None:
+                return False
             self.order_cache[signal.symbol] = order.id
             self._pending_entry_signals[signal.symbol] = {"signal": signal, "order_type": order_type}
             log.info(
@@ -2438,20 +2479,22 @@ class EnhancedExecutor:
     def _cover_naked_positions(self) -> None:
         """Fast-thread companion to protect_positions(): the moment a
         position exists with no resting order and no software-stop coverage
-        yet, register a software stop off the REAL pos.avg_entry_price --
-        pure bookkeeping (a dict write), never a broker order attempt. The
-        actual broker-side GTC attempt frequency is untouched, still only on
-        protect_positions()'s normal (slower) cadence -- this can't turn
-        into a submit_order retry storm for a genuinely PDT-blocked symbol.
+        yet, attempt the REAL broker-side GTC trailing stop right here on
+        the 5s cycle instead of waiting for protect_positions()'s slower
+        adaptive-scan cadence. Falls back to software-stop bookkeeping only
+        if the broker actually rejects the order (e.g. real 40310100).
 
-        2026-08-17, CDTG: the bracket-order trailing stop is deliberately
-        deferred for every live same-day entry (PDT), and protect_positions()
-        only runs on the adaptive scan cadence -- CDTG sat with literally
-        zero stop coverage for 3+ minutes while it fell from $2.97 to $2.73,
-        and by the time a stop was finally armed it anchored to the already-
-        fallen price instead of the entry. Called from the same 10s thread
-        as check_software_stops(), which is what actually watches and closes
-        whatever this registers -- see that method for the poll side."""
+        2026-08-17, CDTG: the bracket-order trailing stop used to be
+        deliberately deferred for every live same-day entry on an assumed
+        PDT block that was never real (removed 2026-08-28 — see enhanced.py
+        entry-order step 2), and protect_positions() only ran on the
+        adaptive scan cadence -- CDTG sat with literally zero stop coverage
+        for 3+ minutes while it fell from $2.97 to $2.73, and by the time a
+        stop was finally armed it anchored to the already-fallen price
+        instead of the entry. Now that the broker attempt itself happens
+        here every 5s, that gap closes to one tick instead of one scan
+        cycle. Called from the same thread as check_software_stops(), which
+        watches/closes positions that land in the fallback path below."""
         try:
             positions   = self.client.get_all_positions()
             open_orders = self.client.get_orders()
@@ -2469,10 +2512,25 @@ class EnhancedExecutor:
                 qty = int(float(pos.qty))
                 if qty == 0:
                     continue
-                entry_price = float(pos.avg_entry_price or pos.current_price)
+                is_long_pos = qty > 0
                 stop_pct    = _trail_pct_for(sym, float(pos.current_price), self._entry_log)[0]
+                try:
+                    self.client.submit_order(TrailingStopOrderRequest(
+                        symbol        = sym,
+                        qty           = abs(qty),
+                        side          = OrderSide.SELL if is_long_pos else OrderSide.BUY,
+                        type          = AlpacaOrderType.TRAILING_STOP,
+                        time_in_force = TimeInForce.GTC,
+                        trail_percent = stop_pct,
+                    ))
+                    log.info(f"PROTECT {sym} [fast-thread]: trailing stop {stop_pct:.1f}% GTC")
+                    continue
+                except Exception as broker_e:
+                    log.warning(f"_cover_naked_positions {sym}: broker stop rejected ({broker_e}) — falling back to software SL")
+
+                entry_price = float(pos.avg_entry_price or pos.current_price)
                 stop_price  = round(
-                    entry_price * (1 - stop_pct / 100) if qty > 0
+                    entry_price * (1 - stop_pct / 100) if is_long_pos
                     else entry_price * (1 + stop_pct / 100),
                     2,
                 )
@@ -2482,7 +2540,7 @@ class EnhancedExecutor:
                     f"software SL set at ${stop_price:.2f} ({stop_pct:.1f}% from ${entry_price:.2f})"
                 )
             except Exception:
-                continue  # best-effort — next 10s tick tries again
+                continue  # best-effort — next 5s tick tries again
 
     def check_software_stops(self) -> None:
         """Close any position whose broker-rejected PDT stop has been breached.
@@ -2960,6 +3018,38 @@ class EnhancedExecutor:
                 excess -= trim_qty * current
             except Exception as e:
                 log.error(f"enforce_portfolio_leverage {sym}: trim failed: {e}")
+
+        # 2026-08-28, user request ("everytime the actual positions reach the
+        # 1.5X margin then exit the outstanding entry orders to minimize the
+        # actual margin utilization"): trimming filled positions above only
+        # addresses exposure that already landed -- any still-resting NEW-
+        # entry order (tracked in _pending_entry_signals) would add MORE
+        # exposure the instant it fills, undoing the trim just made. Cancel
+        # those too, every time this breach fires. Only touches symbols with
+        # NO existing position -- a symbol already held has its resting
+        # order checked against held_symbols and skipped, since that's a
+        # protective stop (see protect_positions/_cover_naked_positions),
+        # not an entry; cancelling that here would strip protection exactly
+        # when leverage is tightest.
+        held_symbols = {p.symbol for p in equity_positions}
+        for sym in list(self._pending_entry_signals.keys()):
+            if sym in held_symbols:
+                continue
+            try:
+                sym_orders = [o for o in (self.client.get_orders() or []) if o.symbol == sym]
+                for _o in sym_orders:
+                    try:
+                        self.client.cancel_order_by_id(str(_o.id))
+                    except Exception:
+                        pass
+                if sym_orders:
+                    log.warning(
+                        f"PORTFOLIO LEVERAGE: cancelled outstanding entry order(s) for {sym} — "
+                        f"book over {MAX_PORTFOLIO_LEVERAGE:.1f}x cap, not adding more exposure"
+                    )
+                self._pending_entry_signals.pop(sym, None)
+            except Exception as e:
+                log.warning(f"enforce_portfolio_leverage: cancel pending entry {sym} failed: {e}")
 
     # ── EOD Close ─────────────────────────────────────────────────────────────
     @staticmethod
@@ -4192,21 +4282,28 @@ class EnhancedExecutor:
                             "queued_at": datetime.datetime.now(datetime.timezone.utc),
                         }
                 return
-            reentry_side = OrderSide.BUY if is_long else OrderSide.SELL
-            reentry_order = self.client.submit_order(TrailingStopOrderRequest(
-                symbol          = sym,
-                qty             = qty,
-                side            = reentry_side,
-                type            = AlpacaOrderType.TRAILING_STOP,
-                time_in_force   = TimeInForce.DAY,
-                trail_percent   = REENTRY_TRAIL_PCT,
-                client_order_id = f"apex-reentry-{sym}-{int(time.time())}",
-            ))
-            self.order_cache[sym] = reentry_order.id
-            log.info(
-                f"{tag} {sym}: entry conditions still met — armed a "
-                f"{REENTRY_TRAIL_PCT:.1f}% trailing {'BUY' if is_long else 'SELL'} to re-enter"
+            _bars = get_bars(sym, period="1d", interval="1m")
+            _px = float(_bars["close"].iloc[-1]) if not _bars.empty else 0.0
+            if _px <= 0:
+                log.info(f"{tag} {sym}: no current price data — not re-arming")
+                return
+            _strategy = self._entry_log.get(sym, {}).get("strategy", "reentry")
+            _reentry_signal = Signal(
+                symbol=sym,
+                action="buy" if is_long else "short",
+                price=_px,
+                confidence=0.70,
+                reason=f"re-entry after {tag}",
+                strategy=_strategy,
             )
+            _acct = self._get_account(force_refresh=True)
+            if self._execute_entry(
+                _reentry_signal,
+                _acct,
+                OrderType.LONG if is_long else OrderType.SHORT,
+                bypass_pdt=True,
+            ):
+                log.info(f"{tag} {sym}: entry conditions still met — re-entry passed all hard checks")
         except Exception as e:
             log.warning(f"{tag} {sym}: re-entry watch order failed (exit itself still succeeded): {e}")
 

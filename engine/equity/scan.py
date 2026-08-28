@@ -12,13 +12,6 @@ def get_adaptive_equity_allocation(market_state: MarketState, avg_signal_conf: f
     base = POSITION_SIZE_PCT
     equity_pct, _ = get_allocation_split(market_state)
     base *= equity_pct
-    # Example logic: scale up in bull, down in bear
-    if hasattr(market_state, 'resolve_regime'):
-        bull = market_state.resolve_regime()
-        if bull:
-            base *= 1.2  # 20% more aggressive in bull
-        else:
-            base *= 0.8  # 20% more conservative in bear
     # If average signal confidence is provided, scale further
     if avg_signal_conf is not None:
         if avg_signal_conf > 0.85:
@@ -36,8 +29,11 @@ Contains reusable scanning functions for main loop and run_top3 tools.
 """
 
 import datetime
+import json
 import logging
+import threading
 import time
+from pathlib import Path
 import pytz
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Tuple, Set, Optional
@@ -72,6 +68,126 @@ from .discovery import get_alpaca_movers_queue as _get_alpaca_movers_queue
 
 _ET  = pytz.timezone("America/New_York")
 _log = logging.getLogger("ApexTrader")
+_ACTIVE_SCAN_FILE = Path(__file__).resolve().parents[2] / "data" / "ti_primary_active.json"
+_ACTIVE_LONGS_FILE = Path(__file__).resolve().parents[2] / "data" / "ti_primary_active_longs.json"
+_ACTIVE_SHORTS_FILE = Path(__file__).resolve().parents[2] / "data" / "ti_primary_active_shorts.json"
+_active_scan_write_lock = threading.Lock()
+_last_active_scan_write = 0.0
+_last_directional_write = 0.0
+
+
+def _write_active_scan_list(tickers: List[str]) -> bool:
+    """Persist the guardrail-approved top scan list at the configured cadence."""
+    global _last_active_scan_write
+    now = time.monotonic()
+    with _active_scan_write_lock:
+        if now - _last_active_scan_write < _cfg.ACTIVE_SCAN_SNAPSHOT_INTERVAL_MIN * 60:
+            return False
+        _last_active_scan_write = now
+    try:
+        _ACTIVE_SCAN_FILE.write_text(
+            json.dumps({
+                "updated": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "count": len(tickers),
+                "tickers": tickers,
+                "longs": [],
+                "shorts": [],
+            }, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        _write_active_directional_lists(tickers)
+        _log.info(f"[UNIVERSE] active top-{len(tickers)} list snapshot updated: {_ACTIVE_SCAN_FILE.name}")
+        return True
+    except Exception as e:
+        _log.warning(f"[UNIVERSE] could not write active scan list: {e}")
+        return False
+
+
+def _write_active_directional_lists(tickers: List[str]) -> None:
+    """Write the active Yahoo gainers/losers split for selected tickers."""
+    try:
+        from engine.ti.yahoo_universe import fetch_long_short_candidates
+        gainers, losers = fetch_long_short_candidates()
+        long_symbols = {symbol for symbol, _ in gainers}
+        short_symbols = {symbol for symbol, _ in losers}
+        if not long_symbols and not short_symbols:
+            raise RuntimeError("Yahoo returned no directional candidates")
+    except Exception as e:
+        _log.warning(f"[SIGNALS] live Yahoo direction fetch failed, using universe tiers: {e}")
+        long_symbols = set(_get_tier_live(1))
+        short_symbols = set(_get_tier_live(2))
+    mover_symbols = set(_get_alpaca_movers_queue())
+    longs = [s for s in tickers if s in long_symbols]
+    longs.extend(s for s in tickers if s in mover_symbols and s not in short_symbols and s not in longs)
+    shorts = [s for s in tickers if s in short_symbols and s not in long_symbols]
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    try:
+        directional = {
+            "longs": [{"symbol": symbol, "action": "buy"} for symbol in longs],
+            "shorts": [{"symbol": symbol, "action": "short"} for symbol in shorts],
+        }
+        for path, selected, action in (
+            (_ACTIVE_LONGS_FILE, longs, "buy"),
+            (_ACTIVE_SHORTS_FILE, shorts, "short"),
+        ):
+            path.write_text(json.dumps({
+                "updated": now,
+                "count": len(selected),
+                "signals": [{"symbol": symbol, "action": action} for symbol in selected],
+            }, indent=2) + "\n", encoding="utf-8")
+        active = json.loads(_ACTIVE_SCAN_FILE.read_text(encoding="utf-8"))
+        active.update(directional)
+        active["updated"] = now
+        _ACTIVE_SCAN_FILE.write_text(json.dumps(active, indent=2) + "\n", encoding="utf-8")
+    except Exception as e:
+        _log.warning(f"[SIGNALS] could not write active Yahoo directional lists: {e}")
+
+
+def _write_directional_signal_lists(signals: list) -> None:
+    """Persist the latest scanned long and short candidates at the same cadence."""
+    global _last_directional_write
+    now_mono = time.monotonic()
+    with _active_scan_write_lock:
+        if now_mono - _last_directional_write < _cfg.ACTIVE_SCAN_SNAPSHOT_INTERVAL_MIN * 60:
+            return
+        _last_directional_write = now_mono
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    payloads = (
+        (_ACTIVE_LONGS_FILE, [s for s in signals if s.action == "buy"], "longs"),
+        (_ACTIVE_SHORTS_FILE, [s for s in signals if s.action in ("sell", "short")], "shorts"),
+    )
+    try:
+        def _record(signal):
+            return {
+                "symbol": signal.symbol,
+                "action": signal.action,
+                "price": signal.price,
+                "confidence": signal.confidence,
+                "strategy": signal.strategy,
+                "reason": signal.reason,
+            }
+
+        for path, selected, direction in payloads:
+            path.write_text(
+                json.dumps({
+                    "updated": now,
+                    "count": len(selected),
+                    "signals": [_record(signal) for signal in selected],
+                }, indent=2) + "\n",
+                encoding="utf-8",
+            )
+        if _ACTIVE_SCAN_FILE.exists():
+            active = json.loads(_ACTIVE_SCAN_FILE.read_text(encoding="utf-8"))
+            active["updated"] = now
+            active["longs"] = [_record(signal) for signal in payloads[0][1]]
+            active["shorts"] = [_record(signal) for signal in payloads[1][1]]
+            _ACTIVE_SCAN_FILE.write_text(json.dumps(active, indent=2) + "\n", encoding="utf-8")
+        _log.info(
+            f"[SIGNALS] active directional lists updated: "
+            f"longs={len(payloads[0][1])}, shorts={len(payloads[1][1])}"
+        )
+    except Exception as e:
+        _log.warning(f"[SIGNALS] could not write directional signal lists: {e}")
 
 # ── Adaptive Filter State ──
 _adaptive_state = {
@@ -268,12 +384,11 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
                 true_day_vol = float(_vol_daily["volume"].iloc[-1])
 
         # Resolve regime and VIX before adaptive gates
+        # Stock entries are regime-neutral. Use the stock's own data and the
+        # fixed guardrail thresholds; SPY/VIX must not decide direction or
+        # whether an individual stock is eligible.
         vix = None
-        if hasattr(market_state, 'vix') and market_state.vix is not None:
-            vix = market_state.vix
-        elif hasattr(market_state, 'resolve_vix'):
-            vix, _, _ = market_state.resolve_vix()
-        bull = bull_regime if bull_regime is not None else market_state.resolve_regime()
+        bull = True
 
         # Adaptive MIN_STOCK_PRICE: more flexible for current market
         base_min_price = MIN_STOCK_PRICE
@@ -388,24 +503,9 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
                             return False, 'rvol'
                         return False
 
-        # Adaptive MAX_GAP_CHASE_PCT using market regime and VIX
-        vix = None
-        if hasattr(market_state, 'vix') and market_state.vix is not None:
-            vix = market_state.vix
-        elif hasattr(market_state, 'resolve_vix'):
-            vix, _, _ = market_state.resolve_vix()
-        bull = bull_regime if bull_regime is not None else market_state.resolve_regime()
-        base_gap = MAX_GAP_CHASE_PCT
-        if bull:
-            if vix and vix > 25:
-                adaptive_gap = min(20.0, base_gap + 5.0)
-            else:
-                adaptive_gap = base_gap
-        else:
-            if vix and vix < 18:
-                adaptive_gap = max(10.0, base_gap - 5.0)
-            else:
-                adaptive_gap = max(12.0, base_gap - 3.0)
+        # Stock-level fixed gap-chase threshold; broad-market regime and VIX
+        # do not decide individual stock eligibility.
+        adaptive_gap = MAX_GAP_CHASE_PCT
 
         # Gap-chase guard: skip if up >adaptive_gap% without a tight consolidation base.
         # Checked against BOTH today's tracked open (intraday chase) and the prior
@@ -573,17 +673,20 @@ def get_scan_targets(excluded: Set[str] = None, market_state: Optional[MarketSta
             _prefetch_snapshots(pool)
         except Exception as e:
             _log.debug(f"[GUARDRAIL] pre-filter snapshot prefetch failed, guardrail checks fail open: {e}")
-        bull = market_state.resolve_regime()
-
         def _quality_ok(s: str) -> bool:
             try:
-                return _passes_guardrails(s, bull_regime=bull, market_state=market_state)
+                return _passes_guardrails(s, market_state=market_state)
             except Exception as e:
-                _log.debug(f"{s}: guardrail pre-filter errored, failing open: {e}")
-                return True
+                _log.warning(f"{s}: guardrail pre-filter failed, excluding from top-{_cfg.TI_PRIMARY_SCAN_BATCH_LIMIT}: {e}")
+                return False
 
-        movers = [s for s in movers if _quality_ok(s)]
-        ti_pool = [s for s in ti_pool if _quality_ok(s)]
+        # Guardrail reads are independent network/data lookups. Run them in
+        # parallel so a long raw TI list cannot delay the active snapshot
+        # write past the scan timeout; map() preserves source ranking order.
+        with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as pool:
+            movers = [s for s, ok in zip(movers, pool.map(_quality_ok, movers)) if ok]
+        with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as pool:
+            ti_pool = [s for s, ok in zip(ti_pool, pool.map(_quality_ok, ti_pool)) if ok]
 
     ti_slice = ti_pool[:_cfg.TI_PRIMARY_SCAN_BATCH_LIMIT]
 
@@ -592,6 +695,8 @@ def get_scan_targets(excluded: Set[str] = None, market_state: Optional[MarketSta
     # source separately -- movers get priority (fresher/news-driven) and TI
     # fills whatever's left, up to the shared cap.
     targets = list(dict.fromkeys(movers + ti_slice))[:_cfg.TI_PRIMARY_SCAN_BATCH_LIMIT]
+    if market_state is not None:
+        _write_active_scan_list(targets)
     return targets
 
 
@@ -603,12 +708,9 @@ def scan_universe(scan_targets: List[str], sentiment: str, market_state: MarketS
     # get_bars("1d","1m") requests — the dominant I/O cost of each scan cycle.
     _prefetch_snapshots(scan_targets)
 
-    # Compute regime ONCE here before spawning workers — avoids a thread race where
-    # multiple workers concurrently hit the 15-min TTL expiry and each make a
-    # separate get_bars("SPY") call to refresh the shared _regime_cache dict.
-    bull_regime = market_state.resolve_regime()
-    regime_str  = "bull" if bull_regime else "bear"
-    strats = get_strategy_instances(bull_regime)
+    # Direction is determined by each stock's own strategy conditions.
+    regime_str = "stock"
+    strats = get_strategy_instances()
 
 
     signals = []
@@ -630,7 +732,7 @@ def scan_universe(scan_targets: List[str], sentiment: str, market_state: MarketS
         # Dead-ticker check already done in get_scan_targets() — skip here.
         # Pass pre-computed regime into guardrails to avoid re-calling _is_bull_regime()
         # Custom: get rejection reason from _passes_guardrails
-        passed, reason = _passes_guardrails(symbol, bull_regime=bull_regime, market_state=market_state, return_reason=True)
+        passed, reason = _passes_guardrails(symbol, market_state=market_state, return_reason=True)
         thin_liquidity = False
         if not passed:
             if reason in guardrail_rejections:
@@ -720,23 +822,8 @@ def scan_universe(scan_targets: List[str], sentiment: str, market_state: MarketS
 
     signals.sort(key=lambda x: x.confidence, reverse=True)
     # Adaptive confidence filter using pre-intelligence (market regime, VIX)
-    vix = None
-    if hasattr(market_state, 'vix') and market_state.vix is not None:
-        vix = market_state.vix
-    elif hasattr(market_state, 'resolve_vix'):
-        vix, _, _ = market_state.resolve_vix()
-    bull = market_state.resolve_regime()
     base_conf = MIN_SIGNAL_CONFIDENCE
-    if bull:
-        if vix and vix > 25:
-            adaptive_conf = min(0.80, base_conf + 0.05)  # stricter in high-vol bull
-        else:
-            adaptive_conf = base_conf
-    else:
-        if vix and vix < 18:
-            adaptive_conf = max(0.65, base_conf - 0.05)  # looser in calm bear
-        else:
-            adaptive_conf = max(0.68, base_conf - 0.02)
+    adaptive_conf = base_conf
     signals = [s for s in signals if s.confidence >= adaptive_conf]
 
     # Dynamic sector/industry weighting cap

@@ -22,7 +22,6 @@ from __future__ import annotations
 import concurrent.futures
 import datetime
 import logging
-import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -91,8 +90,10 @@ _logging.getLogger("webdriver_manager").setLevel(_logging.ERROR)
 #
 # Same date, separate issue ("why the 3mins web scrapping is not
 # happening"): TI capture liveness/trigger state -- see _ti_capture_job.
+# 2026-08-28: source switched from TI's Selenium/Edge scrape to Yahoo
+# Finance (plain HTTP, engine/ti/yahoo_universe.py) -- no more subprocess/
+# wedge tracking needed, just the interval gate.
 _last_ti_capture_ts: float = 0.0
-_ti_capture_proc: Optional[subprocess.Popen] = None
 _last_poller_tick: float = 0.0
 _poller_stale_alerted: bool = False
 
@@ -109,6 +110,8 @@ class AppContext:
     # Per-session state
     last_market_regime:   str  = "bull"
     market_state:         Optional[MarketState] = None
+    # Latest ranked signals eligible for five-second capital-utilization retries.
+    top_entry_signals:    List[Signal] = field(default_factory=list)
     # Short-fail cooldown: {symbol: monotonic_ts_until_retry}
     # Merged here from the old module-level global so it survives restarts
     # via executor._htb_cache and is accessible to the bear plan.
@@ -267,23 +270,8 @@ def _run_options_cycle(ctx: AppContext, market_state: MarketState) -> None:
 # ── Market regime ─────────────────────────────────────────────────────────────
 
 def _resolve_market_regime(ctx: AppContext, market_state: MarketState) -> Tuple[str, int]:
-    """Return (regime, signals_cap). Falls back to last known regime on failure."""
-    if not cfg.USE_MARKET_REGIME_FILTER:
-        return ctx.last_market_regime, cfg.MAX_SIGNALS_PER_CYCLE
-    try:
-        is_bull        = market_state.resolve_regime()
-        regime         = "bull" if is_bull else "bear"
-        ctx.last_market_regime = regime
-        signals_cap    = cfg.MAX_SIGNALS_PER_CYCLE if is_bull else cfg.MARKET_REGIME_SIGNALS_CAP
-        if is_bull:
-            log.info(f"[SCAN] BULL REGIME — cap {signals_cap}/cycle")
-        else:
-            short_cap = 0 if (cfg.LONG_ONLY_MODE or ctx.executor.shorting_blocked) else cfg.BEAR_SHORT_SIGNALS_CAP
-            log.info(f"[SCAN] BEAR REGIME — long cap {cfg.MARKET_REGIME_SIGNALS_CAP}, short cap {short_cap}/cycle")
-        return regime, signals_cap
-    except Exception as e:
-        log.error(f"[SYSTEM] Regime check failed — retaining '{ctx.last_market_regime}': {e}", exc_info=True)
-        return ctx.last_market_regime, cfg.MAX_SIGNALS_PER_CYCLE
+    """Return the stock-only execution capacity; broad-market regime is ignored."""
+    return "stock", cfg.MAX_LONG_ENTRIES_PER_CYCLE + cfg.MAX_SHORT_ENTRIES_PER_CYCLE
 
 
 # ── Universe assembly ─────────────────────────────────────────────────────────
@@ -317,7 +305,7 @@ def _filter_eligible(
 
     Returns the eligible signal list ready for execution.
     """
-    short_min_conf = cfg.MIN_SHORT_CONFIDENCE_BEAR if regime == "bear" else cfg.MIN_SIGNAL_CONFIDENCE
+    short_min_conf = cfg.MIN_SIGNAL_CONFIDENCE
     long_only      = cfg.LONG_ONLY_MODE or ctx.executor.shorting_blocked
 
     if ctx.executor.shorting_blocked and not cfg.LONG_ONLY_MODE:
@@ -377,7 +365,7 @@ def _filter_eligible(
 
 def _log_skipped(signals: list, eligible: list, fresh_held: set, regime: str, executor: EnhancedExecutor) -> None:
     """Log skip reason for each top-10 raw signal that did not make it to eligible."""
-    short_min_conf = cfg.MIN_SHORT_CONFIDENCE_BEAR if regime == "bear" else cfg.MIN_SIGNAL_CONFIDENCE
+    short_min_conf = cfg.MIN_SIGNAL_CONFIDENCE
     eligible_syms  = {s.symbol for s in eligible}
     eligible_underlyings = {cfg.leveraged_underlying(sym) for sym in fresh_held} | \
                             {cfg.leveraged_underlying(s.symbol) for s in eligible}
@@ -446,7 +434,7 @@ def _execute_bear_plan(
     loss_pct: float,
 ) -> None:
     """Bear regime: attempt 1 swap-long then up to BEAR_SHORT_SIGNALS_CAP shorts."""
-    long_sigs         = [s for s in eligible if s.action == "buy"][:cfg.MARKET_REGIME_SIGNALS_CAP]
+    long_sigs         = [s for s in eligible if s.action == "buy"][:cfg.MAX_LONG_ENTRIES_PER_CYCLE]
     short_candidates  = [] if (cfg.LONG_ONLY_MODE or ctx.executor.shorting_blocked) else \
                         [s for s in eligible if s.action in ("sell", "short")]
     if cfg.LONG_ONLY_MODE and any(s.action in ("sell", "short") for s in eligible):
@@ -455,7 +443,7 @@ def _execute_bear_plan(
         log.warning(f"Shorting blocked — dropping {len(short_candidates)} short(s)")
 
     short_queue  = _build_short_queue(ctx, short_candidates)
-    short_target = 0 if (cfg.LONG_ONLY_MODE or ctx.executor.shorting_blocked) else cfg.BEAR_SHORT_SIGNALS_CAP
+    short_target = 0 if (cfg.LONG_ONLY_MODE or ctx.executor.shorting_blocked) else cfg.MAX_SHORT_ENTRIES_PER_CYCLE
     log.info(f"[TRADE] BEAR plan: {len(long_sigs)} long(s) swap-only, target {short_target} short(s) from {len(short_queue)} queued")
 
     # One swap-long per bear cycle
@@ -517,9 +505,15 @@ def _execute_bull_plan(
     ranked = sorted(eligible, key=lambda s: s.confidence, reverse=True)
     log.info(f"Executing up to {signals_cap} signal(s) from {len(ranked)} eligible (cap={signals_cap})")
     executed = 0
+    long_executed = 0
+    short_executed = 0
     for sig in ranked:
-        if executed >= signals_cap:
+        if executed >= min(signals_cap, cfg.MAX_LONG_ENTRIES_PER_CYCLE + cfg.MAX_SHORT_ENTRIES_PER_CYCLE):
             break
+        if sig.action == "buy" and long_executed >= cfg.MAX_LONG_ENTRIES_PER_CYCLE:
+            continue
+        if sig.action in ("sell", "short") and short_executed >= cfg.MAX_SHORT_ENTRIES_PER_CYCLE:
+            continue
         swap_only = (regime == "bear") and sig.action not in ("sell", "short")
         _session.refresh_daily_pnl(ctx.client)
         if _session.daily_pnl <= daily_loss_limit:
@@ -529,7 +523,43 @@ def _execute_bull_plan(
         if ctx.executor.execute(sig, swap_only=swap_only):
             _session.trades += 1
             executed += 1
+            if sig.action == "buy":
+                long_executed += 1
+            elif sig.action in ("sell", "short"):
+                short_executed += 1
         time.sleep(1)
+
+
+def _retry_top_entries(ctx: AppContext) -> None:
+    """Retry the latest top eligible signals on the five-second poller.
+
+    Every attempt goes through EnhancedExecutor.execute(), so the normal hard
+    entry validation, including fresh EMA alignment and duplicate-order guard,
+    remains authoritative. This only retries candidates that failed or were
+    temporarily unaffordable during the last scan; it does not rescan prices.
+    """
+    top_entry_signals = getattr(ctx, "top_entry_signals", [])
+    if not top_entry_signals:
+        return
+
+    now_et = datetime.datetime.now(pytz.timezone("America/New_York"))
+    if not _within_entry_window(now_et):
+        return
+
+    _session.refresh_daily_pnl(ctx.client)
+    last_market_regime = getattr(ctx, "last_market_regime", "bull")
+    loss_pct = cfg.DAILY_LOSS_LIMIT_BEAR_PCT if last_market_regime == "bear" else cfg.DAILY_LOSS_LIMIT_BULL_PCT
+    daily_loss_limit = -(_session.daily_start_equity * loss_pct / 100) if _session.daily_start_equity > 0 else -999_999
+    if _session.daily_pnl <= daily_loss_limit or _session.daily_pnl >= cfg.DAILY_PROFIT_TARGET:
+        return
+
+    for signal in list(top_entry_signals):
+        try:
+            if ctx.executor.execute(signal):
+                _session.trades += 1
+                log.info(f"[5S RETRY] EXECUTED {signal.action.upper()} {signal.symbol} after hard checks")
+        except Exception as e:
+            log.warning(f"[5S RETRY] {signal.symbol} failed: {e}")
 
 
 # ── Core scan cycle ───────────────────────────────────────────────────────────
@@ -588,6 +618,7 @@ def scan_and_trade(ctx: AppContext) -> None:
       8. Execution (bear or bull plan)
     """
     _cycle_start = time.monotonic()
+    ctx.top_entry_signals = []
     _session.reset_daily(ctx.client)
 
     ctx.market_state = MarketState.from_now()
@@ -726,11 +757,10 @@ def scan_and_trade(ctx: AppContext) -> None:
         log.info("[SCAN] No eligible signals after filtering")
         return
 
+    ctx.top_entry_signals = list(eligible[:cfg.TOP_N_SIGNALS])
+
     _t_exec = time.monotonic()
-    if regime == "bear":
-        _execute_bear_plan(ctx, eligible, daily_loss_limit, loss_pct)
-    else:
-        _execute_bull_plan(ctx, eligible, signals_cap, regime, daily_loss_limit, loss_pct)
+    _execute_bull_plan(ctx, eligible, signals_cap, regime, daily_loss_limit, loss_pct)
     log.info(
         f"[TIMING] signal→order: {time.monotonic() - _t_exec:.1f}s | "
         f"total cycle: {time.monotonic() - _cycle_start:.1f}s"
@@ -992,6 +1022,18 @@ def _tick(ctx: AppContext, last_ema15: float, last_pending: float) -> Tuple[floa
     dicts check_ema9_exit and check_blocked_entries_ema touch; keeping
     all of it single-threaded avoids introducing a new cross-thread race
     on that shared state for the sake of speed."""
+    if time.time() - last_pending >= cfg.PENDING_ENTRY_RECHECK_SEC:
+        try:
+            ctx.executor.check_pending_entries_ema()
+        except Exception as e:
+            log.error(f"[STOP-THREAD] check_pending_entries_ema error: {e}", exc_info=True)
+        last_pending = time.time()
+
+    try:
+        _retry_top_entries(ctx)
+    except Exception as e:
+        log.error(f"[STOP-THREAD] top-entry retry error: {e}", exc_info=True)
+
     try:
         ctx.executor._cover_naked_positions()
     except Exception as e:
@@ -1017,12 +1059,6 @@ def _tick(ctx: AppContext, last_ema15: float, last_pending: float) -> Tuple[floa
         ctx.executor.detect_stopped_out_positions()
     except Exception as e:
         log.error(f"[STOP-THREAD] detect_stopped_out_positions error: {e}", exc_info=True)
-    if time.time() - last_pending >= cfg.PENDING_ENTRY_RECHECK_SEC:
-        try:
-            ctx.executor.check_pending_entries_ema()
-        except Exception as e:
-            log.error(f"[STOP-THREAD] check_pending_entries_ema error: {e}", exc_info=True)
-        last_pending = time.time()
     if time.time() - last_ema15 >= cfg.STAGNANT_STOP_CHECK_INTERVAL_MIN * 60:
         try:
             # 2026-08-25, user request: "remove the ema15 delta check,
@@ -1077,6 +1113,7 @@ def _start_software_stop_thread(ctx: AppContext) -> None:
         last_ema15 = 0.0
         last_pending = 0.0
         while True:
+            loop_started = time.monotonic()
             # 2026-08-27, user request ("improve the 1min checks to have
             # better reliability as the whole logic is dependent on it"):
             # outer catch-all around the whole tick, on top of _tick()'s own
@@ -1097,10 +1134,10 @@ def _start_software_stop_thread(ctx: AppContext) -> None:
             # because the process's own heartbeat.txt (written by the main
             # loop, a different thread) is unaffected by this one dying.
             _last_poller_tick = time.time()
-            # 2026-08-27: 10s -> 5s so the outer loop itself can actually
-            # deliver PENDING_ENTRY_RECHECK_SEC's 5s cadence -- gating an
-            # inner check faster than the loop that drives it is a no-op.
-            time.sleep(5)
+            # Keep the pending-order check on a fixed cadence. Sleeping a full
+            # five seconds after each tick adds the network/work duration to
+            # the interval and can turn a nominal 5s check into 10s+.
+            time.sleep(max(0.0, cfg.PENDING_ENTRY_RECHECK_SEC - (time.monotonic() - loop_started)))
 
     t = threading.Thread(target=_loop, name="SoftwareStopPoller", daemon=True)
     t.start()
@@ -1143,11 +1180,8 @@ def _poller_staleness_job() -> None:
         _poller_stale_alerted = True
 
 
-# (start_ET, end_ET, interval_minutes) as (hour, minute) pairs -- same 4-tier
-# cadence previously configured on the Windows Scheduled Task
-# ApexTraderTICapture (scripts/update_ti_capture_schedule_4tier.ps1): fast
-# 3-min sweeps right after the open and into the close, wider spacing
-# through the midday lull.
+# (start_ET, end_ET, interval_minutes) as (hour, minute) pairs: fast 3-min
+# refreshes in the morning and before the close, 10-min refreshes otherwise.
 # 2026-08-27, user request ("fix the stock universe check from ti web
 # scrapping ... starting 9:09 ET and perform the 3 min check till 10:30
 # ET, but don't trade until 9:30 ET"): tier 1 start moved 9:25 -> 9:09,
@@ -1156,13 +1190,9 @@ def _poller_staleness_job() -> None:
 # opens, so the universe is warm well before trading is allowed to start.
 _TI_CAPTURE_TIERS = [
     ((9, 9),   (10, 30), 3),
-    ((10, 30), (12, 30), 5),
-    ((12, 30), (14, 50), 10),
+    ((10, 30), (14, 50), 10),
     ((14, 50), (15, 50), 3),
 ]
-
-_TI_CAPTURE_MAX_RUNTIME_SEC = 300  # generous vs. the ~15-45s observed normal runtime
-
 
 def _ti_capture_interval_min(now_et: datetime.datetime) -> Optional[int]:
     """Return the configured interval (minutes) for now_et's tier, or None if
@@ -1175,37 +1205,26 @@ def _ti_capture_interval_min(now_et: datetime.datetime) -> Optional[int]:
 
 
 def _ti_capture_job(now_et: Optional[datetime.datetime] = None) -> None:
-    """Scheduled every minute (see run()) -- launches the TI-capture wrapper
-    directly from this (already-reliable, long-running) process instead of
-    via the Windows Scheduled Task.
+    """Scheduled every minute (see run()) -- refreshes data/ti_primary.json
+    from Yahoo Finance on the same tiered interval TI's scrape used to run on.
 
-    2026-08-27, user report ("why the 3mins web scrapping is not happening" /
-    "I am concerned now why the TI scrapping stopped"): ApexTraderTICapture
-    (Task Scheduler) was found hanging on effectively every launch that day
-    -- confirmed via the Task Scheduler event log (every Task-Scheduler-
-    launched instance stalled at 0% CPU with zero children spawned, eventually
-    force-killed by its own 10-minute ExecutionTimeLimit, then the next
-    trigger reused the same wedged state and hung again) while the IDENTICAL
-    script launched directly (python -m equivalent, or PowerShell's own
-    Start-Process) completed cleanly in 15-45s every single time, no
-    exceptions. Root cause in the Windows Task Scheduler launch path itself
-    was not pinned down (OneDrive Files-On-Demand hydration was checked and
-    ruled out -- the repo's files are already pinned/local); user chose to
-    route around it rather than keep debugging Windows internals. This job
-    reuses the exact same wrapper script Task Scheduler was invoking
-    (scripts/run_ti_capture_task.ps1, which itself calls
-    engine/ti/capture_tradeideas.py) via subprocess.Popen -- the launch
-    mechanism already proven reliable -- so the Task Scheduler task itself
-    should be disabled once this is live (see scripts/disable_ti_task.ps1)
-    to stop it silently hanging every cycle in parallel.
-
-    Overlap/hang guard: since Task Scheduler's own ExecutionTimeLimit no
-    longer applies, this job now owns that responsibility -- a prior
-    instance still running past _TI_CAPTURE_MAX_RUNTIME_SEC is treated as
-    wedged and killed (whole process tree, since Edge/msedgedriver survive
-    under the PowerShell parent) before a fresh one is launched.
+    2026-08-28, user request ("stop the webscrapping from Trade ideas. instead
+    use yahoo finance trending now, top gainer and top looser list"): TI's
+    "Free Use Has Expired" interstitial was firing on every single page load
+    that day plus a real Edge-crash/profile-lock failure -- replaced the whole
+    Selenium/Edge subprocess (capture_tradeideas.py via
+    scripts/run_ti_capture_task.ps1) with a direct, in-process call to
+    engine/ti/yahoo_universe.py: plain HTTP GETs (yfinance's day_gainers/
+    day_losers screeners + Yahoo's trending endpoint), no browser, no login,
+    no session to expire. That also means no more crash-prone child process
+    to wedge-detect/taskkill -- this job is now just the interval gate; a
+    fetch failure logs and retries next tick like any other best-effort job
+    in this loop. Windows Task Scheduler's ApexTraderTICapture task (the
+    older, since-superseded trigger path) was disabled the same day this
+    landed -- see git history for the one-off `schtasks` command; nothing in
+    this file depends on it either way.
     """
-    global _last_ti_capture_ts, _ti_capture_proc
+    global _last_ti_capture_ts
 
     if now_et is None:
         now_et = datetime.datetime.now(pytz.timezone("America/New_York"))
@@ -1213,38 +1232,16 @@ def _ti_capture_job(now_et: Optional[datetime.datetime] = None) -> None:
     if interval_min is None:
         return  # outside all capture windows today
 
-    if _ti_capture_proc is not None and _ti_capture_proc.poll() is None:
-        age = time.time() - _last_ti_capture_ts
-        if age < _TI_CAPTURE_MAX_RUNTIME_SEC:
-            return  # still within its normal runtime budget -- let it finish
-        log.warning(
-            f"[TI-CAPTURE] previous run still alive after {age:.0f}s "
-            f"(> {_TI_CAPTURE_MAX_RUNTIME_SEC}s budget) -- treating as wedged, killing tree"
-        )
-        try:
-            subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(_ti_capture_proc.pid)],
-                capture_output=True, timeout=15,
-            )
-        except Exception as e:
-            log.warning(f"[TI-CAPTURE] failed to kill wedged instance: {e}")
-        _ti_capture_proc = None
-
     if time.time() - _last_ti_capture_ts < interval_min * 60:
         return
 
-    script = Path(__file__).resolve().parent.parent / "scripts" / "run_ti_capture_task.ps1"
+    _last_ti_capture_ts = time.time()
     try:
-        _ti_capture_proc = subprocess.Popen(
-            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
-             "-WindowStyle", "Hidden", "-File", str(script)],
-            creationflags=subprocess.CREATE_NO_WINDOW,
-        )
-        _last_ti_capture_ts = time.time()
-        log.info(f"[TI-CAPTURE] launched (tier interval={interval_min}min, pid={_ti_capture_proc.pid})")
+        from engine.ti.yahoo_universe import write_ti_primary
+        n = write_ti_primary()
+        log.info(f"[TI-CAPTURE] Yahoo universe refreshed (tier interval={interval_min}min): {n} tickers")
     except Exception as e:
-        log.error(f"[TI-CAPTURE] failed to launch: {e}")
-        _last_ti_capture_ts = time.time()  # don't hot-loop retrying every minute on a persistent failure
+        log.error(f"[TI-CAPTURE] Yahoo universe refresh failed: {e}")
 
 
 def _start_options_scan_thread(ctx: AppContext) -> None:
@@ -1288,6 +1285,30 @@ def _start_options_scan_thread(ctx: AppContext) -> None:
     log.info(f"[OPTIONS-THREAD] Options scan thread started ({cfg.OPTIONS_SCAN_INTERVAL_MIN} min interval)")
 
 
+def _start_active_list_thread() -> None:
+    """Refresh the filtered active stock lists independently of scan duration."""
+    import threading
+
+    def _loop() -> None:
+        next_run = time.monotonic()
+        while True:
+            now_et = datetime.datetime.now(pytz.timezone("America/New_York"))
+            if _within_discovery_window(now_et):
+                try:
+                    get_scan_targets(market_state=MarketState.from_now(now_et))
+                    log.info("[ACTIVE-LISTS] refreshed filtered combined/long/short snapshots")
+                except Exception as e:
+                    log.error(f"[ACTIVE-LISTS] refresh failed: {e}", exc_info=True)
+            next_run += cfg.ACTIVE_SCAN_SNAPSHOT_INTERVAL_MIN * 60
+            time.sleep(max(1.0, next_run - time.monotonic()))
+
+    t = threading.Thread(target=_loop, name="ActiveListRefresher", daemon=True)
+    t.start()
+    log.info(
+        f"[ACTIVE-LISTS] refresher started ({cfg.ACTIVE_SCAN_SNAPSHOT_INTERVAL_MIN} min interval)"
+    )
+
+
 def start() -> None:
     ctx = _build_context()
 
@@ -1322,6 +1343,7 @@ def start() -> None:
 
     # Start the dedicated software-stop monitor thread
     _start_software_stop_thread(ctx)
+    _start_active_list_thread()
     _start_options_scan_thread(ctx)
 
     # Block until startup TI capture completes (up to 90s)
@@ -1533,25 +1555,17 @@ def _demo() -> None:
         _last_poller_tick, _poller_stale_alerted, send_email = _orig_tick, _orig_alerted, _orig_email
 
     # ── _ti_capture_job / _ti_capture_interval_min ──────────────────────────
-    global _last_ti_capture_ts, _ti_capture_proc
-    _orig_ts, _orig_proc = _last_ti_capture_ts, _ti_capture_proc
-    _orig_popen, _orig_run = subprocess.Popen, subprocess.run
+    global _last_ti_capture_ts
+    _orig_ts = _last_ti_capture_ts
     ET = pytz.timezone("America/New_York")
-
-    class _FakeProc:
-        def __init__(self, pid, alive=True):
-            self.pid = pid
-            self._alive = alive
-        def poll(self):
-            return None if self._alive else 0
 
     try:
         # Tier lookup: inside each tier, and the gaps between/around them.
         assert _ti_capture_interval_min(ET.localize(datetime.datetime(2026, 8, 27, 9, 8))) is None, "before first tier"
         assert _ti_capture_interval_min(ET.localize(datetime.datetime(2026, 8, 27, 9, 9))) == 3, "tier 1 start (inclusive)"
         assert _ti_capture_interval_min(ET.localize(datetime.datetime(2026, 8, 27, 10, 29))) == 3, "tier 1 end (exclusive upper)"
-        assert _ti_capture_interval_min(ET.localize(datetime.datetime(2026, 8, 27, 10, 30))) == 5, "tier 2 start"
-        assert _ti_capture_interval_min(ET.localize(datetime.datetime(2026, 8, 27, 11, 45))) == 5, "mid tier 2"
+        assert _ti_capture_interval_min(ET.localize(datetime.datetime(2026, 8, 27, 10, 30))) == 10, "tier 2 start"
+        assert _ti_capture_interval_min(ET.localize(datetime.datetime(2026, 8, 27, 11, 45))) == 10, "mid tier 2"
         assert _ti_capture_interval_min(ET.localize(datetime.datetime(2026, 8, 27, 12, 30))) == 10, "tier 3 start"
         assert _ti_capture_interval_min(ET.localize(datetime.datetime(2026, 8, 27, 14, 49))) == 10, "tier 3 end"
         assert _ti_capture_interval_min(ET.localize(datetime.datetime(2026, 8, 27, 14, 50))) == 3, "tier 4 start"
@@ -1559,61 +1573,42 @@ def _demo() -> None:
         assert _ti_capture_interval_min(ET.localize(datetime.datetime(2026, 8, 27, 15, 50))) is None, "after last tier"
         assert _ti_capture_interval_min(ET.localize(datetime.datetime(2026, 8, 27, 3, 0))) is None, "middle of the night"
 
-        popen_calls = []
-        def _fake_popen(*a, **kw):
-            popen_calls.append((a, kw))
-            return _FakeProc(pid=len(popen_calls) + 1000)
-        run_calls = []
-        subprocess.Popen = _fake_popen
-        subprocess.run = lambda *a, **kw: run_calls.append((a, kw))
+        write_calls = []
+        import engine.ti.yahoo_universe as _yu
+        _orig_write = _yu.write_ti_primary
+        _yu.write_ti_primary = lambda: (write_calls.append(1), 7)[1]
 
         t9_25 = ET.localize(datetime.datetime(2026, 8, 27, 9, 25))
 
-        # Outside any tier -> never launches, regardless of state.
-        _last_ti_capture_ts, _ti_capture_proc = 0.0, None
+        # Outside any tier -> never refreshes, regardless of state.
+        _last_ti_capture_ts = 0.0
         _ti_capture_job(now_et=ET.localize(datetime.datetime(2026, 8, 27, 3, 0)))
-        assert popen_calls == [], "must not launch outside a capture window"
+        assert write_calls == [], "must not refresh outside a capture window"
 
-        # Due (never run before) -> launches.
-        _last_ti_capture_ts, _ti_capture_proc = 0.0, None
+        # Due (never run before) -> refreshes.
+        _last_ti_capture_ts = 0.0
         _ti_capture_job(now_et=t9_25)
-        assert len(popen_calls) == 1, "first-ever call inside a tier must launch"
-        assert _ti_capture_proc is not None and _ti_capture_proc.pid == 1001
+        assert len(write_calls) == 1, "first-ever call inside a tier must refresh"
 
-        # Not due yet (last run 1 min ago, tier interval 3 min) -> no launch.
+        # Not due yet (last run 1 min ago, tier interval 3 min) -> no refresh.
         _last_ti_capture_ts = time.time() - 60
         _ti_capture_job(now_et=t9_25)
-        assert len(popen_calls) == 1, "must not launch again before the tier interval elapses"
+        assert len(write_calls) == 1, "must not refresh again before the tier interval elapses"
 
-        # Due again (last run past the tier interval) -> launches.
+        # Due again (last run past the tier interval) -> refreshes.
         _last_ti_capture_ts = time.time() - 200  # > 3min tier
-        _ti_capture_proc = None
         _ti_capture_job(now_et=t9_25)
-        assert len(popen_calls) == 2, "must launch once the tier interval has elapsed"
+        assert len(write_calls) == 2, "must refresh once the tier interval has elapsed"
 
-        # Previous instance still alive but within its runtime budget -> skip,
-        # no new launch, no kill.
-        _ti_capture_proc = _FakeProc(pid=99, alive=True)
-        _last_ti_capture_ts = time.time() - 30  # well under _TI_CAPTURE_MAX_RUNTIME_SEC
-        _ti_capture_job(now_et=t9_25)
-        assert len(popen_calls) == 2, "must not launch a second instance while one is still running normally"
-        assert run_calls == [], "must not kill an instance still within its runtime budget"
-
-        # Previous instance still alive PAST its runtime budget -> treated as
-        # wedged: killed, then a fresh one launched. This is the exact
-        # scenario found live 2026-08-27 (Task Scheduler instances hanging
-        # indefinitely) -- this job now owns that recovery itself.
-        _ti_capture_proc = _FakeProc(pid=42, alive=True)
-        _last_ti_capture_ts = time.time() - (_TI_CAPTURE_MAX_RUNTIME_SEC + 30)
-        _ti_capture_job(now_et=t9_25)
-        assert len(run_calls) == 1, "a wedged (past-budget) instance must be killed"
-        assert "42" in [str(x) for x in run_calls[0][0][0]], f"must kill the actual wedged PID, got {run_calls[0]}"
-        assert len(popen_calls) == 3, "a fresh instance must launch after killing the wedged one"
+        # write_ti_primary raising must not propagate (best-effort job).
+        _yu.write_ti_primary = lambda: (_ for _ in ()).throw(RuntimeError("network down"))
+        _last_ti_capture_ts = time.time() - 200
+        _ti_capture_job(now_et=t9_25)  # must not raise
 
         print("_ti_capture_job: all checks passed")
     finally:
-        _last_ti_capture_ts, _ti_capture_proc = _orig_ts, _orig_proc
-        subprocess.Popen, subprocess.run = _orig_popen, _orig_run
+        _last_ti_capture_ts = _orig_ts
+        _yu.write_ti_primary = _orig_write
 
     # _tick: 2026-08-27, user request ("in the next 18secs before order
     # executed the code should have cancelled the order"): asserts

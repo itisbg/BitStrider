@@ -357,7 +357,7 @@ CONCENTRATION_CHECK_INTERVAL_MIN = 10
 # concentration checks — see _concentration_check_job in orchestrator.py)
 # for a position that drifts over it through price appreciation alone.
 # ─────────────────────────────────────────────────────────────────
-MAX_PORTFOLIO_LEVERAGE = 2.0   # total open-position market value <= this x equity (scaled 2026-08-17 with the 7.5->10% base)
+MAX_PORTFOLIO_LEVERAGE = 1.5   # total open-position market value <= this x equity (2026-08-28, user request: 1.5x actual-position cap, independent of Alpaca's 4x order-placement margin)
 
 # Same-underlying leveraged-ETF pairs (bull+bear on one commodity/index, e.g.
 # BOIL/KOLD both on nat gas — arbitrary product names, no ticker pattern to
@@ -642,6 +642,7 @@ STARTUP_TI_CAPTURE_TIMEOUT_S                     = int(__import__('os').getenv('
 # + TI primary), not TI alone — see get_scan_targets() in equity/scan.py.
 # Movers get priority; TI fills whatever's left, up to this shared ceiling.
 TI_PRIMARY_SCAN_BATCH_LIMIT                       = int(__import__('os').getenv('TI_PRIMARY_SCAN_BATCH_LIMIT', '30'))
+ACTIVE_SCAN_SNAPSHOT_INTERVAL_MIN                 = int(__import__('os').getenv('ACTIVE_SCAN_SNAPSHOT_INTERVAL_MIN', '10'))
 
 # Sector sympathy scanner — injects peer tickers when a leader stock fires
 USE_SECTOR_SYMPATHY          = False  # disabled — EDGAR 8-K is the primary discovery signal
@@ -660,8 +661,11 @@ PREOPEN_USE_SENTIMENT_GATING = os.getenv("PREOPEN_USE_SENTIMENT_GATING", "true")
 # Daily Limits
 # ─────────────────────────────────────────────────────────────────
 POSITION_CHECK_MIN       = 5
-DAILY_LOSS_LIMIT_BULL_PCT = 1.0   # Halt if down >1% of start equity in bull regime
-DAILY_LOSS_LIMIT_BEAR_PCT = 2.0   # Halt if down >2% of start equity in bear regime (wider room)
+# 2026-08-28, user request ("don't stop the trading today I want to fix all
+# the issues today"): env-overridable so today's debugging session can raise
+# the halt threshold via .env without a code edit -- defaults unchanged.
+DAILY_LOSS_LIMIT_BULL_PCT = float(os.getenv("DAILY_LOSS_LIMIT_BULL_PCT", "1.0"))   # Halt if down >1% of start equity in bull regime
+DAILY_LOSS_LIMIT_BEAR_PCT = float(os.getenv("DAILY_LOSS_LIMIT_BEAR_PCT", "2.0"))   # Halt if down >2% of start equity in bear regime (wider room)
 DAILY_PROFIT_TARGET       = 3500.0
 
 # 2026-08-18, user request: restrict new entries to regular hours only
@@ -862,9 +866,8 @@ PENDING_ENTRY_RECHECK_SEC = 5
 # is in the way trade is intended" before entering, checked alongside the
 # trail-buy entry. Simplified to an EMA's own slope on 1-min bars: this
 # minute's EMA minus last minute's EMA must be positive for a long,
-# negative for a short -- rejects the entry outright otherwise. Fail-open on
-# missing/insufficient bar data, same philosophy as MOMENTUM_FRESHNESS_* --
-# never blocks on data the bot doesn't have.
+# negative for a short -- rejects the entry outright otherwise. Missing or
+# insufficient bar data also blocks because EMA alignment is a hard condition.
 # 2026-08-24, user request: EMA9 -> EMA7 -- faster/more responsive slope,
 # allows an earlier entry read; paired with the entry-anchored EMA15 delta
 # exit above so a still-below-EMA15 entry isn't rejected outright, it's
@@ -1330,13 +1333,15 @@ THIN_LIQUIDITY_EXCLUDED_STRATEGIES = {"ORB", "GapBreakout"}
 # the first REENTRY_TRAIL_PCT% of any real reversal in exchange for not
 # catching the falling knife. See _entries_today in enhanced.py.
 # 2026-08-22, user request: "every entry trail orders percentage is 0.5%
-# along with the ema slope instead of 1%" -- tightened 1.0 -> 0.5. Confirms
-# the reversal with a smaller bounce now, but leans harder on
+# along with the ema slope instead of 1%" -- tightened 1.0 -> 0.5. On
+# 2026-08-28, tightened again to 0.25% so an aligned reversal can trigger
+# sooner, while still requiring the hard EMA entry gate. The entry trigger
+# leans harder on
 # _check_ema_trend_alignment (EMA9 slope must already be moving in the
 # trade's direction) to keep this from just catching noise -- the two
 # conditions apply together, not as alternatives: EMA slope gates entry
 # eligibility at signal time, this trail % gates the actual fill price.
-REENTRY_TRAIL_PCT = 0.5
+REENTRY_TRAIL_PCT = 0.25
 
 # 2026-08-14, user request: "I told ones which fail guard will be traded too
 # but with lower portfolio limit" -- extending the same trade-anyway-at-
@@ -1470,8 +1475,10 @@ MOMENTUM_FRESHNESS_LOOKBACK_MIN     = 30   # minutes of recent bars to find the 
 MOMENTUM_FRESHNESS_MAX_PULLBACK_PCT = 5.0  # reject if price has faded more than this % off that high
 
 USE_MARKET_REGIME_FILTER = True       # SPY below 200-day MA → cut signals to 1
-MARKET_REGIME_SIGNALS_CAP  = 5        # Max LONG entries per cycle in bear regime (swap-only); tries until one succeeds
-BEAR_SHORT_SIGNALS_CAP     = 3        # Max SHORT entries per cycle in bear regime
+MAX_LONG_ENTRIES_PER_CYCLE  = 8       # Maximum successful long entries attempted per scan cycle
+MAX_SHORT_ENTRIES_PER_CYCLE = 5       # Maximum successful short entries attempted per scan cycle
+MARKET_REGIME_SIGNALS_CAP   = MAX_LONG_ENTRIES_PER_CYCLE  # Bear-regime long cap (swap-only)
+BEAR_SHORT_SIGNALS_CAP      = MAX_SHORT_ENTRIES_PER_CYCLE
 ATR_STOP_MULTIPLIER      = 1.5        # Stop loss = entry − ATR × 1.5
 ATR_TP_RATIO             = 2.0        # Take-profit at 2:1 R:R (risk × 2)
 MAX_SHORT_FLOAT_PCT      = 20.0       # Never exceed this % of equity per squeeze ticker
