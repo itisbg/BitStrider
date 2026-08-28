@@ -838,6 +838,25 @@ PRICE_DRIFT_LOOKBACK_MIN       = 30     # how far back the comparison price is f
 STAGNANT_STOP_ENABLED             = True
 STAGNANT_STOP_CHECK_INTERVAL_MIN  = 1
 
+# 2026-08-27, user request ("in the next 18secs before order executed the
+# code should have cancelled the order"): check_pending_entries_ema's own
+# gate recheck (cancel a resting entry order once the EMA trend that
+# justified it no longer holds) now runs on this separate, much faster
+# timer instead of sharing STAGNANT_STOP_CHECK_INTERVAL_MIN (1 min) with
+# check_ema9_exit/check_blocked_entries_ema -- confirmed live 2026-08-27:
+# an OKTA trailing-buy was armed on a fresh gate-pass, then filled just 18
+# seconds later after price reversed in between, with zero chance for a
+# 60s-interval recheck to ever catch it. A 5s recheck can't GUARANTEE
+# catching every fill that fast either (the order is broker-side and can
+# fill on any tick; a cancel request in flight can still lose that race --
+# no polling interval closes that to zero), but it turns "60s vs an
+# 18-second fill = never" into "5s vs an 18-second fill = ~3-4 real
+# chances." Only this specific check moved -- check_ema9_exit and
+# check_blocked_entries_ema stay on the original 1-min cadence, since
+# neither has this same "resting broker order could fill any second" risk
+# profile (see engine/orchestrator.py's _start_software_stop_thread).
+PENDING_ENTRY_RECHECK_SEC = 5
+
 # ─────────────────────────────────────────────────────────────────
 # EMA Trend Alignment Filter -- 2026-08-22, user request: "ensure the trend
 # is in the way trade is intended" before entering, checked alongside the
