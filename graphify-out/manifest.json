@@ -10,24 +10,19 @@
     "semantic_hash": "e0304cd9b416affdd6a5e7cf73638aa2"
   },
   "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\data\\ti_primary.json": {
-    "mtime": 1785895814.9507668,
-    "ast_hash": "ac36b4241499db5581e77745c2e47b85",
-    "semantic_hash": "ac36b4241499db5581e77745c2e47b85"
+    "mtime": 1787946524.848689,
+    "ast_hash": "01947e177923192d07c317b3243b1160",
+    "semantic_hash": "01947e177923192d07c317b3243b1160"
   },
   "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\data\\ti_unusual_options.json": {
-    "mtime": 1785895814.0569808,
-    "ast_hash": "ac36b4241499db5581e77745c2e47b85",
-    "semantic_hash": "ac36b4241499db5581e77745c2e47b85"
-  },
-  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\data\\universe-Dr-BG.json": {
-    "mtime": 1783535911.0,
-    "ast_hash": "7872b1cf3fd3658e795d7ece1516bf94",
-    "semantic_hash": "7872b1cf3fd3658e795d7ece1516bf94"
+    "mtime": 1787926487.7088518,
+    "ast_hash": "004be54fb91ee36a506e6d54a70864a5",
+    "semantic_hash": "004be54fb91ee36a506e6d54a70864a5"
   },
   "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\data\\universe.json": {
-    "mtime": 1785895814.9682753,
-    "ast_hash": "b55ad843c782c33802c995bd7b926036",
-    "semantic_hash": "b55ad843c782c33802c995bd7b926036"
+    "mtime": 1787961968.6347067,
+    "ast_hash": "ac49c43688f6bacd181ef7287d4b3faf",
+    "semantic_hash": "ac49c43688f6bacd181ef7287d4b3faf"
   },
   "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\engine\\.quarterly_state.json": {
     "mtime": 1783116358.0,
@@ -55,9 +50,9 @@
     "semantic_hash": "4d2d9bebfcae09a8106b9012ea389ede"
   },
   "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\engine\\config.py": {
-    "mtime": 1785795164.8670294,
-    "ast_hash": "458f7629934cde97cb502ac4bd6696bd",
-    "semantic_hash": "458f7629934cde97cb502ac4bd6696bd"
+    "mtime": 1787961211.2873046,
+    "ast_hash": "510a76a2b50e3ec56363c2f707a9f65a",
+    "semantic_hash": "510a76a2b50e3ec56363c2f707a9f65a"
   },
   "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\engine\\data\\edgar_scraper.py": {
     "mtime": 1783108845.0,
@@ -80,24 +75,24 @@
     "semantic_hash": "45d49ac8e3e729b64884057463687ac4"
   },
   "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\engine\\equity\\discovery.py": {
-    "mtime": 1785896902.9787953,
-    "ast_hash": "41a52608cd14361f8e0e8a707664d8be",
-    "semantic_hash": "41a52608cd14361f8e0e8a707664d8be"
+    "mtime": 1787860986.4314647,
+    "ast_hash": "56e17bc8c85d1f68dcb662cddba7ed26",
+    "semantic_hash": "56e17bc8c85d1f68dcb662cddba7ed26"
   },
   "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\engine\\equity\\scan.py": {
-    "mtime": 1785795176.7935479,
-    "ast_hash": "f5cfeb67aeeda1d3b517a28203036b1b",
-    "semantic_hash": "f5cfeb67aeeda1d3b517a28203036b1b"
+    "mtime": 1787961490.0039499,
+    "ast_hash": "641b794b458f3bd45533072d3513b643",
+    "semantic_hash": "641b794b458f3bd45533072d3513b643"
   },
   "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\engine\\equity\\strategies.py": {
-    "mtime": 1785568024.6617634,
-    "ast_hash": "125c355b2c91eb40e4de880c5ca7370c",
-    "semantic_hash": "125c355b2c91eb40e4de880c5ca7370c"
+    "mtime": 1787935512.1231253,
+    "ast_hash": "559ce4ebb45e7487ad53a0ba9640d742",
+    "semantic_hash": "559ce4ebb45e7487ad53a0ba9640d742"
   },
   "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\engine\\equity\\universe.py": {
-    "mtime": 1785894455.7038465,
-    "ast_hash": "4b4ffbcbfb58c824c90719d787574dac",
-    "semantic_hash": "4b4ffbcbfb58c824c90719d787574dac"
+    "mtime": 1786071317.0262935,
+    "ast_hash": "03fe85e93958a973a6e86bb1fc5352b0",
+    "semantic_hash": "03fe85e93958a973a6e86bb1fc5352b0"
   },
   "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\engine\\execution\\__init__.py": {
     "mtime": 1783108846.0,
@@ -105,9 +100,9 @@
     "semantic_hash": "772c610feadc9cd80ba31e70f5d659bb"
   },
   "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\engine\\execution\\enhanced.py": {
-    "mtime": 1785894196.5981777,
-    "ast_hash": "d4cbc8e14ed2d671b501060e7744b924",
-    "semantic_hash": "d4cbc8e14ed2d671b501060e7744b924"
+    "mtime": 1787946886.8488564,
+    "ast_hash": "b051d2388bf069945e7f862749a5e836",
+    "semantic_hash": "b051d2388bf069945e7f862749a5e836"
   },
   "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\engine\\never_trade.py": {
     "mtime": 1783110932.0,
@@ -135,39 +130,29 @@
     "semantic_hash": "043730f37fa5c9212aa459dddcfe227a"
   },
   "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\engine\\options\\executor.py": {
-    "mtime": 1785564815.5428903,
-    "ast_hash": "1b202820e0338e01a9907a1b78a73b5a",
-    "semantic_hash": "1b202820e0338e01a9907a1b78a73b5a"
+    "mtime": 1787924785.585298,
+    "ast_hash": "dc047223dbaa79758ed2046080f3c3ea",
+    "semantic_hash": "dc047223dbaa79758ed2046080f3c3ea"
   },
   "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\engine\\options\\strategies.py": {
-    "mtime": 1784684787.4479609,
-    "ast_hash": "d8ea80b843b18dcd0f359c0a1e6f1cd3",
-    "semantic_hash": "d8ea80b843b18dcd0f359c0a1e6f1cd3"
+    "mtime": 1787579322.9967139,
+    "ast_hash": "f2785bc2d1448283bdb89944175b1f27",
+    "semantic_hash": "f2785bc2d1448283bdb89944175b1f27"
   },
   "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\engine\\orchestrator.py": {
-    "mtime": 1785568458.2305691,
-    "ast_hash": "62c245e23167ec2e7e1c1885f208177f",
-    "semantic_hash": "62c245e23167ec2e7e1c1885f208177f"
+    "mtime": 1787948590.7532907,
+    "ast_hash": "851a881a5cc01f11f96d4e49a69389c2",
+    "semantic_hash": "851a881a5cc01f11f96d4e49a69389c2"
   },
   "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\engine\\predictions\\__init__.py": {
     "mtime": 1783108846.0,
     "ast_hash": "272e131861f34d6b767a30c9408f5681",
     "semantic_hash": "272e131861f34d6b767a30c9408f5681"
   },
-  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\engine\\predictions\\day_picks-BG-User-1-2.json": {
-    "mtime": 1783540610.6962707,
-    "ast_hash": "2f89d79b3dee330b402ecdf753f96f70",
-    "semantic_hash": "2f89d79b3dee330b402ecdf753f96f70"
-  },
-  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\engine\\predictions\\day_picks-BG-User-1.json": {
-    "mtime": 1783539450.3407848,
-    "ast_hash": "238a4cd5fdaa1e2cc79d6b6a8b5cee57",
-    "semantic_hash": "238a4cd5fdaa1e2cc79d6b6a8b5cee57"
-  },
   "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\engine\\predictions\\day_picks.json": {
-    "mtime": 1785881884.6367626,
-    "ast_hash": "a6d3b544a48f9a6f5366b9db43c8e6f4",
-    "semantic_hash": "a6d3b544a48f9a6f5366b9db43c8e6f4"
+    "mtime": 1787946318.8501155,
+    "ast_hash": "258c08d3ba2fcb0816f1d2e05ff1d181",
+    "semantic_hash": "258c08d3ba2fcb0816f1d2e05ff1d181"
   },
   "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\engine\\predictions\\predictions.py": {
     "mtime": 1783108846.0,
@@ -185,14 +170,14 @@
     "semantic_hash": "d41d7af3b0572f3f71d78f62fd519300"
   },
   "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\engine\\session\\__init__.py": {
-    "mtime": 1783108846.0,
-    "ast_hash": "85fe3aaf2673eb9d6878fb6b03ef74d4",
-    "semantic_hash": "85fe3aaf2673eb9d6878fb6b03ef74d4"
+    "mtime": 1786725984.5573866,
+    "ast_hash": "c5d0db389213d5974d456b9bbccd7476",
+    "semantic_hash": "c5d0db389213d5974d456b9bbccd7476"
   },
   "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\engine\\session\\session.py": {
-    "mtime": 1783108846.0,
-    "ast_hash": "f92e289ed136467a22182b0cba0e445a",
-    "semantic_hash": "f92e289ed136467a22182b0cba0e445a"
+    "mtime": 1786725979.2560852,
+    "ast_hash": "6a3c69a241a15fec1bfec42a86823226",
+    "semantic_hash": "6a3c69a241a15fec1bfec42a86823226"
   },
   "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\engine\\ti\\__init__.py": {
     "mtime": 1783108846.0,
@@ -200,9 +185,9 @@
     "semantic_hash": "2fc2e4bad988d657e493db75766061cf"
   },
   "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\engine\\ti\\capture_tradeideas.py": {
-    "mtime": 1785894217.2945707,
-    "ast_hash": "233d3365191854877d6c915e1be0ddc7",
-    "semantic_hash": "233d3365191854877d6c915e1be0ddc7"
+    "mtime": 1787926671.518963,
+    "ast_hash": "e4ca5a4df23634fd2c7339fc4f6fd8eb",
+    "semantic_hash": "e4ca5a4df23634fd2c7339fc4f6fd8eb"
   },
   "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\engine\\ti\\ti.py": {
     "mtime": 1783108846.0,
@@ -210,14 +195,14 @@
     "semantic_hash": "7d8e10fd2bc9de02f86b9eca108759b5"
   },
   "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\engine\\utils\\__init__.py": {
-    "mtime": 1783127720.0,
-    "ast_hash": "71c22e5510b7202866ec433e1b675a53",
-    "semantic_hash": "71c22e5510b7202866ec433e1b675a53"
+    "mtime": 1785973615.9443984,
+    "ast_hash": "fe353a66107e9ea9a669e4ba523f33b3",
+    "semantic_hash": "fe353a66107e9ea9a669e4ba523f33b3"
   },
   "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\engine\\utils\\bars.py": {
-    "mtime": 1785568838.4227762,
-    "ast_hash": "3af5ff54a58b1f802adeae20dc06851d",
-    "semantic_hash": "3af5ff54a58b1f802adeae20dc06851d"
+    "mtime": 1787855777.3824008,
+    "ast_hash": "afacefd8a2daa0c61bd44a0a661d5222",
+    "semantic_hash": "afacefd8a2daa0c61bd44a0a661d5222"
   },
   "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\engine\\utils\\data.py": {
     "mtime": 1783108846.0,
@@ -235,9 +220,9 @@
     "semantic_hash": "53738a5cc0307a0121d5951d8bd437d7"
   },
   "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\engine\\utils\\market.py": {
-    "mtime": 1783127693.0,
-    "ast_hash": "41222479b1199ea157005e377473a48c",
-    "semantic_hash": "41222479b1199ea157005e377473a48c"
+    "mtime": 1787795391.2353837,
+    "ast_hash": "91004a37d8c8c1dca1db06c0aafa7af1",
+    "semantic_hash": "91004a37d8c8c1dca1db06c0aafa7af1"
   },
   "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\engine\\utils\\risk.py": {
     "mtime": 1783108846.0,
@@ -245,9 +230,9 @@
     "semantic_hash": "8ed37dc582b4fce84c0a8e873db2fc17"
   },
   "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\engine\\watchdog.py": {
-    "mtime": 1785567001.105558,
-    "ast_hash": "6f62a0e64c7a4e0b16af4821610f6143",
-    "semantic_hash": "6f62a0e64c7a4e0b16af4821610f6143"
+    "mtime": 1785972567.324148,
+    "ast_hash": "94debc67e8cbf269c0552803a92a577e",
+    "semantic_hash": "94debc67e8cbf269c0552803a92a577e"
   },
   "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\main.py": {
     "mtime": 1785777987.3018334,
@@ -380,14 +365,14 @@
     "semantic_hash": "25882b124019dd3ceaed0f8c13bf4cac"
   },
   "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\scripts\\run_autobot_task.ps1": {
-    "mtime": 1784065240.0,
-    "ast_hash": "eb4e32febbd08b95d2ff49d575533142",
-    "semantic_hash": "eb4e32febbd08b95d2ff49d575533142"
+    "mtime": 1785971627.718162,
+    "ast_hash": "beeae3b030cea72e4febc0d4648bb0bc",
+    "semantic_hash": "beeae3b030cea72e4febc0d4648bb0bc"
   },
   "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\scripts\\run_ti_capture_task.ps1": {
-    "mtime": 1785894334.4716878,
-    "ast_hash": "8e07c1c1c32b4690e8a2d36332cbe618",
-    "semantic_hash": "8e07c1c1c32b4690e8a2d36332cbe618"
+    "mtime": 1787938723.8028085,
+    "ast_hash": "2870abf8136e7d7f743d1ab5cb2cf26a",
+    "semantic_hash": "2870abf8136e7d7f743d1ab5cb2cf26a"
   },
   "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\scripts\\run_top3.py": {
     "mtime": 1783108847.0,
@@ -405,9 +390,9 @@
     "semantic_hash": "fe3c38af8863d994e820bf6d91b5d1c9"
   },
   "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\windows_schedule_ti_capture.ps1": {
-    "mtime": 1785895600.807011,
-    "ast_hash": "4acf813047ef94a0ae2426dd4335371c",
-    "semantic_hash": "4acf813047ef94a0ae2426dd4335371c"
+    "mtime": 1787938723.8028085,
+    "ast_hash": "76ea777cb0806b24d9b0a6c6090199c5",
+    "semantic_hash": "76ea777cb0806b24d9b0a6c6090199c5"
   },
   "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\CONFIG.md": {
     "mtime": 1783108845.0,
@@ -443,5 +428,295 @@
     "mtime": 1783127665.0,
     "ast_hash": "a3421b73f460473a233c75cde82b0dbb",
     "semantic_hash": "a3421b73f460473a233c75cde82b0dbb"
+  },
+  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\data\\alpaca_movers_queue.json": {
+    "mtime": 1787933775.532248,
+    "ast_hash": "ee270f44c75f47262421ccfcdc906e5b",
+    "semantic_hash": "ee270f44c75f47262421ccfcdc906e5b"
+  },
+  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\data\\ti_primary_active.json": {
+    "mtime": 1787949114.5766566,
+    "ast_hash": "0f28abd8660bb3595e7c3a8077580297",
+    "semantic_hash": "0f28abd8660bb3595e7c3a8077580297"
+  },
+  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\data\\ti_primary_active_longs.json": {
+    "mtime": 1787949144.2967386,
+    "ast_hash": "710cd2512de06522b21c64a4aa77bc9e",
+    "semantic_hash": "710cd2512de06522b21c64a4aa77bc9e"
+  },
+  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\data\\ti_primary_active_shorts.json": {
+    "mtime": 1787949144.3017957,
+    "ast_hash": "5017b7c53707b778ade1c28ec14e803b",
+    "semantic_hash": "5017b7c53707b778ade1c28ec14e803b"
+  },
+  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\data\\watchlist_snapshot.json": {
+    "mtime": 1787928907.4710357,
+    "ast_hash": "c73f6a11c0424ad3b33eb5a0b944d4db",
+    "semantic_hash": "c73f6a11c0424ad3b33eb5a0b944d4db"
+  },
+  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\engine\\.daily_state.json": {
+    "mtime": 1787894073.3180358,
+    "ast_hash": "963eba8bbda77dc82819aa46046b7e17",
+    "semantic_hash": "963eba8bbda77dc82819aa46046b7e17"
+  },
+  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\engine\\ti\\yahoo_universe.py": {
+    "mtime": 1787948174.7346573,
+    "ast_hash": "9a42902247e1fb54e816ae2e5bf4541d",
+    "semantic_hash": "9a42902247e1fb54e816ae2e5bf4541d"
+  },
+  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\scripts\\add_2hr_trigger.ps1": {
+    "mtime": 1785972259.4799185,
+    "ast_hash": "65ff1786462c6c683de38b998c063ae0",
+    "semantic_hash": "65ff1786462c6c683de38b998c063ae0"
+  },
+  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\scripts\\add_overnight_ti_capture.ps1": {
+    "mtime": 1785980173.9785697,
+    "ast_hash": "50a96c9e552c7bfaac4d47a2ada59b7e",
+    "semantic_hash": "50a96c9e552c7bfaac4d47a2ada59b7e"
+  },
+  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\scripts\\dry_run_eod_guardrail_check.py": {
+    "mtime": 1787616922.3875716,
+    "ast_hash": "2cda9d3258eb94f64899e18fe636ef62",
+    "semantic_hash": "2cda9d3258eb94f64899e18fe636ef62"
+  },
+  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\scripts\\extend_ti_capture_window.ps1": {
+    "mtime": 1785979059.661474,
+    "ast_hash": "49bd539beb243669a5c1514377917daa",
+    "semantic_hash": "49bd539beb243669a5c1514377917daa"
+  },
+  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\scripts\\fix_autorun_task.ps1": {
+    "mtime": 1786555678.478688,
+    "ast_hash": "7e02f4e688024480083e657240511d81",
+    "semantic_hash": "7e02f4e688024480083e657240511d81"
+  },
+  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\scripts\\kill_zombie_edge.ps1": {
+    "mtime": 1785934039.2243104,
+    "ast_hash": "d528eb821f5b86da5a605193836404e4",
+    "semantic_hash": "d528eb821f5b86da5a605193836404e4"
+  },
+  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\scripts\\restart_watchdog.ps1": {
+    "mtime": 1785971440.22296,
+    "ast_hash": "0a99b929d4d3957cd58f526794ce14cd",
+    "semantic_hash": "0a99b929d4d3957cd58f526794ce14cd"
+  },
+  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\scripts\\run_foreground.ps1": {
+    "mtime": 1785971829.504548,
+    "ast_hash": "30ec322ac09fa4c384201db930739343",
+    "semantic_hash": "30ec322ac09fa4c384201db930739343"
+  },
+  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\scripts\\strategy_scoreboard.py": {
+    "mtime": 1786826775.7078505,
+    "ast_hash": "6a53b4fc5f585b2a54590cb601f1f4ce",
+    "semantic_hash": "6a53b4fc5f585b2a54590cb601f1f4ce"
+  },
+  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\scripts\\test_clock_grid_schedule.py": {
+    "mtime": 1786727003.9222748,
+    "ast_hash": "a38db121536b53ba130cb2b5770083d9",
+    "semantic_hash": "a38db121536b53ba130cb2b5770083d9"
+  },
+  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\scripts\\test_concentration_trim_frees_stop.py": {
+    "mtime": 1787000131.4421964,
+    "ast_hash": "77497b6ff58824ae3ab30d4331a6f175",
+    "semantic_hash": "77497b6ff58824ae3ab30d4331a6f175"
+  },
+  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\scripts\\test_daily_state_persistence.py": {
+    "mtime": 1786726008.544418,
+    "ast_hash": "28fc40aa54eb2a68846cca2bbc8691eb",
+    "semantic_hash": "28fc40aa54eb2a68846cca2bbc8691eb"
+  },
+  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\scripts\\test_drift_backfill.py": {
+    "mtime": 1786721865.95197,
+    "ast_hash": "b00e9345403dd03e211c3c7bb33d6e3c",
+    "semantic_hash": "b00e9345403dd03e211c3c7bb33d6e3c"
+  },
+  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\scripts\\test_edgedriver_version_match.py": {
+    "mtime": 1786626207.379109,
+    "ast_hash": "d08670532a2f208b34dec3ea42b303ee",
+    "semantic_hash": "d08670532a2f208b34dec3ea42b303ee"
+  },
+  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\scripts\\test_ema15_reclaim.py": {
+    "mtime": 1787619948.2772236,
+    "ast_hash": "d533bd49b09093c0a549848c1fdb55e8",
+    "semantic_hash": "d533bd49b09093c0a549848c1fdb55e8"
+  },
+  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\scripts\\test_entry_log_rebuild_shorts.py": {
+    "mtime": 1786723321.0840914,
+    "ast_hash": "7ee240ac337c7d017e9e6cb1e69ddb49",
+    "semantic_hash": "7ee240ac337c7d017e9e6cb1e69ddb49"
+  },
+  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\scripts\\test_entry_rechase.py": {
+    "mtime": 1786716588.372635,
+    "ast_hash": "42618f3d6846b1b0761a8ad03c1d7671",
+    "semantic_hash": "42618f3d6846b1b0761a8ad03c1d7671"
+  },
+  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\scripts\\test_entry_window.py": {
+    "mtime": 1787460201.9036672,
+    "ast_hash": "4d46c9d2fff8dec0492667631a5f197e",
+    "semantic_hash": "4d46c9d2fff8dec0492667631a5f197e"
+  },
+  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\scripts\\test_eod_close_rerun.py": {
+    "mtime": 1787465972.5611596,
+    "ast_hash": "5cd518ef32d294d345a0c8a829685df4",
+    "semantic_hash": "5cd518ef32d294d345a0c8a829685df4"
+  },
+  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\scripts\\test_execute_bull_plan.py": {
+    "mtime": 1786715763.0248919,
+    "ast_hash": "a2ec8d055f7eaeda30329d5ed8e56370",
+    "semantic_hash": "a2ec8d055f7eaeda30329d5ed8e56370"
+  },
+  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\scripts\\test_faded_entry_execution.py": {
+    "mtime": 1787579414.8396611,
+    "ast_hash": "0cf085c9cb7023919523b3f7c5b3ba4a",
+    "semantic_hash": "0cf085c9cb7023919523b3f7c5b3ba4a"
+  },
+  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\scripts\\test_force_close_no_afterhours_chase.py": {
+    "mtime": 1787054331.0246923,
+    "ast_hash": "ef7a299a7c69e1e990ca0c99e90ee879",
+    "semantic_hash": "ef7a299a7c69e1e990ca0c99e90ee879"
+  },
+  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\scripts\\test_growing_concentration_cap.py": {
+    "mtime": 1786975994.2686436,
+    "ast_hash": "9636015462ae3b2419dd1f3d0c635dea",
+    "semantic_hash": "9636015462ae3b2419dd1f3d0c635dea"
+  },
+  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\scripts\\test_guardrail_eod_close.py": {
+    "mtime": 1786554389.7941427,
+    "ast_hash": "a7404937038fc2b55694285769b90841",
+    "semantic_hash": "a7404937038fc2b55694285769b90841"
+  },
+  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\scripts\\test_margin_safeguard.py": {
+    "mtime": 1786592926.167293,
+    "ast_hash": "233891e5f3f671ca15dee7ecf5d126fc",
+    "semantic_hash": "233891e5f3f671ca15dee7ecf5d126fc"
+  },
+  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\scripts\\test_marketable_limit_and_trail.py": {
+    "mtime": 1787442940.5965893,
+    "ast_hash": "f098e511d0597ab6f039722b3e96e92d",
+    "semantic_hash": "f098e511d0597ab6f039722b3e96e92d"
+  },
+  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\scripts\\test_momentum_freshness.py": {
+    "mtime": 1786544762.808774,
+    "ast_hash": "f5a145f7706fa32bd57b5f8fa8c4121d",
+    "semantic_hash": "f5a145f7706fa32bd57b5f8fa8c4121d"
+  },
+  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\scripts\\test_no_gain_exit_band.py": {
+    "mtime": 1786531040.3796947,
+    "ast_hash": "8c2c3f8b0e04bb3ed822bca7ded0aa04",
+    "semantic_hash": "8c2c3f8b0e04bb3ed822bca7ded0aa04"
+  },
+  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\scripts\\test_pending_entry_ema_recheck.py": {
+    "mtime": 1787621215.3202417,
+    "ast_hash": "aefe663450a76de2315b322a062b7f22",
+    "semantic_hash": "aefe663450a76de2315b322a062b7f22"
+  },
+  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\scripts\\test_portfolio_leverage_cap.py": {
+    "mtime": 1786976016.1096532,
+    "ast_hash": "4342fe0e8f4126cb4e0392a7163d72c9",
+    "semantic_hash": "4342fe0e8f4126cb4e0392a7163d72c9"
+  },
+  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\scripts\\test_price_drift_stop.py": {
+    "mtime": 1786722570.9269056,
+    "ast_hash": "c50b995e8bef52638bd64e769183df8f",
+    "semantic_hash": "c50b995e8bef52638bd64e769183df8f"
+  },
+  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\scripts\\test_price_drift_young_position.py": {
+    "mtime": 1787443049.4904523,
+    "ast_hash": "cae5500e0bbab6f37b5dfd5d4fa27ff8",
+    "semantic_hash": "cae5500e0bbab6f37b5dfd5d4fa27ff8"
+  },
+  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\scripts\\test_prior_traded_reentry.py": {
+    "mtime": 1787579410.6608646,
+    "ast_hash": "b3edef34ae37fb93b1938e9daa279591",
+    "semantic_hash": "b3edef34ae37fb93b1938e9daa279591"
+  },
+  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\scripts\\test_protect_positions_shorts.py": {
+    "mtime": 1787443082.4214983,
+    "ast_hash": "3eb6de939326ab29ed33055e18d48066",
+    "semantic_hash": "3eb6de939326ab29ed33055e18d48066"
+  },
+  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\scripts\\test_ratchet_done_reset.py": {
+    "mtime": 1787619996.0863688,
+    "ast_hash": "1fe6e9da070284c10ed20c9e6d73454c",
+    "semantic_hash": "1fe6e9da070284c10ed20c9e6d73454c"
+  },
+  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\scripts\\test_session_alias_live.py": {
+    "mtime": 1787079092.6935298,
+    "ast_hash": "88a0ebeca28d7f6317d839bd4f1d638f",
+    "semantic_hash": "88a0ebeca28d7f6317d839bd4f1d638f"
+  },
+  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\scripts\\test_share_rounding.py": {
+    "mtime": 1787082297.541087,
+    "ast_hash": "db25d4cc11c05a824c1eaf17a315d043",
+    "semantic_hash": "db25d4cc11c05a824c1eaf17a315d043"
+  },
+  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\scripts\\test_short_rejection_handling.py": {
+    "mtime": 1786417843.2570615,
+    "ast_hash": "87046b53c55c2c203dc025d769f321c6",
+    "semantic_hash": "87046b53c55c2c203dc025d769f321c6"
+  },
+  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\scripts\\test_stopped_out_close_price.py": {
+    "mtime": 1786975523.158101,
+    "ast_hash": "470a659aaaeded7d5d02c7b929d765e9",
+    "semantic_hash": "470a659aaaeded7d5d02c7b929d765e9"
+  },
+  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\scripts\\test_strategy_kelly_mult.py": {
+    "mtime": 1786844531.4055648,
+    "ast_hash": "415a3fe9ab35063bc1476c87f5afb5db",
+    "semantic_hash": "415a3fe9ab35063bc1476c87f5afb5db"
+  },
+  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\scripts\\test_strategy_scoreboard.py": {
+    "mtime": 1786826790.2944684,
+    "ast_hash": "6416241b9588856379168c71710803c8",
+    "semantic_hash": "6416241b9588856379168c71710803c8"
+  },
+  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\scripts\\test_strategy_toggles.py": {
+    "mtime": 1786824459.4442182,
+    "ast_hash": "f7f4a9155ddaaafcc15f9e1d5fbe2e1c",
+    "semantic_hash": "f7f4a9155ddaaafcc15f9e1d5fbe2e1c"
+  },
+  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\scripts\\test_swing_drift_stop.py": {
+    "mtime": 1786826918.8554485,
+    "ast_hash": "baa31bb28e082ad4f97c5b3ffd21e44e",
+    "semantic_hash": "baa31bb28e082ad4f97c5b3ffd21e44e"
+  },
+  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\scripts\\test_thin_liquidity_admit.py": {
+    "mtime": 1786976080.9467437,
+    "ast_hash": "8b8e7dc92178d5a2699b61786d37123b",
+    "semantic_hash": "8b8e7dc92178d5a2699b61786d37123b"
+  },
+  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\scripts\\test_thin_liquidity_eod_cutoff.py": {
+    "mtime": 1787083413.6706958,
+    "ast_hash": "a20ea0cf0993a51161f905bc12a20220",
+    "semantic_hash": "a20ea0cf0993a51161f905bc12a20220"
+  },
+  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\scripts\\test_thin_liquidity_excluded_strategies.py": {
+    "mtime": 1786826895.2537093,
+    "ast_hash": "3a997779652e8cd782a6d085bd77ae59",
+    "semantic_hash": "3a997779652e8cd782a6d085bd77ae59"
+  },
+  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\scripts\\touch_env_restart.ps1": {
+    "mtime": 1787622472.9823084,
+    "ast_hash": "10b8c461bd02d3daa35b370d369114de",
+    "semantic_hash": "10b8c461bd02d3daa35b370d369114de"
+  },
+  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\scripts\\update_ti_capture_schedule_4tier.ps1": {
+    "mtime": 1787853825.2110405,
+    "ast_hash": "0050d0ffd5a9152742e4c20a6421fcd9",
+    "semantic_hash": "0050d0ffd5a9152742e4c20a6421fcd9"
+  },
+  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\windows_schedule_strategy_scoreboard.ps1": {
+    "mtime": 1786826838.611863,
+    "ast_hash": "608bd955b1d8f78fbeca52a4e540eade",
+    "semantic_hash": "608bd955b1d8f78fbeca52a4e540eade"
+  },
+  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\graphify-out\\memory\\query_20260805_025812_why_does_get_bars_connect_nearly_every_strategy_an.md": {
+    "mtime": 1785898692.4419532,
+    "ast_hash": "3e509fc5f9b3e64ed6a9efeb8ed39e29",
+    "semantic_hash": "3e509fc5f9b3e64ed6a9efeb8ed39e29"
+  },
+  "C:\\Users\\BG\\OneDrive\\Returns-LSTM\\StockPricePrediction\\BitStrider-main\\pcg 30min.png": {
+    "mtime": 1787945549.156117,
+    "ast_hash": "a4c657e4e465256c21fe3f687d4f1edb",
+    "semantic_hash": "a4c657e4e465256c21fe3f687d4f1edb"
   }
 }

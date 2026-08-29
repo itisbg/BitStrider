@@ -31,6 +31,10 @@ import schedule
 import pytz
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
+def _execution_rank(signal: Signal) -> tuple:
+    """Keep default basket signals behind ordinary day-scan signals."""
+    return (signal.symbol in cfg.LOW_PRIORITY_SCAN_SYMBOLS, -signal.confidence)
+
 from . import config as cfg
 from .utils import (
     setup_logging,
@@ -434,7 +438,9 @@ def _execute_bear_plan(
     loss_pct: float,
 ) -> None:
     """Bear regime: attempt 1 swap-long then up to BEAR_SHORT_SIGNALS_CAP shorts."""
-    long_sigs         = [s for s in eligible if s.action == "buy"][:cfg.MAX_LONG_ENTRIES_PER_CYCLE]
+    long_sigs         = sorted(
+        [s for s in eligible if s.action == "buy"], key=_execution_rank,
+    )[:cfg.MAX_LONG_ENTRIES_PER_CYCLE]
     short_candidates  = [] if (cfg.LONG_ONLY_MODE or ctx.executor.shorting_blocked) else \
                         [s for s in eligible if s.action in ("sell", "short")]
     if cfg.LONG_ONLY_MODE and any(s.action in ("sell", "short") for s in eligible):
@@ -502,7 +508,7 @@ def _execute_bull_plan(
     never going to fill anyway. Mirrors the pattern _execute_bear_plan's
     short queue already used correctly (short_success counter, not a
     pre-slice)."""
-    ranked = sorted(eligible, key=lambda s: s.confidence, reverse=True)
+    ranked = sorted(eligible, key=_execution_rank)
     log.info(f"Executing up to {signals_cap} signal(s) from {len(ranked)} eligible (cap={signals_cap})")
     executed = 0
     long_executed = 0
@@ -1012,10 +1018,9 @@ def _tick(ctx: AppContext, last_ema15: float, last_pending: float) -> Tuple[floa
     2026-08-27, user request ("in the next 18secs before order executed
     the code should have cancelled the order"): check_pending_entries_ema
     now runs on its own PENDING_ENTRY_RECHECK_SEC (5s) timer, separate
-    from check_ema9_exit/check_blocked_entries_ema's
-    STAGNANT_STOP_CHECK_INTERVAL_MIN (1 min) -- see PENDING_ENTRY_RECHECK_SEC's
-    config.py comment for why (a resting trailing-buy order can fill in
-    under 20s; a 1-min-shared recheck never got a chance to catch it).
+    check_ema9_exit/check_blocked_entries_ema every poll as well as
+    check_pending_entries_ema. All entry/exit condition checks therefore use
+    the same ten-second cadence.
     Deliberately still the SAME thread/sequential execution as everything
     else here, not a second thread -- check_pending_entries_ema mutates
     order_cache/_pending_entry_signals/_ema_blocked_entries, the same
@@ -1059,35 +1064,24 @@ def _tick(ctx: AppContext, last_ema15: float, last_pending: float) -> Tuple[floa
         ctx.executor.detect_stopped_out_positions()
     except Exception as e:
         log.error(f"[STOP-THREAD] detect_stopped_out_positions error: {e}", exc_info=True)
-    if time.time() - last_ema15 >= cfg.STAGNANT_STOP_CHECK_INTERVAL_MIN * 60:
-        try:
-            # 2026-08-25, user request: "remove the ema15 delta check,
-            # only keep the ema3 and ema7 positive slope" -- the
-            # EMA15-based exit check (method, helpers, config
-            # constants, self-tests) was deleted outright, not just
-            # unwired. check_ema9_exit (EMA9 delta now, was EMA7) is
-            # the only per-minute exit check now.
-            ctx.executor.check_ema9_exit()
-        except Exception as e:
-            log.error(f"[STOP-THREAD] check_ema9_exit error: {e}", exc_info=True)
-        try:
-            # 2026-08-25, user request: "each blocked trade should wait
-            # for next minute recheck not to completely discard the
-            # order" -- see check_blocked_entries_ema.
-            ctx.executor.check_blocked_entries_ema()
-        except Exception as e:
-            log.error(f"[STOP-THREAD] check_blocked_entries_ema error: {e}", exc_info=True)
-        last_ema15 = time.time()
+    try:
+        ctx.executor.check_ema9_exit()
+    except Exception as e:
+        log.error(f"[STOP-THREAD] check_ema9_exit error: {e}", exc_info=True)
+    try:
+        ctx.executor.check_blocked_entries_ema()
+    except Exception as e:
+        log.error(f"[STOP-THREAD] check_blocked_entries_ema error: {e}", exc_info=True)
+    last_ema15 = time.time()
     return last_ema15, last_pending
 
 
 def _start_software_stop_thread(ctx: AppContext) -> None:
     """Spawn a daemon thread that polls _cover_naked_positions(),
     check_software_stops(), check_afterhours_stops(), _sweep_force_closes(),
-    _sweep_pending_entries(), and detect_stopped_out_positions() every 5
-    seconds, check_pending_entries_ema() every PENDING_ENTRY_RECHECK_SEC
-    (5s), and check_ema9_exit()/check_blocked_entries_ema() every
-    STAGNANT_STOP_CHECK_INTERVAL_MIN (1 min).
+    _sweep_pending_entries(), detect_stopped_out_positions(),
+    check_pending_entries_ema(), check_ema9_exit(), and
+    check_blocked_entries_ema() every ten seconds.
 
     2026-08-24, user request ("why do you say the cycle time increase" --
     it wasn't supposed to touch the EMA check at all): the per-minute EMA
@@ -1134,17 +1128,15 @@ def _start_software_stop_thread(ctx: AppContext) -> None:
             # because the process's own heartbeat.txt (written by the main
             # loop, a different thread) is unaffected by this one dying.
             _last_poller_tick = time.time()
-            # Keep the pending-order check on a fixed cadence. Sleeping a full
-            # five seconds after each tick adds the network/work duration to
-            # the interval and can turn a nominal 5s check into 10s+.
+            # Keep the poller on a fixed cadence. Sleep only for the remaining
+            # interval after network/work completes to avoid compounding delays.
             time.sleep(max(0.0, cfg.PENDING_ENTRY_RECHECK_SEC - (time.monotonic() - loop_started)))
 
     t = threading.Thread(target=_loop, name="SoftwareStopPoller", daemon=True)
     t.start()
     log.info(
-        f"[STOP-THREAD] Software-stop fast-poll thread started (5s interval, "
-        f"pending-entry EMA re-check every {cfg.PENDING_ENTRY_RECHECK_SEC}s, "
-        f"EMA9 exit + blocked-entry EMA re-check every 1 min)"
+        f"[STOP-THREAD] Software-stop poll thread started (10s interval, "
+        f"pending-entry/EMA exit/blocked-entry checks every {cfg.PENDING_ENTRY_RECHECK_SEC}s)"
     )
 
 
@@ -1635,8 +1627,7 @@ def _demo() -> None:
         def __init__(self):
             self.executor = _TickExecutor()
 
-    # Both timers "just fired" (0.0 sentinel -> always due on first tick,
-    # same convention _loop() itself uses) -> everything fires once.
+    # The first five-second poll runs every monitoring check.
     tctx = _TickCtx()
     last_ema15, last_pending = _tick(tctx, 0.0, 0.0)
     assert "pending_ema" in tctx.executor.calls, "pending-entry check must fire on a fresh/never-ticked timer"
@@ -1645,21 +1636,17 @@ def _demo() -> None:
     assert set(tctx.executor.calls) >= {"cover", "afterhours", "force_closes", "sweep_pending", "stopped_out"}, \
         "every-tick checks must always run regardless of either timer"
 
-    # Immediately after, pending is due again in PENDING_ENTRY_RECHECK_SEC
-    # (5s) while the 1-min timer is nowhere close -- this is the actual
-    # fix: pending must fire far more often than the other two.
+    # Every subsequent five-second poll runs the same monitoring checks.
     tctx.executor.calls.clear()
     last_ema15_2, last_pending_2 = _tick(tctx, last_ema15, time.time() - (cfg.PENDING_ENTRY_RECHECK_SEC + 1))
     assert "pending_ema" in tctx.executor.calls, "pending-entry check must fire again once its own 5s timer elapses"
-    assert "ema9_exit" not in tctx.executor.calls and "blocked_ema" not in tctx.executor.calls, \
-        "the 1-min checks must NOT fire again just because pending's independent timer did"
-    assert last_ema15_2 == last_ema15, "an untouched timer must be returned unchanged, not reset"
+    assert "ema9_exit" in tctx.executor.calls and "blocked_ema" in tctx.executor.calls, \
+        "EMA exit and blocked-entry checks must run on every five-second poll"
 
-    # And the reverse: pending NOT due, 1-min timer due -> only the 1-min
-    # checks fire, pending stays untouched.
+    # The monitoring checks remain active even when the pending timer is not due.
     tctx.executor.calls.clear()
     last_ema15_3, last_pending_3 = _tick(tctx, time.time() - (cfg.STAGNANT_STOP_CHECK_INTERVAL_MIN * 60 + 1), time.time())
-    assert "pending_ema" not in tctx.executor.calls, "pending-entry check must not fire before its own timer elapses"
+    assert "pending_ema" not in tctx.executor.calls, "pending-entry check must respect its five-second timer"
     assert "ema9_exit" in tctx.executor.calls and "blocked_ema" in tctx.executor.calls, \
         "the 1-min checks must fire once their own timer elapses, independent of pending's timer"
 

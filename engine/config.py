@@ -279,7 +279,7 @@ MAX_POSITIONS        = 12     # 7.5% × 12 = 90% of usable equity (within 10% BP
 # hardcoded 5. This is a watchlist/visibility breadth, not an execution cap:
 # _execute_bull_plan already ranks and tries every eligible signal, not just
 # the top 5/15, until MAX_POSITIONS-driven capacity fills.
-TOP_N_SIGNALS        = 15
+TOP_N_SIGNALS        = 60
 # When full, close the weakest position to make room if new signal conf > this threshold
 SWAP_ON_FULL         = True   # enabled — close weakest position for a better signal when full
 SWAP_MIN_CONFIDENCE  = 0.75   # Swap out weakest when new signal >= this confidence (was 0.85)
@@ -350,12 +350,11 @@ CONCENTRATION_CHECK_INTERVAL_MIN = 10
 # across every open position combined, independent of whatever margin the
 # broker would otherwise extend. MAX_POSITION_CONCENTRATION_PCT (20%) caps
 # one symbol; CORRELATION_GROUPS (25%) caps one correlated basket; this
-# caps the WHOLE book at once. Enforced two ways: at entry-sizing time
-# (_size_with_buying_power in enhanced.py won't size a new position past
-# the remaining headroom under the cap) and as a periodic backstop
-# (enforce_portfolio_leverage, same fixed clock-grid schedule as the other
-# concentration checks — see _concentration_check_job in orchestrator.py)
-# for a position that drifts over it through price appreciation alone.
+# caps the WHOLE book at once. It is enforced after fills by
+# enforce_portfolio_leverage (same fixed clock-grid schedule as the other
+# concentration checks — see _concentration_check_job in orchestrator.py).
+# Entry sizing uses broker buying power and the per-symbol cap; it does not
+# pre-throttle orders against this total-exposure limit.
 # ─────────────────────────────────────────────────────────────────
 MAX_PORTFOLIO_LEVERAGE = 1.5   # total open-position market value <= this x equity (2026-08-28, user request: 1.5x actual-position cap, independent of Alpaca's 4x order-placement margin)
 
@@ -641,6 +640,7 @@ STARTUP_TI_CAPTURE_TIMEOUT_S                     = int(__import__('os').getenv('
 # 30 signals together"): this is now the COMBINED cap on (Alpaca-movers queue
 # + TI primary), not TI alone — see get_scan_targets() in equity/scan.py.
 # Movers get priority; TI fills whatever's left, up to this shared ceiling.
+# Keep the active long/short universe broad enough to avoid idle capital.
 TI_PRIMARY_SCAN_BATCH_LIMIT                       = int(__import__('os').getenv('TI_PRIMARY_SCAN_BATCH_LIMIT', '30'))
 ACTIVE_SCAN_SNAPSHOT_INTERVAL_MIN                 = int(__import__('os').getenv('ACTIVE_SCAN_SNAPSHOT_INTERVAL_MIN', '10'))
 
@@ -859,7 +859,8 @@ STAGNANT_STOP_CHECK_INTERVAL_MIN  = 1
 # check_blocked_entries_ema stay on the original 1-min cadence, since
 # neither has this same "resting broker order could fill any second" risk
 # profile (see engine/orchestrator.py's _start_software_stop_thread).
-PENDING_ENTRY_RECHECK_SEC = 5
+PENDING_ENTRY_RECHECK_SEC = 10
+PROTECTION_LIMIT_REPLACE_AFTER_SEC = 10
 
 # ─────────────────────────────────────────────────────────────────
 # EMA Trend Alignment Filter -- 2026-08-22, user request: "ensure the trend
@@ -880,6 +881,8 @@ PENDING_ENTRY_RECHECK_SEC = 5
 # _check_ema_trend_alignment's own docstring for both current conditions.
 EMA_TREND_FILTER_ENABLED = True
 EMA_TREND_MIN_BARS       = 10  # need at least this many 1-min bars before trusting EMA7's slope
+EMA_ENTRY_CONFIRM_SEC    = 10  # minimum time between the two required EMA passes
+EMA_ENTRY_CONFIRM_CHECKS = 2
 
 # check_blocked_entries_ema -- 2026-08-25, user request: "each blocked
 # trade should wait for next minute recheck not to completely discard the
@@ -1030,7 +1033,7 @@ SHORT_FAIL_COOLDOWN_MIN = 5    # Re-try failed short symbols immediately
 # ranked watchlist it's drawn from. Still bounded above by MAX_POSITIONS (12
 # total open at once) and each attempt still has to individually pass
 # _validate_trade -- this only raises how many the cycle is willing to TRY.
-MAX_SIGNALS_PER_CYCLE = 15     # Execute at most this many signals per scan cycle
+MAX_SIGNALS_PER_CYCLE = 60     # Execute at most this many signals per scan cycle
 
 # Per-symbol HMM regime alignment: confidence bonus (not a gate) when a
 # signal's direction agrees with the symbol's own 2-state Gaussian HMM regime,
@@ -1475,10 +1478,14 @@ MOMENTUM_FRESHNESS_LOOKBACK_MIN     = 30   # minutes of recent bars to find the 
 MOMENTUM_FRESHNESS_MAX_PULLBACK_PCT = 5.0  # reject if price has faded more than this % off that high
 
 USE_MARKET_REGIME_FILTER = True       # SPY below 200-day MA → cut signals to 1
-MAX_LONG_ENTRIES_PER_CYCLE  = 8       # Maximum successful long entries attempted per scan cycle
-MAX_SHORT_ENTRIES_PER_CYCLE = 5       # Maximum successful short entries attempted per scan cycle
+MAX_LONG_ENTRIES_PER_CYCLE  = 12      # Maximum successful long entries attempted per scan cycle
+MAX_SHORT_ENTRIES_PER_CYCLE = 12      # Maximum successful short entries attempted per scan cycle
 MARKET_REGIME_SIGNALS_CAP   = MAX_LONG_ENTRIES_PER_CYCLE  # Bear-regime long cap (swap-only)
 BEAR_SHORT_SIGNALS_CAP      = MAX_SHORT_ENTRIES_PER_CYCLE
+LOW_PRIORITY_SCAN_SYMBOLS   = {
+    "QLD", "META", "AAPL", "AMZN", "NFLX", "GOOGL", "NVDA", "AMD",
+    "AVGO", "PLTR", "ORCL", "MSFT", "ARM", "SMCI", "MU", "TSM", "MRVL", "AI", "SPCX",
+}
 ATR_STOP_MULTIPLIER      = 1.5        # Stop loss = entry − ATR × 1.5
 ATR_TP_RATIO             = 2.0        # Take-profit at 2:1 R:R (risk × 2)
 MAX_SHORT_FLOAT_PCT      = 20.0       # Never exceed this % of equity per squeeze ticker

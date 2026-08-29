@@ -37,7 +37,7 @@ from engine.config import (
     MAX_POSITIONS,
     SWAP_ON_FULL,
     SWAP_MIN_CONFIDENCE,
-    POLLER_CHECK_WORKERS,
+    POLLER_CHECK_WORKERS, PROTECTION_LIMIT_REPLACE_AFTER_SEC,
     EXTENDED_HOURS,
     USE_DYNAMIC_TIERS,
     USE_RISK_EQUALIZED_SIZING,
@@ -52,6 +52,7 @@ from engine.config import (
     TRAIL_STOP_PCT, PROFIT_TRAIL_GIVEBACK_PCT,
     STAGNANT_STOP_ENABLED, STAGNANT_STOP_CHECK_INTERVAL_MIN, ENTRY_WINDOW_END_ET,
     EMA_TREND_FILTER_ENABLED, EMA_TREND_MIN_BARS, EMA9_TRAIL_PCT,
+    EMA_ENTRY_CONFIRM_SEC, EMA_ENTRY_CONFIRM_CHECKS,
     SWING_DRIFT_STOP_ENABLED, SWING_DRIFT_STOP_PCT,
     MIN_AVG_DAILY_VOLUME_REGULAR_HOURS, MIN_FLOAT_SHARES, MIN_MARKET_CAP,
     SWING_STALE_EXIT_ENABLED, SWING_STALE_DAYS, SWING_STALE_MIN_GAIN_PCT,
@@ -555,6 +556,7 @@ def _demo() -> None:
                 self._ratchet_done = set()
                 self._ema9_trail_peak = {}
                 self._last_known_positions = {}
+                self._loss_reentry_required = set()
 
             def _get_account(self, force_refresh=False):
                 return SimpleNamespace(equity=10000.0, buying_power=10000.0)
@@ -566,7 +568,7 @@ def _demo() -> None:
 
         ENTRY_WINDOW_END_ET = "23:59"  # never "past window" during this test run
         _get_scan_targets = lambda: ["FOO", "BAR"]  # FOO in top-30, BAZ is not
-        get_bars = lambda *a, **k: _pd.DataFrame({"close": [1.23]})
+        get_bars = lambda *a, **k: _pd.DataFrame({"close": [1.20, 1.22, 1.24]})
 
         rearm = EnhancedExecutor._maybe_rearm_reentry
         stopped_out = EnhancedExecutor.detect_stopped_out_positions
@@ -574,7 +576,7 @@ def _demo() -> None:
         # Case 1: gate agrees -> submits a real re-entry order.
         _check_ema_trend_alignment = lambda sig, is_long, force_fresh=False: (True, None)
         s = _ReentryStub()
-        rearm(s, "FOO", True, 10, "TEST")
+        rearm(s, "FOO", True, 10, "TEST", was_loss=True)
         assert len(s.client.submitted) == 1, "gate-ok must submit exactly one order"
         assert s.order_cache.get("FOO") == "fake-order-id", "must register the order in order_cache"
         assert "FOO" in s._no_rearm, "must self-mark _no_rearm so detect_stopped_out_positions doesn't double-process this close"
@@ -583,7 +585,7 @@ def _demo() -> None:
         # Case 2: gate disagrees -> queues for per-minute retry instead of giving up.
         _check_ema_trend_alignment = lambda sig, is_long, force_fresh=False: (False, "trend not aligned")
         s = _ReentryStub()
-        rearm(s, "FOO", True, 10, "TEST")
+        rearm(s, "FOO", True, 10, "TEST", was_loss=True)
         assert len(s.client.submitted) == 0, "gate-fail must not submit an order"
         assert "FOO" in s._no_rearm, "must still self-mark even on a failed immediate check"
         assert "FOO" in s._ema_blocked_entries, "gate-fail must queue into _ema_blocked_entries for per-minute retry"
@@ -612,7 +614,7 @@ def _demo() -> None:
         # _no_rearm from any closing path).
         _check_ema_trend_alignment = lambda sig, is_long, force_fresh=False: (True, None)
         s = _ReentryStub()
-        s._last_known_positions = {"FOO": {"entry_price": 1.0, "last_price": 1.0, "is_long": True, "qty": 10}}
+        s._last_known_positions = {"FOO": {"entry_price": 1.0, "last_price": 0.9, "is_long": True, "qty": 10}}
         stopped_out(s)
         assert len(s.client.submitted) == 1, "an unmarked disappeared position must be treated as a genuine stop and re-armed"
         assert s.order_cache.get("FOO") == "fake-order-id"
@@ -845,7 +847,7 @@ def _demo() -> None:
                 self.closed = []
             def _submit_closing_order(self, sym, qty, side, current):
                 self.closed.append(sym)
-            def _maybe_rearm_reentry(self, sym, is_long, qty, tag):
+            def _maybe_rearm_reentry(self, sym, is_long, qty, tag, was_loss=False):
                 pass
 
         import pandas as _pd
@@ -955,6 +957,7 @@ class EnhancedExecutor:
         self._account_cache:  Optional[AccountSnapshot] = None
         self._account_ttl:    float = 2.0   # tight TTL — buying power must be fresh between orders
         self._entry_submission_lock = threading.RLock()
+        self._ema_entry_confirmations: Dict[str, Tuple[int, float]] = {}
         self._htb_cache:      set   = set()   # hard-to-borrow symbols — skip shorts this session
         self._entry_log:   Dict[str, dict] = {}  # {symbol: {"strategy": str, "date": date}}
         self._swap_cycle_closed: set = set()     # positions already swapped this scan cycle
@@ -1022,6 +1025,10 @@ class EnhancedExecutor:
         # still deserved the trailing-buy treatment on the 2nd entry.
         self._entries_today: Dict[str, int] = {}
         self._entries_today_date: Optional[datetime.date] = None
+        # Symbols whose most recent completed trade was a loss.  This flag is
+        # consumed only after the next entry succeeds, so every re-entry route
+        # (including the five-second scan retry) shares the same 30m gate.
+        self._loss_reentry_required: set = set()
         # symbols confirmed to have zero prior broker fill history -- lets
         # _is_reentry_signal's broker fallback (_get_entry_datetime) skip the
         # round-trip on every future entry attempt for a genuinely new name.
@@ -1543,6 +1550,7 @@ class EnhancedExecutor:
         # _check_ema_trend_alignment for the reasoning.
         trend_ok, trend_reason = _check_ema_trend_alignment(signal, order_type == OrderType.LONG)
         if not trend_ok:
+            self._ema_entry_confirmations.pop(signal.symbol, None)
             # 2026-08-25, user request: "each blocked trade should wait for
             # next minute recheck not to completely discard the order" ->
             # "the trade idea should check for every minute conditions to
@@ -1558,6 +1566,22 @@ class EnhancedExecutor:
                 "queued_at": datetime.datetime.now(datetime.timezone.utc),
             }
             return False, trend_reason
+
+        now_mono = time.monotonic()
+        confirmations, last_check = self._ema_entry_confirmations.get(signal.symbol, (0, 0.0))
+        if confirmations == 0 or now_mono - last_check >= EMA_ENTRY_CONFIRM_SEC:
+            confirmations += 1
+            self._ema_entry_confirmations[signal.symbol] = (confirmations, now_mono)
+        if confirmations < EMA_ENTRY_CONFIRM_CHECKS:
+            self._ema_blocked_entries[signal.symbol] = {
+                "signal": signal, "order_type": order_type,
+                "queued_at": datetime.datetime.now(datetime.timezone.utc),
+            }
+            return False, (
+                f"{signal.symbol}: EMA alignment confirmation {confirmations}/"
+                f"{EMA_ENTRY_CONFIRM_CHECKS}; waiting for the next {EMA_ENTRY_CONFIRM_SEC}s check"
+            )
+        self._ema_entry_confirmations.pop(signal.symbol, None)
 
         # Asset tradability check: skip halted or suspended symbols
         try:
@@ -1693,24 +1717,15 @@ class EnhancedExecutor:
         desired up only sticks when a cap doesn't clamp it back down."""
         margin  = 2.0 if order_type == OrderType.SHORT else 1.0
         usable  = buying_power * (1.0 - MIN_BUYING_POWER_PCT / 100.0)
+        account_snapshot = self._account_cache or self._get_account()  # use cached if available
+        # New orders use broker buying power. The 1.5x portfolio cap is
+        # enforced only after fills by enforce_portfolio_leverage().
         desired = round(risk_info["dollar_amount"] / signal.price)
         max_bp  = int(usable / (signal.price * margin))
-
-        account_snapshot = self._account_cache or self._get_account()  # use cached if available
         max_concentration = int(account_snapshot.equity * MAX_POSITION_CONCENTRATION_PCT / 100.0 / signal.price)
 
-        # 2026-08-17, user request: originally capped TOTAL exposure at order-
-        # placement time too (independent of whatever margin buying_power
-        # would allow). 2026-08-28, user request ("max leverage check only
-        # for the positions actually entered not for the new orders"):
-        # removed that preemptive throttle -- orders now size against the
-        # broker's own margin (max_bp/max_concentration only), same as
-        # Alpaca's up-to-4x order-placement limit. MAX_PORTFOLIO_LEVERAGE
-        # (1.5x) is enforced purely reactively now, on actual filled
-        # positions only, by enforce_portfolio_leverage() -- which trims the
-        # largest positions AND cancels outstanding entry orders the moment
-        # actual exposure crosses the cap, rather than throttling every
-        # order below it preemptively.
+        # Broker buying power and the single-symbol concentration cap limit
+        # placement; total portfolio leverage is checked after fills.
         shares  = min(desired, max_bp, max_concentration)
 
         min_position = SMALL_ACCOUNT_MIN_POSITION_DOLLARS if account_snapshot.equity < SMALL_ACCOUNT_EQUITY_THRESHOLD else MIN_POSITION_DOLLARS
@@ -1857,13 +1872,24 @@ class EnhancedExecutor:
 
         # ── Step 1: Entry order (failure aborts the whole bracket) ──────────
         try:
-            entry_req = TrailingStopOrderRequest(
+            stop_price = round(
+                signal.price * (1 - TRAIL_STOP_PCT / 100) if is_long_entry
+                else signal.price * (1 + TRAIL_STOP_PCT / 100),
+                2,
+            )
+            take_profit = round(
+                signal.price * (1 + ATR_TP_RATIO * TRAIL_STOP_PCT / 100) if is_long_entry
+                else signal.price * (1 - ATR_TP_RATIO * TRAIL_STOP_PCT / 100),
+                2,
+            )
+            entry_req = MarketOrderRequest(
                 symbol          = signal.symbol,
                 qty             = shares,
                 side            = side,
-                type            = AlpacaOrderType.TRAILING_STOP,
                 time_in_force   = TimeInForce.DAY,
-                trail_percent   = REENTRY_TRAIL_PCT,
+                order_class     = OrderClass.BRACKET,
+                take_profit     = TakeProfitRequest(limit_price=take_profit),
+                stop_loss       = StopLossRequest(stop_price=stop_price),
                 client_order_id = f"apex-entry-{signal.strategy}-{signal.symbol}-{int(time.time())}",
             )
             order = self._submit_entry_order(signal.symbol, entry_req)
@@ -1872,16 +1898,13 @@ class EnhancedExecutor:
             self.order_cache[signal.symbol] = order.id
             self._pending_entry_signals[signal.symbol] = {"signal": signal, "order_type": order_type}
             log.info(
-                f"{signal.symbol}: {'re-entry' if is_reentry else 'entry'} -- trailing "
-                f"{'BUY' if is_long_entry else 'SELL'} {REENTRY_TRAIL_PCT:.1f}% instead of chasing in"
+                f"{signal.symbol}: {'re-entry' if is_reentry else 'entry'} -- market bracket "
+                f"{'BUY' if is_long_entry else 'SELL'} with fixed {TRAIL_STOP_PCT:.1f}% protection"
             )
             self._entries_today[signal.symbol] = self._entries_today.get(signal.symbol, 0) + 1
 
             # Store ATR-based TP target — checked each scan cycle by check_tp_targets()
-            if signal.atr_stop and signal.atr_stop > 0:
-                _sl, _tp = self._calculate_bracket_prices(signal, risk_info, order_type)
-                self._tp_targets[signal.symbol] = _tp
-                log.info(f"TP target set {signal.symbol}: ${_tp:.2f} (ATR R:R {ATR_TP_RATIO}:1)")
+            self._tp_targets[signal.symbol] = take_profit
 
         except Exception as e:
             err = str(e).lower()
@@ -1974,13 +1997,25 @@ class EnhancedExecutor:
 
         try:
             coid = f"apex-{signal.strategy}-{signal.symbol}-{int(time.time())}"
-            req = TrailingStopOrderRequest(
+            is_long_entry = order_type == OrderType.LONG
+            stop_price = round(
+                signal.price * (1 - TRAIL_STOP_PCT / 100) if is_long_entry
+                else signal.price * (1 + TRAIL_STOP_PCT / 100),
+                2,
+            )
+            take_profit = round(
+                signal.price * (1 + ATR_TP_RATIO * TRAIL_STOP_PCT / 100) if is_long_entry
+                else signal.price * (1 - ATR_TP_RATIO * TRAIL_STOP_PCT / 100),
+                2,
+            )
+            req = MarketOrderRequest(
                 symbol          = signal.symbol,
                 qty             = shares,
                 side            = side,
-                type            = AlpacaOrderType.TRAILING_STOP,
                 time_in_force   = TimeInForce.DAY,
-                trail_percent   = REENTRY_TRAIL_PCT,
+                order_class     = OrderClass.BRACKET,
+                take_profit     = TakeProfitRequest(limit_price=take_profit),
+                stop_loss       = StopLossRequest(stop_price=stop_price),
                 client_order_id = coid,
             )
             order = self._submit_entry_order(signal.symbol, req)
@@ -1990,8 +2025,7 @@ class EnhancedExecutor:
             self._pending_entry_signals[signal.symbol] = {"signal": signal, "order_type": order_type}
             log.info(
                 f"{action} {signal.symbol}: {shares} @ ${signal.price:.2f} -- trailing "
-                f"{'BUY' if order_type == OrderType.LONG else 'SELL'} {REENTRY_TRAIL_PCT:.1f}% "
-                f"instead of chasing in | {signal.strategy}"
+                f"market bracket with fixed {TRAIL_STOP_PCT:.1f}% protection | {signal.strategy}"
             )
             return True
 
@@ -2018,16 +2052,13 @@ class EnhancedExecutor:
 
         risk_info = calculate_risk_adjusted_size(acct.equity, signal.symbol, signal.price)
 
-        # Scale dollar_amount by confidence: 0.50× at floor (MIN_SIGNAL_CONFIDENCE) → 1.0× at 0.85+
-        from engine.config import MIN_SIGNAL_CONFIDENCE
-        _conf_floor = MIN_SIGNAL_CONFIDENCE
-        _conf_mult = CONF_SCALE_MIN_MULT + (1.0 - CONF_SCALE_MIN_MULT) * min(
-            1.0, max(0.0, (signal.confidence - _conf_floor) / (CONF_SCALE_FULL_CONF - _conf_floor))
-        )
-        risk_info = dict(risk_info, dollar_amount=round(risk_info["dollar_amount"] * _conf_mult, 2))
+        # Every signal reaching this point already passed the hard confidence
+        # and EMA gates. Do not halve its allocation at the confidence floor;
+        # use the full configured position target and let buying power,
+        # concentration, and actual-position leverage caps control exposure.
         log.debug(
             f"[SIZE] {signal.symbol} conf={signal.confidence:.0%} → "
-            f"scale={_conf_mult:.2f}× → ${risk_info['dollar_amount']:,.0f}"
+            f"scale=1.00x → ${risk_info['dollar_amount']:,.0f}"
         )
 
         _pre_bonus_pct = risk_info["allocation_pct"]
@@ -2136,7 +2167,16 @@ class EnhancedExecutor:
             if signal.action == "buy":
                 if positions.has_position(signal.symbol) and positions.is_short(signal.symbol):
                     return self._close_short_position(signal, acct.equity)
-                return self._execute_entry(signal, acct, OrderType.LONG, swap_only=swap_only)
+                order_type = OrderType.LONG
+                if signal.symbol in getattr(self, "_loss_reentry_required", set()):
+                    ok, reason = EnhancedExecutor._check_30m_reentry_performance(signal.symbol, True)
+                    if not ok:
+                        log.info(f"Skip {signal.symbol}: {reason} — loss re-entry 30m gate")
+                        return False
+                result = self._execute_entry(signal, acct, order_type, swap_only=swap_only)
+                if result:
+                    getattr(self, "_loss_reentry_required", set()).discard(signal.symbol)
+                return result
 
             elif signal.action in ("sell", "short"):
                 if LONG_ONLY_MODE:
@@ -2152,7 +2192,16 @@ class EnhancedExecutor:
 
                 if positions.has_position(signal.symbol) and positions.is_long(signal.symbol):
                     return self._close_long_position(signal, acct.equity)
-                return self._execute_entry(signal, acct, OrderType.SHORT, swap_only=swap_only)
+                order_type = OrderType.SHORT
+                if signal.symbol in getattr(self, "_loss_reentry_required", set()):
+                    ok, reason = EnhancedExecutor._check_30m_reentry_performance(signal.symbol, False)
+                    if not ok:
+                        log.info(f"Skip {signal.symbol}: {reason} — loss re-entry 30m gate")
+                        return False
+                result = self._execute_entry(signal, acct, order_type, swap_only=swap_only)
+                if result:
+                    getattr(self, "_loss_reentry_required", set()).discard(signal.symbol)
+                return result
 
         except Exception as e:
             log.error(f"Execute error {signal.symbol}: {e}")
@@ -2498,7 +2547,6 @@ class EnhancedExecutor:
         try:
             positions   = self.client.get_all_positions()
             open_orders = self.client.get_orders()
-            covered     = {o.symbol for o in open_orders}
         except Exception as e:
             log.warning(f"_cover_naked_positions: fetch failed: {e}")
             return
@@ -2506,19 +2554,87 @@ class EnhancedExecutor:
             sym = pos.symbol
             if re.match(r'^[A-Z]+\d{6}[CP]\d{8}$', sym):
                 continue  # options legs — managed separately
-            if sym in covered or sym in self._pdt_stop_blocked:
+            if sym in self._pdt_stop_blocked:
                 continue
             try:
                 qty = int(float(pos.qty))
                 if qty == 0:
                     continue
                 is_long_pos = qty > 0
-                stop_pct    = _trail_pct_for(sym, float(pos.current_price), self._entry_log)[0]
+                stop_pct    = TRAIL_STOP_PCT
+                position_side = OrderSide.SELL if is_long_pos else OrderSide.BUY
+                symbol_orders = [o for o in open_orders if o.symbol == sym]
+                trailing_stops = []
+                for order in symbol_orders:
+                    raw_type = getattr(order, "order_type", "")
+                    order_type = str(getattr(raw_type, "value", raw_type)).lower()
+                    raw_side = getattr(order, "side", "")
+                    order_side = str(getattr(raw_side, "value", raw_side)).lower()
+                    tif = getattr(order, "time_in_force", None)
+                    expected_side = "sell" if is_long_pos else "buy"
+                    if tif == TimeInForce.DAY and order_side == expected_side and "limit" in order_type:
+                        submitted_at = getattr(order, "submitted_at", None) or getattr(order, "created_at", None)
+                        if submitted_at is not None:
+                            if submitted_at.tzinfo is None:
+                                submitted_at = submitted_at.replace(tzinfo=datetime.timezone.utc)
+                            age_seconds = (datetime.datetime.now(datetime.timezone.utc) - submitted_at).total_seconds()
+                        else:
+                            age_seconds = 0.0
+                        if age_seconds >= PROTECTION_LIMIT_REPLACE_AFTER_SEC:
+                            try:
+                                self.client.cancel_order_by_id(str(order.id))
+                                time.sleep(0.4)
+                                log.warning(
+                                    f"PROTECT {sym}: converted DAY limit exit {order.id} "
+                                    f"to fixed {stop_pct:.1f}% GTC trailing stop after {age_seconds:.0f}s"
+                                )
+                            except Exception as cancel_err:
+                                log.warning(f"PROTECT {sym}: limit-exit conversion failed for {order.id}: {cancel_err}")
+                        continue
+                    if tif != TimeInForce.GTC:
+                        continue
+                    if order_side != expected_side:
+                        continue
+                    if "trailing_stop" in order_type:
+                        current_trail = getattr(order, "trail_percent", None)
+                        try:
+                            current_trail = float(current_trail) if current_trail is not None else None
+                        except (TypeError, ValueError):
+                            current_trail = None
+                        if current_trail is not None and abs(current_trail - stop_pct) < 1e-9:
+                            trailing_stops.append(order)
+                        else:
+                            try:
+                                self.client.cancel_order_by_id(str(order.id))
+                                time.sleep(0.2)
+                                log.warning(
+                                    f"PROTECT {sym}: replaced trailing exit {order.id} "
+                                    f"({current_trail}%) with fixed {stop_pct:.1f}%"
+                                )
+                            except Exception as cancel_err:
+                                log.warning(f"PROTECT {sym}: wrong-trail cancel failed for {order.id}: {cancel_err}")
+                    else:
+                        try:
+                            self.client.cancel_order_by_id(str(order.id))
+                            time.sleep(0.2)
+                            log.warning(f"PROTECT {sym}: cancelled stale {order_type} exit order {order.id}")
+                        except Exception as cancel_err:
+                            log.warning(f"PROTECT {sym}: could not cancel stale exit order {order.id}: {cancel_err}")
+
+                if trailing_stops:
+                    # Keep one fixed 1.5% protection order and remove duplicates.
+                    for duplicate in trailing_stops[1:]:
+                        try:
+                            self.client.cancel_order_by_id(str(duplicate.id))
+                        except Exception as cancel_err:
+                            log.warning(f"PROTECT {sym}: duplicate trailing-stop cancel failed: {cancel_err}")
+                    continue
+
                 try:
                     self.client.submit_order(TrailingStopOrderRequest(
                         symbol        = sym,
                         qty           = abs(qty),
-                        side          = OrderSide.SELL if is_long_pos else OrderSide.BUY,
+                        side          = position_side,
                         type          = AlpacaOrderType.TRAILING_STOP,
                         time_in_force = TimeInForce.GTC,
                         trail_percent = stop_pct,
@@ -2572,7 +2688,10 @@ class EnhancedExecutor:
                             f"SOFTWARE SL HIT {sym}: price ${current:.2f} crossed stop ${stop_price:.2f} — "
                             f"{'SELL' if is_long else 'BUY-TO-COVER'} submitted"
                         )
-                        self._maybe_rearm_reentry(sym, is_long, abs(qty), "SOFTWARE SL")
+                        self._maybe_rearm_reentry(
+                            sym, is_long, abs(qty), "SOFTWARE SL",
+                            was_loss=(current - float(pos.avg_entry_price)) * qty < 0,
+                        )
                     except Exception as close_err:
                         if "40310100" in str(close_err):
                             # Broker PDT also blocks same-day close — position is a forced
@@ -2671,7 +2790,10 @@ class EnhancedExecutor:
             qty = last.get("qty")
             if not qty:
                 continue  # no qty on record (pre-upgrade snapshot) — skip rather than guess
-            self._maybe_rearm_reentry(sym, last["is_long"], qty, "STOPPED OUT")
+            signed_pnl = (last["last_price"] - last["entry_price"]) * qty * (1 if last["is_long"] else -1)
+            self._maybe_rearm_reentry(
+                sym, last["is_long"], qty, "STOPPED OUT", was_loss=signed_pnl < 0,
+            )
 
         self._last_known_positions = current
 
@@ -2785,7 +2907,10 @@ class EnhancedExecutor:
                     if chase_n == 0:
                         # Only on the first attempt for this breach -- a re-chase
                         # (chase_n > 0) is retrying the SAME close, not a new one.
-                        self._maybe_rearm_reentry(sym, is_long, abs(qty), "AFTER-HOURS SL")
+                        self._maybe_rearm_reentry(
+                            sym, is_long, abs(qty), "AFTER-HOURS SL",
+                            was_loss=_pnl < 0,
+                        )
                 except Exception as close_err:
                     log.error(f"AFTER-HOURS SL {sym}: close order failed after GTC cancel: {close_err}")
                     # GTC is gone and the replacement didn't go through — without
@@ -2995,9 +3120,16 @@ class EnhancedExecutor:
             return
 
         excess = total_value - cap_value
-        # Trim largest positions first — fewest orders, biggest single
-        # contributor to the breach comes down fastest.
-        for pos in sorted(equity_positions, key=lambda p: abs(float(p.market_value)), reverse=True):
+        def _exit_priority(pos):
+            """Prefer losing positions, then older flat positions."""
+            gain_pct = float(getattr(pos, "unrealized_plpc", 0.0))
+            entry_date = self._entry_log.get(pos.symbol, {}).get("date")
+            age_days = (datetime.date.today() - entry_date).days if entry_date else 0
+            return (gain_pct >= 0, gain_pct if gain_pct < 0 else 0.0, -age_days, -abs(float(pos.market_value)))
+
+        # Reduce exposure in order: losers first, then older non-gainers,
+        # then profitable positions only if the breach remains.
+        for pos in sorted(equity_positions, key=_exit_priority):
             if excess <= 0:
                 break
             sym = pos.symbol
@@ -3564,20 +3696,27 @@ class EnhancedExecutor:
                     if ceiling_age_s < FADED_ENTRY_CEILING_TIMEOUT_SECONDS:
                         fresh_limit = min(fresh_limit, ceiling) if is_long else max(fresh_limit, ceiling)
 
-                req = LimitOrderRequest(
-                    symbol=sym, qty=remaining, side=side, time_in_force=TimeInForce.DAY,
-                    limit_price=fresh_limit,
-                    client_order_id=f"apex-rechase-{sym}-{int(time.time())}",
+                # Legacy pending-limit entries are converted to the same
+                # trailing entry used by every current entry path. This keeps
+                # the poller from recreating a limit order after cancellation.
+                req = TrailingStopOrderRequest(
+                    symbol=sym, qty=remaining, side=side,
+                    type=AlpacaOrderType.TRAILING_STOP,
+                    time_in_force=TimeInForce.DAY,
+                    trail_percent=REENTRY_TRAIL_PCT,
+                    client_order_id=f"apex-reentry-trail-{sym}-{int(time.time())}",
                 )
-                new_order = self.client.submit_order(req)
+                new_order = self._submit_entry_order(sym, req)
+                if new_order is None:
+                    raise RuntimeError(f"duplicate entry blocked for {sym}")
                 self.order_cache[sym] = new_order.id
                 info["order_id"] = str(new_order.id)
                 info["qty"] = remaining
                 info["chase_count"] = chase_n + 1
                 log.warning(
                     f"ENTRY RE-CHASE {sym}: unfilled after prior attempt "
-                    f"— resubmitted {remaining} @ ${fresh_limit:.2f} ({slip_pct:.1f}% off mid, attempt {chase_n + 1})"
-                    + (f" [capped @ ${ceiling:.2f}]" if ceiling is not None and ceiling_age_s < FADED_ENTRY_CEILING_TIMEOUT_SECONDS else "")
+                    f"— converted to {remaining}-share {REENTRY_TRAIL_PCT:.2f}% trailing entry "
+                    f"(attempt {chase_n + 1})"
                 )
             except Exception as e:
                 log.error(f"_sweep_pending_entries {sym}: re-chase failed: {e}")
@@ -4094,7 +4233,10 @@ class EnhancedExecutor:
             try:
                 self._submit_closing_order(sym, abs(qty), side, current)
                 log.warning(f"PRICE DRIFT STOP {sym}: {abs(qty)} shares | {reason}")
-                self._maybe_rearm_reentry(sym, is_long, abs(qty), "PRICE DRIFT STOP")
+                self._maybe_rearm_reentry(
+                    sym, is_long, abs(qty), "PRICE DRIFT STOP",
+                    was_loss=(current - entry) * qty < 0,
+                )
             except Exception as e:
                 log.error(f"PRICE DRIFT STOP {sym}: close failed: {e}")
                 # The resting GTC was just cancelled above — re-arm a fallback
@@ -4162,7 +4304,61 @@ class EnhancedExecutor:
             f"{'peak' if is_long else 'trough'} ${peak:.2f} since entry — trailing EMA9 stop hit"
         )
 
-    def _maybe_rearm_reentry(self, sym: str, is_long: bool, qty: int, tag: str) -> None:
+    @staticmethod
+    def _ema7_ema15_reversal_reason(ema7_now: float, ema15_now: float, is_long: bool) -> Optional[str]:
+        """Exit when EMA7 moves to the wrong side of EMA15."""
+        reversed_trend = ema7_now < ema15_now if is_long else ema7_now > ema15_now
+        if not reversed_trend:
+            return None
+        return (
+            f"EMA7 ${ema7_now:.2f} {'below' if is_long else 'above'} "
+            f"EMA15 ${ema15_now:.2f} — EMA trend reversed against the "
+            f"{'long' if is_long else 'short'} position"
+        )
+
+    @staticmethod
+    def _check_30m_reentry_performance(symbol: str, is_long: bool) -> Tuple[bool, str]:
+        """Require completed 30-minute performance to agree with re-entry."""
+        try:
+            bars = get_bars(symbol, "5d", "30m", bypass_cache=True)
+            if bars.empty or "close" not in bars.columns or len(bars) < 3:
+                return False, f"{symbol}: 30m performance unavailable"
+            completed = bars
+            if "time" in bars.columns:
+                now_utc = datetime.datetime.now(datetime.timezone.utc)
+                bar_times = bars["time"]
+                completed = bars[
+                    bar_times.apply(
+                        lambda value: value + datetime.timedelta(minutes=30) <= now_utc
+                        if getattr(value, "tzinfo", None) is not None
+                        else False
+                    )
+                ]
+            if len(completed) < 3:
+                return False, f"{symbol}: fewer than 3 completed 30m bars"
+            closes = completed["close"]
+            ema7 = closes.ewm(span=7, adjust=False).mean()
+            ema15 = closes.ewm(span=15, adjust=False).mean()
+            move = float(closes.iloc[-1] - closes.iloc[-2])
+            ema7_delta = float(ema7.iloc[-1] - ema7.iloc[-2])
+            aligned = (
+                move > 0 and ema7_delta > 0 and ema7.iloc[-1] > ema15.iloc[-1]
+                if is_long else
+                move < 0 and ema7_delta < 0 and ema7.iloc[-1] < ema15.iloc[-1]
+            )
+            if not aligned:
+                return False, (
+                    f"{symbol}: 30m move {move:+.2f}, EMA7 delta {ema7_delta:+.2f}, "
+                    f"EMA7 {ema7.iloc[-1]:.2f} vs EMA15 {ema15.iloc[-1]:.2f} "
+                    f"not aligned for {'long' if is_long else 'short'} re-entry"
+                )
+            return True, ""
+        except Exception as exc:
+            return False, f"{symbol}: 30m performance check failed: {exc}"
+
+    def _maybe_rearm_reentry(
+        self, sym: str, is_long: bool, qty: int, tag: str, was_loss: bool = False,
+    ) -> None:
         """After a STOP-LOSS-type close, re-check the same entry gate a fresh
         signal would need and re-arm a trailing re-entry if it currently
         passes. Extracted 2026-08-26 (was inline in check_ema9_exit only,
@@ -4227,6 +4423,10 @@ class EnhancedExecutor:
         exit would submit a second, orphaned trailing-buy re-entry order).
         """
         self._no_rearm.add(sym)
+        if was_loss:
+            getattr(self, "_loss_reentry_required", set()).add(sym)
+        else:
+            getattr(self, "_loss_reentry_required", set()).discard(sym)
         try:
             import pytz as _pytz
             _now_et = datetime.datetime.now(_pytz.timezone("America/New_York"))
@@ -4245,6 +4445,11 @@ class EnhancedExecutor:
             if sym not in _get_scan_targets():
                 log.info(f"{tag} {sym}: no longer in the top-30 scan universe — not re-arming a re-entry")
                 return
+            if was_loss:
+                performance_ok, performance_reason = EnhancedExecutor._check_30m_reentry_performance(sym, is_long)
+                if not performance_ok:
+                    log.info(f"{tag} {sym}: {performance_reason} — not re-arming after loss/reversal")
+                    return
             sig_stub = SimpleNamespace(symbol=sym)
             gate_ok, gate_reason = _check_ema_trend_alignment(sig_stub, is_long, force_fresh=True)
             if not gate_ok:
@@ -4385,10 +4590,14 @@ class EnhancedExecutor:
                 continue
             if current <= 0:
                 continue
-            eligible.append((sym, qty, current, qty > 0))
+            try:
+                entry = float(getattr(pos, "avg_entry_price", current))
+            except (TypeError, ValueError):
+                continue
+            eligible.append((sym, qty, current, qty > 0, entry))
 
         def _fetch_and_decide(item):
-            sym, qty, current, is_long = item
+            sym, qty, current, is_long, entry = item
             # 2026-08-27, user request ("it should have canceled the order"):
             # bypass_cache=True -- this is the actual per-minute stop-loss
             # trigger, not just a gate check; it must never read a snapshot
@@ -4399,9 +4608,15 @@ class EnhancedExecutor:
             bars = get_bars(sym, period="1d", interval="1m", bypass_cache=True)
             if bars.empty or "close" not in bars.columns or len(bars) < EMA_TREND_MIN_BARS:
                 return item, None  # not enough data -- never force a decision on it
-            ema9_now = float(bars["close"].ewm(span=9, adjust=False).mean().iloc[-1])
-            peak = self._update_ema9_peak(self._ema9_trail_peak, sym, ema9_now, is_long)
-            reason = self._ema9_trail_exit_reason(ema9_now, peak, is_long)
+            closes = bars["close"]
+            ema7_now = float(closes.ewm(span=7, adjust=False).mean().iloc[-1])
+            ema15_now = float(closes.ewm(span=15, adjust=False).mean().iloc[-1])
+            reversal_reason = EnhancedExecutor._ema7_ema15_reversal_reason(ema7_now, ema15_now, is_long)
+            if reversal_reason is not None:
+                return item, reversal_reason
+            ema9_now = float(closes.ewm(span=9, adjust=False).mean().iloc[-1])
+            peak = EnhancedExecutor._update_ema9_peak(self._ema9_trail_peak, sym, ema9_now, is_long)
+            reason = EnhancedExecutor._ema9_trail_exit_reason(ema9_now, peak, is_long)
             return item, reason
 
         to_exit = []  # (item, reason)
@@ -4416,7 +4631,7 @@ class EnhancedExecutor:
                     except Exception as e:
                         log.warning(f"check_ema9_exit: fetch/decide failed for one position, skipping this poll: {e}")
 
-        for (sym, qty, current, is_long), reason in to_exit:
+        for (sym, qty, current, is_long, entry), reason in to_exit:
             # Cancel any resting order (the deferred GTC trailing stop, most
             # commonly) before closing -- the broker won't accept a second
             # order against qty that's already reserved by one.
@@ -4437,7 +4652,10 @@ class EnhancedExecutor:
             try:
                 self._submit_closing_order(sym, abs(qty), side, current)
                 log.warning(f"EMA9 EXIT {sym}: {abs(qty)} shares | {reason}")
-                self._maybe_rearm_reentry(sym, is_long, abs(qty), "EMA9 EXIT")
+                self._maybe_rearm_reentry(
+                    sym, is_long, abs(qty), "EMA9 EXIT",
+                    was_loss=(current - entry) * qty < 0,
+                )
             except Exception as e:
                 log.error(f"EMA9 EXIT {sym}: close failed: {e}")
                 # The resting GTC was just cancelled above — re-arm a fallback
@@ -4717,8 +4935,15 @@ class EnhancedExecutor:
                 # signal blocked purely on the EMA gate still gets the
                 # normal PDT check.
                 is_long = order_type == OrderType.LONG
+                if sym in getattr(self, "_loss_reentry_required", set()):
+                    performance_ok, performance_reason = EnhancedExecutor._check_30m_reentry_performance(sym, is_long)
+                    if not performance_ok:
+                        log.info(f"BLOCKED ENTRY {sym}: {performance_reason} — loss re-entry 30m gate")
+                        self._ema_blocked_entries[sym] = info
+                        continue
                 bypass_pdt = self._is_reentry_signal(sym, is_long)
                 if self._execute_entry(signal, acct, order_type, bypass_pdt=bypass_pdt):
+                    getattr(self, "_loss_reentry_required", set()).discard(sym)
                     log.info(f"BLOCKED ENTRY RE-FIRED {sym}: EMA condition realigned")
             except Exception as e:
                 log.warning(f"check_blocked_entries_ema {sym}: retry failed: {e}")

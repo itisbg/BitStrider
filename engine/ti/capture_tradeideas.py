@@ -1246,8 +1246,14 @@ def scrape_tradeideas(
             time.sleep(RENDER_GRACE_SEC)
 
             if not _ensure_logged_in(driver):
-                print(f"[WARN ] {scan_key}: still on TI login page — skipping")
-                continue
+                # 2026-08-28, user request: don't contribute zero tickers for
+                # this cycle just because the login wall couldn't be cleared --
+                # scrape whatever's visible on the page anonymously (TI's free
+                # tier / teaser view) as a degraded fallback instead of nothing.
+                # _extract_tickers naturally returns [] if there's truly no
+                # ticker data on a bare login page, which flows through the
+                # existing empty-list handling below same as any thin scrape.
+                print(f"[WARN ] {scan_key}: still on TI login page — scraping anonymous/free view instead of skipping")
 
             if scan_key == "toplists":
                 local_select_minutes = 15 if select_minutes is None else select_minutes
@@ -1268,6 +1274,39 @@ def scrape_tradeideas(
                         time.sleep(DROPDOWN_REFRESH_SEC)
 
                 tickers = _extract_tickers(driver)
+
+                # 2026-08-28, user report: a thin/empty scrape can happen with
+                # NO password field and NO interstitial visible -- _ensure_logged_in
+                # only catches an actually-expired session, not a stale/cached page
+                # that rendered fine but with no real data (soft-cache, half-loaded
+                # heatmap, etc.). One hard reload + re-check catches that case too,
+                # instead of silently accepting a near-empty scrape.
+                if len(tickers) < _MIN_SCRAPE_TICKERS:
+                    print(f"[WARN ] {scan_key}: only {len(tickers)} ticker(s) — reloading page and retrying once")
+                    try:
+                        driver.get(url)
+                        for sel in ["body", "div"]:
+                            try:
+                                WebDriverWait(driver, TABLE_WAIT_SEC).until(
+                                    EC.presence_of_element_located((By.CSS_SELECTOR, sel))
+                                )
+                                break
+                            except Exception:
+                                continue
+                        time.sleep(RENDER_GRACE_SEC)
+                        if _ensure_logged_in(driver):
+                            if select_minutes is not None:
+                                _try_select_timeframe(driver, select_minutes)
+                                time.sleep(DROPDOWN_REFRESH_SEC)
+                            retried = _extract_tickers(driver)
+                            if len(retried) > len(tickers):
+                                print(f"[OK   ] {scan_key}: retry recovered {len(retried)} ticker(s)")
+                                tickers = retried
+                        else:
+                            print(f"[WARN ] {scan_key}: still on TI login page after reload — keeping anonymous/free view")
+                    except Exception as e:
+                        print(f"[WARN ] {scan_key}: reload retry failed ({e}) — keeping original {len(tickers)}-ticker scrape")
+
                 results[scan_key] = tickers
             print(f"[OK   ] {scan_key}: {len(tickers)} tickers — {tickers[:10]}{'…' if len(tickers)>10 else ''}")
 

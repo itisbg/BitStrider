@@ -1,6 +1,14 @@
 # Adaptive equity allocation based on pre-intelligence (market regime, signal quality, or pre-market indicators)
+from typing import Optional, Union
+
 from engine.utils import MarketState
-def get_adaptive_equity_allocation(market_state: MarketState, avg_signal_conf: float = None, premarket_strength: float = None) -> float:
+
+
+def get_adaptive_equity_allocation(
+    market_state: MarketState,
+    avg_signal_conf: Optional[float] = None,
+    premarket_strength: Optional[float] = None,
+) -> float:
     """
     Returns adaptive position size percentage for equities based on pre-intelligence.
     - In strong bull regime or high signal confidence, increase allocation.
@@ -36,7 +44,7 @@ import time
 from pathlib import Path
 import pytz
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Dict, Tuple, Set, Optional
+from typing import List, Dict, Tuple, Set, Optional, Union
 
 from engine import config as _cfg
 from engine.config import (
@@ -71,6 +79,7 @@ _log = logging.getLogger("ApexTrader")
 _ACTIVE_SCAN_FILE = Path(__file__).resolve().parents[2] / "data" / "ti_primary_active.json"
 _ACTIVE_LONGS_FILE = Path(__file__).resolve().parents[2] / "data" / "ti_primary_active_longs.json"
 _ACTIVE_SHORTS_FILE = Path(__file__).resolve().parents[2] / "data" / "ti_primary_active_shorts.json"
+_DEFAULT_SCAN_SYMBOLS = set(_cfg.LOW_PRIORITY_SCAN_SYMBOLS)
 _active_scan_write_lock = threading.Lock()
 _last_active_scan_write = 0.0
 _last_directional_write = 0.0
@@ -104,7 +113,7 @@ def _write_active_scan_list(tickers: List[str]) -> bool:
 
 
 def _write_active_directional_lists(tickers: List[str]) -> None:
-    """Write the active Yahoo gainers/losers split for selected tickers."""
+    """Write direction lists, switching sides on the 09:30 open after 10 ET."""
     try:
         from engine.ti.yahoo_universe import fetch_long_short_candidates
         gainers, losers = fetch_long_short_candidates()
@@ -117,9 +126,71 @@ def _write_active_directional_lists(tickers: List[str]) -> None:
         long_symbols = set(_get_tier_live(1))
         short_symbols = set(_get_tier_live(2))
     mover_symbols = set(_get_alpaca_movers_queue())
-    longs = [s for s in tickers if s in long_symbols]
-    longs.extend(s for s in tickers if s in mover_symbols and s not in short_symbols and s not in longs)
-    shorts = [s for s in tickers if s in short_symbols and s not in long_symbols]
+    now_et = datetime.datetime.now(_ET)
+    after_open_confirmation = (now_et.hour > 10) or (now_et.hour == 10 and now_et.minute >= 0)
+
+    def _day_direction(symbol: str) -> Optional[bool]:
+        try:
+            bars = get_bars(symbol, "1d", "1m")
+            if bars.empty or "open" not in bars.columns or "close" not in bars.columns:
+                return None
+            if not after_open_confirmation:
+                return None
+            current_price = float(bars["close"].iloc[-1])
+            if current_price <= 0:
+                return None
+            open_price = None
+            if "time" in bars.columns:
+                session_open = bars[bars["time"].dt.strftime("%H:%M") >= "09:30"]
+                if not session_open.empty:
+                    open_price = float(session_open["open"].iloc[0])
+            if open_price is None or open_price <= 0:
+                return None
+            if current_price > open_price:
+                return True
+            if current_price < open_price:
+                return False
+            return None
+        except Exception as e:
+            _log.debug(f"[SIGNALS] {symbol}: day-direction check failed: {e}")
+            return None
+
+    if after_open_confirmation:
+        directions = {symbol: _day_direction(symbol) for symbol in tickers}
+        longs = [s for s in tickers if directions[s] is True or s in _DEFAULT_SCAN_SYMBOLS]
+        shorts = [s for s in tickers if directions[s] is False or s in _DEFAULT_SCAN_SYMBOLS]
+    else:
+        longs = [s for s in tickers if s in long_symbols or s in mover_symbols or s in _DEFAULT_SCAN_SYMBOLS]
+        shorts = [s for s in tickers if s in short_symbols or s in mover_symbols or s in _DEFAULT_SCAN_SYMBOLS]
+
+    longs = list(dict.fromkeys(longs))
+    shorts = list(dict.fromkeys(shorts))
+
+    # Ensure the active long/short books stay populated from the merged Yahoo +
+    # Alpaca movers universe instead of collapsing to a tiny list when a few
+    # symbols are rejected at the edges. Preserve the original merged ordering
+    # while backfilling each side up to 30 names.
+    merged_order = list(dict.fromkeys(tickers + list(long_symbols | short_symbols | mover_symbols)))
+    for symbol in merged_order:
+        if len(longs) >= 30 and len(shorts) >= 30:
+            break
+        if symbol in _DEFAULT_SCAN_SYMBOLS:
+            continue
+        if len(longs) < 30 and symbol in long_symbols:
+            if symbol not in longs:
+                longs.append(symbol)
+        if len(shorts) < 30 and symbol in short_symbols:
+            if symbol not in shorts:
+                shorts.append(symbol)
+        if len(longs) < 30 and symbol in mover_symbols and symbol in long_symbols:
+            if symbol not in longs:
+                longs.append(symbol)
+        if len(shorts) < 30 and symbol in mover_symbols and symbol in short_symbols:
+            if symbol not in shorts:
+                shorts.append(symbol)
+
+    longs = longs[:30]
+    shorts = shorts[:30]
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
     try:
         directional = {
@@ -167,20 +238,46 @@ def _write_directional_signal_lists(signals: list) -> None:
                 "reason": signal.reason,
             }
 
+        def _default_record(symbol, action):
+            return {
+                "symbol": symbol,
+                "action": action,
+                "priority": "low",
+                "reason": "default candidate; normal strategy and EMA checks required",
+            }
+
         for path, selected, direction in payloads:
+            default_records = [
+                _default_record(symbol, "buy" if direction == "longs" else "short")
+                for symbol in sorted(_DEFAULT_SCAN_SYMBOLS)
+                if symbol not in {signal.symbol for signal in selected}
+            ]
+            records = [_record(signal) for signal in selected] + default_records
             path.write_text(
                 json.dumps({
                     "updated": now,
-                    "count": len(selected),
-                    "signals": [_record(signal) for signal in selected],
+                    "count": len(records),
+                    "signals": records,
                 }, indent=2) + "\n",
                 encoding="utf-8",
             )
         if _ACTIVE_SCAN_FILE.exists():
             active = json.loads(_ACTIVE_SCAN_FILE.read_text(encoding="utf-8"))
             active["updated"] = now
-            active["longs"] = [_record(signal) for signal in payloads[0][1]]
-            active["shorts"] = [_record(signal) for signal in payloads[1][1]]
+            active["longs"] = [
+                _record(signal) for signal in payloads[0][1]
+            ] + [
+                _default_record(symbol, "buy")
+                for symbol in sorted(_DEFAULT_SCAN_SYMBOLS)
+                if symbol not in {signal.symbol for signal in payloads[0][1]}
+            ]
+            active["shorts"] = [
+                _record(signal) for signal in payloads[1][1]
+            ] + [
+                _default_record(symbol, "short")
+                for symbol in sorted(_DEFAULT_SCAN_SYMBOLS)
+                if symbol not in {signal.symbol for signal in payloads[1][1]}
+            ]
             _ACTIVE_SCAN_FILE.write_text(json.dumps(active, indent=2) + "\n", encoding="utf-8")
         _log.info(
             f"[SIGNALS] active directional lists updated: "
@@ -313,7 +410,12 @@ def _should_admit_thin_liquidity(reason: Optional[str], market_state: Optional[M
     return market_state.now.strftime("%H:%M") < EOD_CLOSE_TIME
 
 
-def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Optional[MarketState] = None, return_reason: bool = False) -> bool:
+def _passes_guardrails(
+    symbol: str,
+    bull_regime: Optional[bool] = None,
+    market_state: Optional[MarketState] = None,
+    return_reason: bool = False,
+) -> Union[bool, Tuple[bool, Optional[str]]]:
     """Pre-scan gates: dollar-volume, RVOL, and gap-chase guard.
     Returns False to skip the symbol; never raises.
 
@@ -332,12 +434,19 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
         # into every guardrail with no check at all.
         _snap = _snapshot_cache.get(symbol)
         _snap_fresh = False
+        latest_trade = None
+        daily_bar = None
+        previous_daily_bar = None
+        if _snap is not None:
+            latest_trade = getattr(_snap, "latest_trade", None)
+            daily_bar = getattr(_snap, "daily_bar", None)
+            previous_daily_bar = getattr(_snap, "previous_daily_bar", None)
         if (
             _snap is not None
-            and _snap.daily_bar is not None
-            and _snap.latest_trade is not None
+            and daily_bar is not None
+            and latest_trade is not None
         ):
-            _trade_ts = getattr(_snap.latest_trade, "timestamp", None)
+            _trade_ts = getattr(latest_trade, "timestamp", None)
             if _trade_ts is None:
                 _snap_fresh = True  # no timestamp to check — trust it, same as before
             else:
@@ -348,11 +457,11 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
                 if not _snap_fresh:
                     _log.debug(f"[GUARDRAIL] {symbol}: snapshot stale ({_snap_age:.0f}s) — falling back to fresh intraday bars")
 
-        if _snap_fresh:
-            price   = float(_snap.latest_trade.price)
-            day_vol = float(_snap.daily_bar.volume)
-            open_px = float(_snap.daily_bar.open)
-            prev_close = float(_snap.previous_daily_bar.close) if _snap.previous_daily_bar else 0.0
+        if _snap_fresh and latest_trade is not None and daily_bar is not None:
+            price   = float(latest_trade.price)
+            day_vol = float(daily_bar.volume)
+            open_px = float(daily_bar.open)
+            prev_close = float(previous_daily_bar.close) if previous_daily_bar is not None else 0.0
             intraday = None
         else:
             # ── Fallback: fetch 1-min intraday bars ───────────────────────────
@@ -430,7 +539,7 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
 
         # Adaptive RVOL_MIN: higher in bull/high VIX, lower in calm or bear conditions
         # Use regular market hours only so extended-hours volume does not distort the pace.
-        if market_state.is_regular_hours and bull:
+        if market_state is not None and market_state.is_regular_hours and bull:
             daily = get_daily_volume_bars(symbol)
             if not daily.empty and len(daily) >= 2:
                 avg_daily_vol = float(daily["volume"].iloc[:-1].mean())
@@ -487,7 +596,7 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
             return False
 
         # RVOL gate (adaptive)
-        if market_state.is_market_open and bull:
+        if market_state is not None and market_state.is_market_open and bull:
             daily = get_daily_volume_bars(symbol)
             if not daily.empty and len(daily) >= 2:
                 avg_daily_vol = float(daily["volume"].iloc[:-1].mean())
@@ -582,7 +691,7 @@ def _is_thinly_traded(symbol: str) -> bool:
     return is_thin
 
 
-def get_scan_targets(excluded: Set[str] = None, market_state: Optional[MarketState] = None) -> List[str]:
+def get_scan_targets(excluded: Optional[Set[str]] = None, market_state: Optional[MarketState] = None) -> List[str]:
     """Equity scan universe = Alpaca-movers queue + top TI_PRIMARY_SCAN_BATCH_LIMIT
     tickers from the latest Trade Ideas capture (data/ti_primary.json), TI in
     its own rank order.
@@ -675,7 +784,10 @@ def get_scan_targets(excluded: Set[str] = None, market_state: Optional[MarketSta
             _log.debug(f"[GUARDRAIL] pre-filter snapshot prefetch failed, guardrail checks fail open: {e}")
         def _quality_ok(s: str) -> bool:
             try:
-                return _passes_guardrails(s, market_state=market_state)
+                result = _passes_guardrails(s, market_state=market_state, return_reason=True)
+                if isinstance(result, tuple):
+                    return bool(result[0])
+                return bool(result)
             except Exception as e:
                 _log.warning(f"{s}: guardrail pre-filter failed, excluding from top-{_cfg.TI_PRIMARY_SCAN_BATCH_LIMIT}: {e}")
                 return False
@@ -690,11 +802,19 @@ def get_scan_targets(excluded: Set[str] = None, market_state: Optional[MarketSta
 
     ti_slice = ti_pool[:_cfg.TI_PRIMARY_SCAN_BATCH_LIMIT]
 
-    # 2026-08-26, user request ("keep it to top 30 signals together"): cap the
-    # COMBINED (movers + TI) list at TI_PRIMARY_SCAN_BATCH_LIMIT, not each
-    # source separately -- movers get priority (fresher/news-driven) and TI
-    # fills whatever's left, up to the shared cap.
-    targets = list(dict.fromkeys(movers + ti_slice))[:_cfg.TI_PRIMARY_SCAN_BATCH_LIMIT]
+    # 2026-08-28: preserve a healthy merged movers + Yahoo universe instead of
+    # collapsing to a tiny final list. Keep the active scan footprint broad
+    # enough that both a long and short book can stay populated.
+    combined = list(dict.fromkeys(movers + ti_slice))
+    reserved = sorted(_DEFAULT_SCAN_SYMBOLS)
+    ranked = [s for s in combined if s not in _DEFAULT_SCAN_SYMBOLS]
+    # use the same merged source order for both directional books; cap per side
+    # at 30 while still letting the shared scan pool remain broad enough to trade.
+    target_cap = max(30, _cfg.TI_PRIMARY_SCAN_BATCH_LIMIT)
+    targets = ranked[:max(0, target_cap - len(reserved))] + reserved
+    # If the merged pool is still above the cap, prefer the healthiest-ranked names
+    # already present in the merged list rather than leaving the long/short books sparse.
+    targets = list(dict.fromkeys(targets))[:max(30, target_cap)]
     if market_state is not None:
         _write_active_scan_list(targets)
     return targets
@@ -732,7 +852,12 @@ def scan_universe(scan_targets: List[str], sentiment: str, market_state: MarketS
         # Dead-ticker check already done in get_scan_targets() — skip here.
         # Pass pre-computed regime into guardrails to avoid re-calling _is_bull_regime()
         # Custom: get rejection reason from _passes_guardrails
-        passed, reason = _passes_guardrails(symbol, market_state=market_state, return_reason=True)
+        guardrail_result = _passes_guardrails(symbol, market_state=market_state, return_reason=True)
+        if isinstance(guardrail_result, tuple):
+            passed, reason = guardrail_result
+        else:
+            passed = bool(guardrail_result)
+            reason = 'other'
         thin_liquidity = False
         if not passed:
             if reason in guardrail_rejections:
@@ -868,7 +993,7 @@ def scan_universe(scan_targets: List[str], sentiment: str, market_state: MarketS
     return signals, hit_counts, scan_errors
 
 
-def filter_signals(signals, long_only: bool = False, min_conf: float = 0.0, cap: int = None):
+def filter_signals(signals, long_only: bool = False, min_conf: float = 0.0, cap: Optional[int] = None):
     if long_only:
         signals = [s for s in signals if s.action == "buy"]
 
@@ -886,10 +1011,13 @@ def _demo() -> None:
     movers"). Monkeypatches the module's own network-touching globals so
     this runs with no live calls; restored in a finally."""
     global _get_ti_primary, _get_alpaca_movers_queue, is_dead_ticker, _is_thinly_traded
-    global _prefetch_snapshots, _passes_guardrails
+    global _prefetch_snapshots, _passes_guardrails, _DEFAULT_SCAN_SYMBOLS, _write_active_scan_list
     _orig = (_get_ti_primary, _get_alpaca_movers_queue, is_dead_ticker, _is_thinly_traded,
-             _prefetch_snapshots, _passes_guardrails)
+               _prefetch_snapshots, _passes_guardrails, _DEFAULT_SCAN_SYMBOLS,
+               _write_active_scan_list)
     try:
+        _DEFAULT_SCAN_SYMBOLS = set()
+        _write_active_scan_list = lambda tickers: False
         # GOOD passes every check; RVOLBAD/PRICEBAD/FLOATBAD each fail one
         # of the structural guardrails -- exactly the pattern confirmed live
         # 2026-08-27 (FSLY/GTM/etc on RVOL, GCTK/WKSP/UPXI on price,
@@ -897,9 +1025,9 @@ def _demo() -> None:
         _get_ti_primary = lambda: ["RVOLBAD", "GOOD1", "PRICEBAD", "GOOD2", "FLOATBAD", "GOOD3"]
         _get_alpaca_movers_queue = lambda: []
         is_dead_ticker = lambda s: False
-        _is_thinly_traded = lambda s: False
+        _is_thinly_traded = lambda symbol: False
         _prefetch_snapshots = lambda symbols: None
-        _passes_guardrails = lambda s, bull_regime=None, market_state=None, return_reason=False: not s.endswith("BAD")
+        _passes_guardrails = lambda symbol, bull_regime=None, market_state=None, return_reason=False: not symbol.endswith("BAD")
 
         # market_state=None (existing callers that don't have one) -> old
         # behavior, guardrails not applied at all.
@@ -909,8 +1037,20 @@ def _demo() -> None:
 
         # market_state provided -> the *BAD candidates must be filtered out
         # before the cap, not just left in place.
-        class _FakeMarketState:
+        class _FakeMarketState(MarketState):
+            def __init__(self):
+                super().__init__(
+                    now=datetime.datetime.now(_ET),
+                    hour=float(datetime.datetime.now(_ET).hour),
+                    weekday=True,
+                    is_market_open=True,
+                    is_regular_hours=True,
+                    is_options_lull_hours=False,
+                    is_open_window=False,
+                )
+
             def resolve_regime(self): return True
+
         targets = get_scan_targets(market_state=_FakeMarketState())
         assert targets == ["GOOD1", "GOOD2", "GOOD3"], \
             f"guardrail-failing candidates must be dropped before the cap when market_state is given, got {targets}"
@@ -930,7 +1070,8 @@ def _demo() -> None:
         print("scan._demo: all assertions passed")
     finally:
         (_get_ti_primary, _get_alpaca_movers_queue, is_dead_ticker, _is_thinly_traded,
-         _prefetch_snapshots, _passes_guardrails) = _orig
+         _prefetch_snapshots, _passes_guardrails, _DEFAULT_SCAN_SYMBOLS,
+         _write_active_scan_list) = _orig
 
 
 if __name__ == "__main__":

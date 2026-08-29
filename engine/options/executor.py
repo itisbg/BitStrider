@@ -54,7 +54,6 @@ from engine.config import (
     OPTIONS_PROFIT_TARGET_PCT,
     OPTIONS_STOP_LOSS_PCT,
     OPTIONS_DTE_MIN,
-    PDT_ACCOUNT_MIN, PDT_MAX_TRADES, PDT_OPTIONS_DAY_TRADE_RESERVE,
     OPTIONS_THETA_EXIT_DTE,
     OPTIONS_TRAIL_ACTIVATE_PCT,
     OPTIONS_TRAIL_DRAWDOWN_PCT,
@@ -811,23 +810,6 @@ class OptionsExecutor:
         except Exception:
             pass  # network/parse failure — allow entry rather than block all trades
 
-        # 2. PDT & Account Guard
-        is_small_account, dt_remaining = self._check_pdt_status()
-        if is_small_account:
-            # Reserve day trades only matter for same-day closes.
-            # Options entered with DTE >= OPTIONS_DTE_MIN are swing trades by design
-            # and will NOT create a day trade on entry. Only block if we literally have
-            # no day trades left (would be unable to emergency-exit any position today).
-            if dt_remaining == 0:
-                log.info(
-                    f"[OPTIONS] PDT reserve: 0 day trades remaining — skipping {signal.symbol} entry"
-                )
-                return False
-            # Cap to 1 open option position on small accounts to conserve capital
-            if self._count_open_options() >= 1:
-                log.info(f"[OPTIONS] Small account 1-position cap reached — skipping {signal.symbol}")
-                return False
-
         # 3. Budget & Contract Calculation
         total_budget, remaining = self._get_options_budget()
         raw_contracts = self._calc_contracts(signal, remaining)
@@ -1100,25 +1082,6 @@ class OptionsExecutor:
         
         
     # ── Position Monitoring ────────────────────────────────────────────────────
-    def _check_pdt_status(self) -> Tuple[bool, int]:
-        """
-        Helper to determine if the account is subject to PDT restrictions.
-        Returns: (is_small_account, day_trades_remaining)
-        """
-        try:
-            acct = self.client.get_account()
-            equity = float(acct.equity)
-            pdt_flagged = str(getattr(acct, "pattern_day_trader", False)).lower() in ("1", "true", "yes")
-            
-            # If under 25k and flagged, we are restricted
-            is_small = equity < PDT_ACCOUNT_MIN and pdt_flagged
-            trades_used = int(getattr(acct, "daytrade_count", 0) or 0)
-            remaining = max(0, PDT_MAX_TRADES - trades_used)
-            
-            return is_small, remaining
-        except Exception as e:
-            log.warning(f"PDT Status Check Failed: {e}")
-            return False, 0
     def monitor_positions(self) -> None:
         """
         Check open options (Single & MLEG) and close at target/stop.
@@ -1142,24 +1105,13 @@ class OptionsExecutor:
         to_close: List[str] = []
         today = datetime.date.today()
 
-        # PDT/Account Status Logic (unchanged)
-        pdt_small_account, dt_left_today = self._check_pdt_status()
-
         for occ_sym, pos in list(self._positions.items()):
             dte = (pos.expiry - today).days
-            same_day_entry = pos.entered_at == today
-            pdt_block = pdt_small_account and same_day_entry and dt_left_today <= 1
 
             # 1. Theta guard: exit within OPTIONS_THETA_EXIT_DTE days to avoid accelerating decay
-            # Skip if entered today and PDT-blocked — Alpaca will reject the close anyway
             if dte <= OPTIONS_THETA_EXIT_DTE:
-                if pdt_block or same_day_entry:
-                    log.debug(
-                        f"OPTIONS: {occ_sym} theta guard (DTE={dte}) deferred — entered today, will close tomorrow"
-                    )
-                else:
-                    log.warning(f"OPTIONS: {occ_sym} within {OPTIONS_THETA_EXIT_DTE}d of expiry (DTE={dte}) — closing")
-                    to_close.append(occ_sym)
+                log.warning(f"OPTIONS: {occ_sym} within {OPTIONS_THETA_EXIT_DTE}d of expiry (DTE={dte}) — closing")
+                to_close.append(occ_sym)
                 continue
 
             # 2. P&L — fetch live bid/ask quotes for every leg, compute net mark.
@@ -1211,7 +1163,7 @@ class OptionsExecutor:
                     f"pnl={pnl_pct:+.1f}% peak={pos.peak_pnl_pct:.1f}%"
                 )
 
-                # 4. Exit decision  (same_day_entry / pdt_block computed at top of loop)
+                # 4. Exit decision
 
                 # Per-position stop: tighter for open-window entries (25%) vs global (30%)
                 # Must be computed BEFORE the outer check so tighter stops are reachable.
@@ -1247,73 +1199,46 @@ class OptionsExecutor:
                     # Only close if mark is positive (we receive money on close).
                     _target_mark = entry_mark if pos.breakeven_mode else entry_mark * (1 + OPTIONS_PROFIT_TARGET_PCT / 100)
                     if occ_sym not in to_close and current_mark > 0 and current_mark >= _target_mark:
-                        if not pdt_block:
-                            _reason = "break-even" if pos.breakeven_mode else f"target +{OPTIONS_PROFIT_TARGET_PCT:.0f}%"
-                            log.info(
-                                f"OPTIONS: {pos.symbol} {_mleg_type} {_reason} hit "
-                                f"(mark=${current_mark:.2f} >= target=${_target_mark:.2f}) — closing"
-                            )
-                            to_close.append(occ_sym)
+                        _reason = "break-even" if pos.breakeven_mode else f"target +{OPTIONS_PROFIT_TARGET_PCT:.0f}%"
+                        log.info(
+                            f"OPTIONS: {pos.symbol} {_mleg_type} {_reason} hit "
+                            f"(mark=${current_mark:.2f} >= target=${_target_mark:.2f}) — closing"
+                        )
+                        to_close.append(occ_sym)
 
                     # Emergency exit: DTE ≤ 3 with remaining positive value below 55% of entry.
                     # Close to recover what's left rather than let theta eat it to zero.
                     # If mark is inverted (≤ 0): clear tracker and let expire — no close cost.
                     elif occ_sym not in to_close and dte <= 3:
                         if current_mark <= 0:
-                            if not same_day_entry:
-                                log.info(
-                                    f"OPTIONS: {pos.symbol} {_mleg_type} DTE={dte} "
-                                    f"mark=${current_mark:.2f} (inverted) — letting expire"
-                                )
-                                del self._positions[occ_sym]
+                            log.info(
+                                f"OPTIONS: {pos.symbol} {_mleg_type} DTE={dte} "
+                                f"mark=${current_mark:.2f} (inverted) — letting expire"
+                            )
+                            del self._positions[occ_sym]
                         elif current_mark < entry_mark * 0.55:
-                            if same_day_entry:
-                                log.debug(
-                                    f"OPTIONS: {pos.symbol} {_mleg_type} DTE={dte} emergency exit deferred — entered today"
-                                )
-                            elif not pdt_block:
-                                log.warning(
-                                    f"OPTIONS: {pos.symbol} {_mleg_type} DTE={dte} emergency exit "
-                                    f"— mark=${current_mark:.2f} < 55% of entry=${entry_mark:.2f} — closing"
-                                )
-                                to_close.append(occ_sym)
+                            log.warning(
+                                f"OPTIONS: {pos.symbol} {_mleg_type} DTE={dte} emergency exit "
+                                f"— mark=${current_mark:.2f} < 55% of entry=${entry_mark:.2f} — closing"
+                            )
+                            to_close.append(occ_sym)
 
                     continue   # skip standard % stop / trailing stop for mleg structures
                 # ── End butterfly/condor logic ────────────────────────────────
 
                 if pnl_pct >= OPTIONS_PROFIT_TARGET_PCT:
-                    if pdt_block:
-                        log.info(f"OPTIONS: {pos.symbol} at target {pnl_pct:.1f}% but PDT blocked")
-                    else:
-                        log.info(f"OPTIONS: {pos.symbol} target hit ({pnl_pct:.1f}%) -- closing")
-                        to_close.append(occ_sym)
+                    log.info(f"OPTIONS: {pos.symbol} target hit ({pnl_pct:.1f}%) -- closing")
+                    to_close.append(occ_sym)
 
                 elif pnl_pct <= -_eff_stop:
-                    if same_day_entry:
-                        # Never stop out on entry day — let the position breathe overnight
-                        # Exception: open-window entries have tighter 25% same-day stop
-                        if pos.open_stop_pct > 0:
-                            log.warning(
-                                f"OPTIONS: {pos.symbol} open-window stop {_eff_stop:.0f}% hit "
-                                f"({pnl_pct:.1f}%) same-day — closing"
-                            )
-                            to_close.append(occ_sym)
-                        else:
-                            log.debug(
-                                f"OPTIONS: {pos.symbol} at stop ({pnl_pct:.1f}%) but entered today — holding"
-                            )
-                    elif not pdt_block:
-                        log.warning(f"OPTIONS: {pos.symbol} stop hit ({pnl_pct:.1f}%) — closing")
-                        to_close.append(occ_sym)
+                    log.warning(f"OPTIONS: {pos.symbol} stop hit ({pnl_pct:.1f}%) — closing")
+                    to_close.append(occ_sym)
 
                 # 5. Trailing stop — arms once peak >= OPTIONS_TRAIL_ACTIVATE_PCT
                 # Fires when pnl drops OPTIONS_TRAIL_DRAWDOWN_PCT pp below the peak.
                 # Only evaluated when the fixed stop and target haven't already triggered.
-                # Skipped on entry day (same logic as fixed stop) to avoid noise.
                 elif (
-                    not same_day_entry
-                    and not pdt_block
-                    and pos.peak_pnl_pct >= OPTIONS_TRAIL_ACTIVATE_PCT
+                    pos.peak_pnl_pct >= OPTIONS_TRAIL_ACTIVATE_PCT
                     and pnl_pct <= pos.peak_pnl_pct - OPTIONS_TRAIL_DRAWDOWN_PCT
                 ):
                     log.info(
