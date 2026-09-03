@@ -1107,6 +1107,10 @@ def _tick(ctx: AppContext, last_ema15: float, last_pending: float) -> Tuple[floa
     except Exception as e:
         log.error(f"[STOP-THREAD] check_ema9_exit error: {e}", exc_info=True)
     try:
+        ctx.executor.check_mfe_giveback_exit()
+    except Exception as e:
+        log.error(f"[STOP-THREAD] check_mfe_giveback_exit error: {e}", exc_info=True)
+    try:
         ctx.executor.check_blocked_entries_ema()
     except Exception as e:
         log.error(f"[STOP-THREAD] check_blocked_entries_ema error: {e}", exc_info=True)

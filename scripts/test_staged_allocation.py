@@ -33,6 +33,12 @@ sys.path.insert(0, str(ROOT))
 import engine.execution.enhanced as enhanced
 from engine.execution.enhanced import EnhancedExecutor, OrderSide, TimeInForce, AlpacaOrderType, TrailingStopOrderRequest
 
+# Time-independent (2026-09-03): staged tranche submission paths gate on the
+# 11:00-14:45 ET lunch break, so this test failed whenever it ran midday.
+# Never-inside-the-break during the test, same shim the module's own
+# self-test block uses.
+enhanced.in_lunch_break = lambda *_: False
+
 assert enhanced.STAGED_ALLOCATION_ENABLED is True
 assert enhanced.STAGED_ALLOCATION_TRANCHES == 4
 assert enhanced.STAGED_ALLOCATION_MIN_GAIN_PCT == 0.0

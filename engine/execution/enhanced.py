@@ -62,6 +62,7 @@ from engine.config import (
     MIN_AVG_DAILY_VOLUME_REGULAR_HOURS, MIN_FLOAT_SHARES, MIN_MARKET_CAP,
     SWING_STALE_EXIT_ENABLED, SWING_STALE_DAYS, SWING_STALE_MIN_GAIN_PCT,
     NO_GAIN_EXIT_ENABLED, NO_GAIN_EXIT_HOURS, NO_GAIN_EXIT_MIN_PCT, NO_GAIN_EXIT_MAX_LOSS_PCT,
+    MFE_GIVEBACK_ENABLED, MFE_ARM_PROFIT_PCT, MFE_GIVEBACK_FRACTION, MFE_BREAKEVEN_FLOOR_PCT,
     AFTERHOURS_STOP_CHECK_ENABLED, AFTERHOURS_CHASE_STALE_SECONDS,
     MAX_POSITION_CONCENTRATION_PCT, CORRELATION_GROUPS, MAX_PORTFOLIO_LEVERAGE,
     POSITION_CAP_GROWTH_FACTOR, POSITION_CAP_ABSOLUTE_MAX_PCT,
@@ -1141,6 +1142,12 @@ class EnhancedExecutor:
         # {symbol: deque of the last N check_price_drift_stop prices, maxlen = PRICE_DRIFT_LOOKBACK_MIN / PRICE_DRIFT_CHECK_INTERVAL_MIN}
         # deque[0] is the oldest sample kept -- the ~PRICE_DRIFT_LOOKBACK_MIN-minutes-ago reference once full.
         self._price_drift_history: Dict[str, Deque[float]] = {}
+        # {symbol: best price seen since entry (high for longs, low for shorts)}
+        # -- the MFE give-back stop's reference, updated every poller tick by
+        # check_mfe_giveback_exit(). First sighting seeds from the current
+        # price (fail-open after a restart: we may miss the pre-restart peak
+        # but never invent one). Cleaned up when the position is gone.
+        self._mfe_peaks: Dict[str, float] = {}
         # {symbol: {"order_id": str, "qty": int, "is_long": bool, "chase_count": int}}
         # -- resting entry orders not yet confirmed filled; swept by _sweep_pending_entries
         self._entry_pending: Dict[str, dict] = {}
@@ -5072,6 +5079,150 @@ class EnhancedExecutor:
         # Drop history for symbols no longer held or no longer in scope
         for sym in [s for s in self._price_drift_history if s not in live_syms]:
             self._price_drift_history.pop(sym, None)
+
+    @staticmethod
+    def _mfe_giveback_reason(peak: Optional[float], entry: Optional[float],
+                             current: float, is_long: bool) -> Optional[str]:
+        """Pure decision function for check_mfe_giveback_exit(): once a
+        position's unrealized gain has ever reached MFE_ARM_PROFIT_PCT
+        (measured against `peak`, the best price seen since entry), exit the
+        moment the CURRENT gain falls below max(peak_gain *
+        MFE_GIVEBACK_FRACTION, MFE_BREAKEVEN_FLOOR_PCT). Returns a reason
+        string when the stop fires, else None.
+
+        2026-09-03, from the morning post-mortem: 41 round trips peaked at
+        +$90.56 unrealized combined and realized +$1.22 -- a 1.3% capture
+        rate. The broker-side GTC trailing stop trails from its own HWM but
+        at 1.5-4.0% width, so a green-then-fade round trip inside a few
+        minutes never touches it; and no software check tracked what a trade
+        had ALREADY shown. This closes that gap: arming at +0.5% and giving
+        back at most 40% of the peak (floor: entry +0.1%) would have locked
+        most of SMMT/HOOD/CRCL/CONL's morning peaks and kept the ASST-class
+        trades (peak +0.5%, exited -1.96%) from ever going red.
+
+        Fail-safe semantics, matching the rest of this file: peak/entry
+        missing or <=0 drops that leg of the decision (never a trigger), and
+        a peak that never armed returns None. Shorts are mirrored (peak is
+        the lowest price seen; gain is entry-minus-current)."""
+        if peak is None or entry is None or entry <= 0 or peak <= 0:
+            return None
+        if is_long:
+            peak_gain_pct = (peak - entry) / entry * 100.0
+            cur_gain_pct = (current - entry) / entry * 100.0
+        else:
+            peak_gain_pct = (entry - peak) / entry * 100.0
+            cur_gain_pct = (entry - current) / entry * 100.0
+        if peak_gain_pct < MFE_ARM_PROFIT_PCT:
+            return None  # never armed -- ordinary trailing stop still owns this trade
+        floor_pct = max(peak_gain_pct * MFE_GIVEBACK_FRACTION, MFE_BREAKEVEN_FLOOR_PCT)
+        if cur_gain_pct > floor_pct:
+            return None
+        return (
+            f"peaked at {peak_gain_pct:+.2f}% (${peak:.2f}) but now {cur_gain_pct:+.2f}% "
+            f"(${current:.2f}) -- below the {floor_pct:.2f}% give-back floor "
+            f"(arm {MFE_ARM_PROFIT_PCT:.2f}%, keep {MFE_GIVEBACK_FRACTION:.0%} of peak)"
+        )
+
+    def check_mfe_giveback_exit(self) -> None:
+        """Exit any same-day position that armed the MFE give-back watch and
+        has since surrendered too much of its best gain (see
+        _mfe_giveback_reason for the decision rule and the 2026-09-03
+        post-mortem that motivated it). Runs on the SoftwareStopPoller
+        thread, same lifecycle as check_price_drift_stop: cancel any resting
+        orders on the symbol, submit a marketable-limit close, re-arm the
+        GTC trailing stop if the close itself fails so the position is never
+        left unprotected, and offer the closed leg to the re-entry machinery.
+
+        The per-symbol peak is the best price seen across this process's
+        polls (long: highest; short: lowest), seeded from the first sighting
+        and dropped once the position is gone. Scoped to same-day entries
+        only -- overnight/swing positions keep their normal trailing stop."""
+        if not MFE_GIVEBACK_ENABLED:
+            return
+
+        try:
+            positions = self.client.get_all_positions()
+        except Exception as e:
+            log.warning(f"check_mfe_giveback_exit: fetch failed: {e}")
+            return
+
+        today = datetime.date.today()
+        live_syms = set()
+
+        for pos in positions:
+            sym = pos.symbol
+            if re.match(r'^[A-Z]+\d{6}[CP]\d{8}$', sym):
+                continue  # options legs -- managed separately
+            try:
+                qty = int(float(pos.qty))
+            except (TypeError, ValueError):
+                continue
+            if qty == 0:
+                continue
+
+            entry_info = self._entry_log.get(sym)
+            if not entry_info or entry_info.get("date") != today:
+                continue  # not a same-day entry -- out of scope, leave on its normal trailing stop
+
+            live_syms.add(sym)
+            try:
+                current = float(pos.current_price)
+                entry = float(pos.avg_entry_price)
+            except (TypeError, ValueError):
+                continue
+            if current <= 0:
+                continue
+
+            is_long = qty > 0
+            prev_peak = self._mfe_peaks.get(sym)
+            new_peak = current if prev_peak is None else (
+                max(prev_peak, current) if is_long else min(prev_peak, current)
+            )
+            self._mfe_peaks[sym] = new_peak
+
+            reason = self._mfe_giveback_reason(new_peak, entry, current, is_long)
+            if reason is None:
+                continue
+
+            try:
+                sym_orders = [o for o in (self.client.get_orders() or []) if o.symbol == sym]
+                for _o in sym_orders:
+                    try:
+                        self.client.cancel_order_by_id(str(_o.id))
+                    except Exception:
+                        pass
+                if sym_orders:
+                    time.sleep(0.4)
+            except Exception as e:
+                log.warning(f"check_mfe_giveback_exit {sym}: order fetch/cancel failed, will retry next cycle: {e}")
+                continue
+
+            side = OrderSide.SELL if is_long else OrderSide.BUY
+            try:
+                self._submit_closing_order(sym, abs(qty), side, current)
+                log.warning(f"MFE GIVEBACK STOP {sym}: {abs(qty)} shares | {reason}")
+                self._maybe_rearm_reentry(
+                    sym, is_long, abs(qty), "MFE GIVEBACK STOP",
+                    was_loss=(current - entry) * qty < 0,
+                )
+            except Exception as e:
+                log.error(f"MFE GIVEBACK STOP {sym}: close failed: {e}")
+                # The resting GTC was just cancelled above -- re-arm a fallback
+                # so the position isn't left fully unprotected.
+                try:
+                    trail_pct, _ = _atr_trail_pct_for(sym, current, self._entry_log)
+                    self.client.submit_order(TrailingStopOrderRequest(
+                        symbol=sym, qty=abs(qty), side=side,
+                        type=AlpacaOrderType.TRAILING_STOP, time_in_force=TimeInForce.GTC,
+                        trail_percent=trail_pct,
+                    ))
+                    log.warning(f"check_mfe_giveback_exit {sym}: re-armed GTC trailing stop after failed close")
+                except Exception as rearm_err:
+                    log.error(f"check_mfe_giveback_exit {sym}: close failed AND GTC re-arm failed -- position may be UNPROTECTED: {rearm_err}")
+
+        # Drop peaks for symbols no longer held or no longer in scope
+        for sym in [s for s in self._mfe_peaks if s not in live_syms]:
+            self._mfe_peaks.pop(sym, None)
 
     @staticmethod
     def _update_ema9_peak(peak_map: Dict[str, float], sym: str, ema9_now: float, is_long: bool) -> float:

@@ -952,6 +952,35 @@ NO_GAIN_EXIT_MIN_PCT     = 0.0    # gain above this exits (must be <= this, and 
 NO_GAIN_EXIT_MAX_LOSS_PCT = -1.5  # loss at or below this also exits (new -- was no downside cutoff)
 
 # -----------------------------------------------------------------
+# MFE Give-back Stop -- protects gains a trade has ALREADY shown.
+# 2026-09-03, from the 09:30-11:00 ET post-mortem: 41 morning round
+# trips peaked at +$90.56 unrealized combined but realized only
+# +$1.22 (1.3% MFE capture). 34/41 trips went green at some point and
+# their +$94.88 of peak profit was only 31.4% captured. Typical
+# pattern: green within 2-10 min of entry, exit flat/negative 2-11
+# min later (CONL x4, CRCL x4, MSTX x3, SMMT, HOOD, BTDR...).
+#
+# Rule (check_mfe_giveback_exit(), runs on the SoftwareStopPoller
+# thread): once a position's unrealized gain has EVER reached
+# MFE_ARM_PROFIT_PCT this session, exit the moment the CURRENT gain
+# falls below max(peak_gain * MFE_GIVEBACK_FRACTION,
+# MFE_BREAKEVEN_FLOOR_PCT). The floor doubles as a breakeven-plus
+# ratchet -- an armed trade can never round-trip through its entry
+# again. Scoped to same-day entries only (self._entry_log date),
+# same restart-survivable scoping as PRICE_DRIFT_STOP/NO_GAIN_EXIT.
+# The peak is tracked in-memory from the poller's own samples; a
+# restart re-seeds the peak from the current price (fail-open: we may
+# miss the pre-restart peak but never invent one). Tuned from the
+# 9/3 data: typical armed give-backs were 35-80% of peak, so 0.6
+# locks most of a green trade's best level while leaving the PLTR
+# case (peak +6.5%, held 90% of it) almost untouched.
+# -----------------------------------------------------------------
+MFE_GIVEBACK_ENABLED      = True
+MFE_ARM_PROFIT_PCT        = 0.5   # peak unrealized gain % needed to arm the give-back watch
+MFE_GIVEBACK_FRACTION     = 0.6   # exit once current gain falls below this fraction of the peak gain
+MFE_BREAKEVEN_FLOOR_PCT   = 0.1   # floor: an armed trade exits before falling under entry + this %
+
+# -----------------------------------------------------------------
 # After-Hours Software Stop-Loss
 # Alpaca's broker-side GTC trailing stop is only evaluated during regular
 # hours (09:30-16:00 ET) -- a position can free-fall pre-market/after-hours

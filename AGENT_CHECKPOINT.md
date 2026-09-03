@@ -9,6 +9,20 @@
 > re-asking questions. Update BEFORE starting a risky step, and again after it.
 
 ---
+## Snapshot — 2026-09-03 ~14:05 ET (MFE give-back stop implemented + deploy)
+
+### What
+- New gain-retention exit: `check_mfe_giveback_exit()` in `engine/execution/enhanced.py`, wired into the SoftwareStopPoller `_tick()` in `engine/orchestrator.py`. Config: `MFE_GIVEBACK_ENABLED/ARM_PROFIT_PCT/GIVEBACK_FRACTION/BREAKEVEN_FLOOR_PCT` in `engine/config.py`.
+- Rule: once a same-day position's peak unrealized gain reaches +0.5%, exit when current gain falls below max(60% of peak, entry+0.1%) — breakeven-plus ratchet. Pure decision fn `_mfe_giveback_reason()` is unit-testable; short-mirrored; same-day scope; GTC re-arm fallback on close failure.
+- Motivation: 9/3 morning post-mortem — 41 trips peaked +$90.56 unrealized, realized +$1.22 (1.3% MFE capture). Analysis tooling: `%TEMP%\apex_peak_hold_analysis.py` (read-only Alpaca).
+- Also fixed 2 time-dependent tests (test_pending_entry_ema_recheck, test_staged_allocation) that failed whenever run during the 11:00-14:45 lunch window — added the module's own `in_lunch_break = lambda *_: False` shim. This was silently blocking midday deploys.
+
+### Verification
+- New `scripts/test_mfe_giveback.py` green (uses the real 9/3 CONL/SMMT/HOOD/ASST/PLTR cases).
+- Full suite: ALL 49 runnable tests exit 0 (test_notifications still skipped by hand, runs in deploy gate).
+
+---
+
 ## Snapshot — 2026-09-03 ~12:00 UTC (cleanup pass)
 
 - Removed `engine/equity/scan.py.bak` (stale backup, was never imported; scan smoke + morning readiness re-passed after removal).

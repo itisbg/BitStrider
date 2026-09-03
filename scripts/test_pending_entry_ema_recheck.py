@@ -20,6 +20,13 @@ import pandas as pd
 import engine.execution.enhanced as enhanced
 from engine.execution.enhanced import EnhancedExecutor
 
+# Time-independent (2026-09-03): check_pending_entries_ema early-returns
+# during the 11:00-14:45 ET lunch break, so this test failed whenever it ran
+# midday. Never-inside-the-break during the test, same shim the module's own
+# self-test block uses (enhanced.py's in-module "never inside the midday
+# break during this test run").
+enhanced.in_lunch_break = lambda *_: False
+
 
 class _FakeOrder:
     def __init__(self, status, side, order_id, symbol):
