@@ -21,6 +21,12 @@
 - New `scripts/test_mfe_giveback.py` green (uses the real 9/3 CONL/SMMT/HOOD/ASST/PLTR cases).
 - Full suite: ALL 49 runnable tests exit 0 (test_notifications still skipped by hand, runs in deploy gate).
 
+### Deployed LIVE (13:05:37 local / 14:05:37 ET)
+- Commit `80cfe5a` pushed to GitHub (`origin/fix/ti-scraper-devtools-and-gtc-order-bug`, verified via ls-remote).
+- `scripts/deploy.py` gate passed (all tests + compileall) -> flag written -> watchdog consumed it within ~2s -> main.py restarted 13:05:37 during the lunch flat window, 0 open positions. `.mainbot.lock` recreated 13:05:38; heartbeat fresh; guardian polling clean (+0.60% day, positions=0).
+- MFE give-back is active for all same-day entries from the 14:45 ET PM window onward. NOTE: OneDrive made local `origin/*` refs stale twice today -- after any push, confirm with `git ls-remote origin` before trusting "Everything up-to-date".
+
+
 ---
 
 ## Snapshot — 2026-09-03 ~12:00 UTC (cleanup pass)
