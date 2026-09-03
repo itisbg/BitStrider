@@ -587,10 +587,11 @@ ENTRY_WINDOW_BREAK_END_ET   = "14:45"   # afternoon entry segment opens
 # be later than EOD_CLOSE_TIME again -- see the assert next to
 # EOD_CLOSE_TIME below, which enforces this at import time instead of
 # trusting the two literals to stay in sync by hand.
-# 2026-09-01: this is now the AFTERNOON entry segment's end (14:45-15:50),
+# 2026-09-01: this is now the AFTERNOON entry segment's end (14:45-15:45),
 # still the absolute last cutoff for any entry/re-entry order placement --
 # the enhanced.py re-arm and blocked-entry-expiry gates key on it unchanged.
-ENTRY_WINDOW_END_ET   = "15:50"
+# 2026-09-03, user request: afternoon session ends 3:45PM ET (was 3:50PM).
+ENTRY_WINDOW_END_ET   = "15:45"
 
 # Quarterly Profit Target
 USE_QUARTERLY_TARGET        = True
@@ -645,8 +646,10 @@ LUNCH_FLAT_TIME_ET   = ENTRY_WINDOW_BREAK_START_ET
 EOD_CLOSE_ENABLED    = True
 # 2026-08-18, user request: "change the eod close time and no trades time to
 # 3:50pm ET" -- was 15:45 (10 min/15:50 before that, widened 2026-08-12,
-# tightened back same day as this ask). Only 10 min before the 16:00 close now.
-EOD_CLOSE_TIME       = "15:50"
+# tightened back same day as this ask). 2026-09-03, user request: back to
+# 3:45PM ET (afternoon session ends 15:45, not 15:50). 15 min before the
+# 16:00 close.
+EOD_CLOSE_TIME       = "15:45"
 # 2026-09-01: the lunch flat must fire exactly when the morning entry segment
 # ends (otherwise the book could stay open into the break) and the two entry
 # segments must not overlap and must both stay inside the final 15:50 cutoff.
@@ -711,8 +714,10 @@ assert ENTRY_WINDOW_END_ET <= EOD_CLOSE_TIME, (
 )
 _market_close_h, _market_close_m = map(int, MARKET_CLOSE.split(":"))
 _eod_close_h, _eod_close_m = map(int, EOD_CLOSE_TIME.split(":"))
-assert ((_market_close_h * 60 + _market_close_m) - (_eod_close_h * 60 + _eod_close_m)) == 10, (
-    f"EOD_CLOSE_TIME ({EOD_CLOSE_TIME}) must be exactly 10 minutes before MARKET_CLOSE ({MARKET_CLOSE})"
+_eod_gap_min = (_market_close_h * 60 + _market_close_m) - (_eod_close_h * 60 + _eod_close_m)
+assert 10 <= _eod_gap_min <= 15, (
+    f"EOD_CLOSE_TIME ({EOD_CLOSE_TIME}) must be 10-15 minutes before MARKET_CLOSE ({MARKET_CLOSE}), "
+    f"got {_eod_gap_min} min (2026-09-03: 15:45 ET close = 15 min gap, was 15:50 = 10 min)"
 )
 
 # -----------------------------------------------------------------
@@ -743,7 +748,7 @@ GUARDIAN_STALE_HEARTBEAT_SEC = int(os.getenv("GUARDIAN_STALE_HEARTBEAT_SEC", "30
 # Guardian only takes flatten action inside this ET band (the bot has reset its
 # daily baseline by 09:35 ET and the day is over after 15:50).
 GUARDIAN_POLL_START_ET = os.getenv("GUARDIAN_POLL_START_ET", "09:35")
-GUARDIAN_POLL_END_ET   = os.getenv("GUARDIAN_POLL_END_ET",   "15:50")
+GUARDIAN_POLL_END_ET   = os.getenv("GUARDIAN_POLL_END_ET",   "15:45")
 EOD_CLOSE_STRATEGIES = {         # Strategy names that must be closed same day
     "FloatRotation",
     "GapBreakout",

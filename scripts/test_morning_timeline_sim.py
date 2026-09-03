@@ -91,12 +91,12 @@ def simulate(day, boot, restarts=()):
         if refresh_busy_until is None or t >= refresh_busy_until:
             if kick:
                 kick = False
-                if t.weekday() < 5 and _t(day, "08:55") <= t <= _t(day, "15:50"):
+                if t.weekday() < 5 and _t(day, "08:55") <= t <= _t(day, "15:45"):
                     prewarm_starts.append(t)
                 refresh_busy_until = t + datetime.timedelta(seconds=PREWARM_DUR_S)
                 next_run = refresh_busy_until
             elif next_run is not None and t >= next_run:
-                if t.weekday() < 5 and _t(day, "08:55") <= t <= _t(day, "15:50"):
+                if t.weekday() < 5 and _t(day, "08:55") <= t <= _t(day, "15:45"):
                     prewarm_starts.append(t)
                     refresh_busy_until = t + datetime.timedelta(seconds=PREWARM_DUR_S)
                     next_run = refresh_busy_until + datetime.timedelta(seconds=REFRESH_S)

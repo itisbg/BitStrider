@@ -373,7 +373,7 @@ class AutoBotWatchdog:
         lunch_flat = (11 * 60, 14 * 60 + 45)      # 11:00-14:45 ET
         if lunch_flat[0] <= hm < lunch_flat[1]:
             return True
-        eod_to_prep = (15 * 60 + 50, 9 * 60 + 5)  # after 15:50 ET -> 09:05 ET next day
+        eod_to_prep = (15 * 60 + 45, 9 * 60 + 5)  # after 15:45 ET (EOD close, 2026-09-03: was 15:50) -> 09:05 ET next day
         if eod_to_prep[0] < hm or hm < eod_to_prep[1]:
             return True
         return False

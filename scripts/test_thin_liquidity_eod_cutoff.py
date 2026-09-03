@@ -37,7 +37,7 @@ if TRADE_THIN_LIQUIDITY_REJECTS:
     assert _should_admit_thin_liquidity("rvol", _state("14:00")) is True
 
     # At/after EOD_CLOSE_TIME, no more admits -- this is the fix. Reads the
-    # live config value (now 15:50, was 15:45) rather than a hardcoded
+    # live config value (now 15:45, was 15:50) rather than a hardcoded
     # literal so this doesn't silently go stale the next time it moves --
     # see scripts/test_entry_window.py for the incident that taught this.
     assert _should_admit_thin_liquidity("rvol", _state(EOD_CLOSE_TIME)) is False
