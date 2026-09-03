@@ -1,4 +1,4 @@
-﻿"""
+"""
 ApexTrader - Enhanced Executor
 Optimized trade executor with consolidated logic:
   - Reduced API calls through caching
@@ -45,14 +45,19 @@ from engine.config import (
     MIN_BUYING_POWER_PCT, MIN_POSITION_DOLLARS, PDT_WARN_AT_REMAINING,
     TAKE_PROFIT_NORMAL, TAKE_PROFIT_HIGH, STOP_LOSS_PCT,
     ATR_TP_RATIO, MAX_SHORT_FLOAT_PCT, HIGH_SHORT_FLOAT_STOCKS, is_high_short_float,
-    EOD_CLOSE_ENABLED, EOD_CLOSE_TIME, EOD_CLOSE_STRATEGIES,
+    EOD_CLOSE_ENABLED, EOD_CLOSE_TIME, EOD_CLOSE_STRATEGIES, MARKET_CLOSE,
     GUARDRAIL_EOD_CLOSE_ENABLED, GUARDRAIL_EOD_CLOSE_TIME,
     PRICE_DRIFT_STOP_ENABLED, PRICE_DRIFT_STOP_PCT,
     PRICE_DRIFT_CHECK_INTERVAL_MIN, PRICE_DRIFT_LOOKBACK_MIN,
     TRAIL_STOP_PCT, PROFIT_TRAIL_GIVEBACK_PCT,
+    ATR_TRAIL_ENABLED, ATR_TRAIL_PERIOD, ATR_TRAIL_MULTIPLIER, ATR_TRAIL_MAX_PCT,
     STAGNANT_STOP_ENABLED, STAGNANT_STOP_CHECK_INTERVAL_MIN, ENTRY_WINDOW_END_ET,
+    ENTRY_WINDOW_BREAK_START_ET, ENTRY_WINDOW_BREAK_END_ET,
+    LUNCH_FLAT_ENABLED, LUNCH_FLAT_TIME_ET,
     EMA_TREND_FILTER_ENABLED, EMA_TREND_MIN_BARS, EMA9_TRAIL_PCT,
     EMA_ENTRY_CONFIRM_SEC, EMA_ENTRY_CONFIRM_CHECKS,
+    EMA_ENTRY_MIN_SPREAD_PCT, EMA_ENTRY_MIN_TRAILING_30M_RETURN_PCT,
+    REENTRY_SIZE_REDUCTION_PCT, LOSS_BLOCK_MORNING_END_ET, SYMBOL_DAILY_LOSS_BLOCK_COUNT,
     SWING_DRIFT_STOP_ENABLED, SWING_DRIFT_STOP_PCT,
     MIN_AVG_DAILY_VOLUME_REGULAR_HOURS, MIN_FLOAT_SHARES, MIN_MARKET_CAP,
     SWING_STALE_EXIT_ENABLED, SWING_STALE_DAYS, SWING_STALE_MIN_GAIN_PCT,
@@ -78,22 +83,28 @@ from engine.config import (
     THIN_LIQUIDITY_TRAILING_STOP_MULT,
     MARKETABLE_LIMIT_BUFFER_PCT,
     FADED_ENTRY_PASSIVE_WINDOW_SECONDS, FADED_ENTRY_CEILING_TIMEOUT_SECONDS,
-    REENTRY_TRAIL_PCT,
+    REENTRY_TRAIL_PCT, DUPLICATE_ENTRY_BLOCK_SECONDS,
+    STAGED_ALLOCATION_ENABLED, STAGED_ALLOCATION_TRANCHES, STAGED_ALLOCATION_MIN_GAIN_PCT, STAGED_ALLOCATION_MAX_ADD_PCT,
     LIVE,
 )
 from engine.equity.strategies import Signal, _get_float_shares, _get_market_cap
 from engine.equity.scan import get_scan_targets as _get_scan_targets
-from engine.utils import MarketState, calculate_risk_adjusted_size, check_vix_roc_filter, get_dynamic_tier
-from engine.utils.bars import get_bars, get_daily_volume_bars
+from engine.utils import MarketState, calculate_risk_adjusted_size, check_vix_roc_filter, get_dynamic_tier, calculate_atr, in_lunch_break
+from engine.utils.bars import get_bars, get_daily_volume_bars, get_premarket_bars, is_dead_ticker
 from engine.never_trade import is_never_trade
 from engine.notifications.notifications import send_email
+# Submodule object (not the package alias -- see orchestrator.py's 2026-08-18
+# comment on why `from . import session` freezes a value copy and breaks the
+# daily-loss halt). Used by _entry_halt_active so re-entry paths honor the
+# daily-loss limit (2026-09-02: previously skipped entirely on re-entries).
+from engine.session import session as _session
 
 log = logging.getLogger("ApexTrader")
 
 
-# ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+# ----------------------------------------------------------------------------------------------------------------------------
 # Helpers
-# ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+# ----------------------------------------------------------------------------------------------------------------------------
 def ratchet_scale(confidence: float) -> float:
     """Pure math for the confidence-ratchet trailing-stop multiplier.
     confidence <= SWAP_MIN_CONFIDENCE (0.75) -> 1.0 (no tightening).
@@ -110,7 +121,7 @@ def ratchet_scale(confidence: float) -> float:
 def _check_momentum_freshness(signal: Signal) -> Tuple[bool, Optional[str]]:
     """Reject a gap/momentum signal (MOMENTUM_FRESHNESS_STRATEGIES) if price
     has already faded MOMENTUM_FRESHNESS_MAX_PULLBACK_PCT+ off its high over
-    the last MOMENTUM_FRESHNESS_LOOKBACK_MIN minutes — the move may already
+    the last MOMENTUM_FRESHNESS_LOOKBACK_MIN minutes -- the move may already
     be rolling over by the time the order is about to submit, seconds to
     minutes after the strategy detected it. See engine/config.py for the
     full reasoning and known limitations (sharp reversals only, not gradual
@@ -118,7 +129,7 @@ def _check_momentum_freshness(signal: Signal) -> Tuple[bool, Optional[str]]:
 
     Returns (fresh, reject_reason). fresh=True with no reason for any
     strategy not in MOMENTUM_FRESHNESS_STRATEGIES, or when there isn't
-    enough recent bar data to judge — never blocks on missing data.
+    enough recent bar data to judge -- never blocks on missing data.
     """
     if not MOMENTUM_FRESHNESS_ENABLED or signal.strategy not in MOMENTUM_FRESHNESS_STRATEGIES:
         return True, None
@@ -134,64 +145,140 @@ def _check_momentum_freshness(signal: Signal) -> Tuple[bool, Optional[str]]:
     if pullback_pct > MOMENTUM_FRESHNESS_MAX_PULLBACK_PCT:
         return False, (
             f"{signal.symbol}: faded {pullback_pct:.1f}% off its {MOMENTUM_FRESHNESS_LOOKBACK_MIN}-min "
-            f"high (${recent_high:.2f} -> ${current_price:.2f}) — {signal.strategy} entry not fresh"
+            f"high (${recent_high:.2f} -> ${current_price:.2f}) -- {signal.strategy} entry not fresh"
         )
     return True, None
 
 
+def _entry_gate_bars(symbol: str, force_fresh: bool = False):
+    """Return premarket-inclusive 1m bars when needed so 09:30 entries can validate."""
+    bars = get_bars(symbol, period="1d", interval="1m", bypass_cache=force_fresh)
+    if bars.empty or "close" not in bars.columns or len(bars) < 62:
+        premarket = get_premarket_bars(symbol)
+        if not premarket.empty and "close" in premarket.columns and len(premarket) > len(bars):
+            bars = premarket
+    if not bars.empty and "time" in bars.columns:
+        try:
+            bars = bars.sort_values("time")
+        except Exception:
+            pass
+    return bars
+
+
+def _closed_1m_bars(bars):
+    """Keep only closed 1-minute candles; fall back to provider rows as closed if no time column."""
+    if bars.empty or "time" not in bars.columns:
+        return bars
+    try:
+        eastern = datetime.datetime.now(datetime.timezone.utc).astimezone().tzinfo
+        import pytz as _pytz
+        eastern = _pytz.timezone("America/New_York")
+        now_et = datetime.datetime.now(eastern)
+        current_minute = now_et.replace(second=0, microsecond=0)
+
+        def _to_et(value):
+            ts = value.to_pydatetime() if hasattr(value, "to_pydatetime") else value
+            if isinstance(ts, str):
+                ts = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            if getattr(ts, "tzinfo", None) is None:
+                ts = eastern.localize(ts)
+            return ts.astimezone(eastern)
+
+        et_times = bars["time"].apply(_to_et)
+        closed = bars[et_times < current_minute]
+        return closed if not closed.empty else bars.iloc[:0]
+    except Exception:
+        # Better to use the provider's completed rows than fail-open. If they are
+        # stale/empty, the checks below still block.
+        return bars
+
+
+def _entry_trend_snapshot(signal: Signal, is_long: bool, force_fresh: bool = False) -> Tuple[bool, str]:
+    """Full hard entry trend gate using two closed candles and recent 30m momentum."""
+    bars = _closed_1m_bars(_entry_gate_bars(signal.symbol, force_fresh=force_fresh))
+    high_col = "high" if "high" in bars.columns else "close"
+    if bars.empty or "close" not in bars.columns or high_col not in bars.columns or len(bars) < 62:
+        return False, f"{signal.symbol}: EMA/momentum trend unavailable (need 62 closed 1-min bars)"
+
+    closes = bars["close"].astype(float).reset_index(drop=True)
+    highs = bars[high_col].astype(float).reset_index(drop=True)
+    ema7 = closes.ewm(span=7, adjust=False).mean()
+    ema15 = closes.ewm(span=15, adjust=False).mean()
+
+    details = []
+    for idx in (len(closes) - 2, len(closes) - 1):
+        close_now = float(closes.iloc[idx])
+        ema7_now = float(ema7.iloc[idx])
+        ema15_now = float(ema15.iloc[idx])
+        ema7_delta = float(ema7.iloc[idx] - ema7.iloc[idx - 1])
+        spread_pct = ((ema7_now - ema15_now) / ema15_now * 100.0) if ema15_now else 0.0
+        ret30_pct = ((close_now - float(closes.iloc[idx - 30])) / float(closes.iloc[idx - 30]) * 100.0) if float(closes.iloc[idx - 30]) else 0.0
+        recent_high = float(highs.iloc[idx - 29:idx + 1].max())
+        previous_high = float(highs.iloc[idx - 59:idx - 29].max())
+
+        if is_long:
+            ok = (
+                ema7_now > ema15_now
+                and spread_pct >= EMA_ENTRY_MIN_SPREAD_PCT
+                and ema7_delta > 0
+                and close_now >= ema7_now
+                and ret30_pct > EMA_ENTRY_MIN_TRAILING_30M_RETURN_PCT
+                and recent_high > previous_high
+            )
+            need = (
+                f"need long EMA7>EMA15 spread>={EMA_ENTRY_MIN_SPREAD_PCT:.2f}%, "
+                f"EMA7 delta>0, price>=EMA7, trailing30>{EMA_ENTRY_MIN_TRAILING_30M_RETURN_PCT:.2f}%, "
+                "recent30 high > prior30 high"
+            )
+        else:
+            ok = (
+                ema7_now < ema15_now
+                and spread_pct <= -EMA_ENTRY_MIN_SPREAD_PCT
+                and ema7_delta < 0
+                and close_now <= ema7_now
+                and ret30_pct < -EMA_ENTRY_MIN_TRAILING_30M_RETURN_PCT
+                and recent_high < previous_high
+            )
+            need = (
+                f"need short EMA7<EMA15 spread<=-{EMA_ENTRY_MIN_SPREAD_PCT:.2f}%, "
+                f"EMA7 delta<0, price<=EMA7, trailing30<-{EMA_ENTRY_MIN_TRAILING_30M_RETURN_PCT:.2f}%, "
+                "recent30 high < prior30 high"
+            )
+
+        detail = (
+            f"candle {idx - len(closes) + 1}/0 close ${close_now:.2f}, "
+            f"EMA7 ${ema7_now:.2f}, EMA15 ${ema15_now:.2f}, spread {spread_pct:+.3f}%, "
+            f"EMA7 delta {ema7_delta:+.4f}, trailing30 {ret30_pct:+.3f}%, "
+            f"recent30 high ${recent_high:.2f} vs prior30 high ${previous_high:.2f}"
+        )
+        details.append(detail)
+        if not ok:
+            return False, f"{signal.symbol}: {detail} ({need}) -- trend not aligned with the {'long' if is_long else 'short'} entry"
+
+    return True, f"{signal.symbol}: EMA ENTRY PASS -- " + " | ".join(details)
+
+
 def _check_ema_trend_alignment(signal: Signal, is_long: bool, force_fresh: bool = False) -> Tuple[bool, Optional[str]]:
-    """2026-08-22, user request: simplified from an EMA9-vs-EMA20 crossover
-    to an EMA's own slope -- current-minute EMA minus the previous minute's
-    EMA must be positive for a long entry, negative for a short (checked
-    alongside the trail-buy entry). Applies to both directions, unlike
-    _check_momentum_freshness (long-only) -- a short entry needs the same
-    short-term-trend check.
+    """EMA7 slope + EMA7-vs-EMA15 crossover alignment gate for a fresh entry.
 
-    2026-08-24, user request: EMA9 -> EMA7 -- faster/more responsive to
-    recent price action, allows an earlier read on a turning trend.
-    Briefly reverted back to EMA9 the same day on a flawed read of the
-    backtest (EMA7 blocked 4 of today's real entries that EMA9 let
-    through -- but all 4 turned out to be losers under both exit versions,
-    so EMA7 blocking them was correct, not a problem). Verified: with the
-    current exit logic, EMA7 beats EMA9 on today's 13 real entries
-    (-$3.94 vs -$9.79) -- switched back to EMA7. (The EMA15-based exit this
-    was originally paired with, check_ema15_exit, was removed 2026-08-25 --
-    see check_ema9_exit for the current exit-side check.)
-
-    2026-08-25, user request: "check ema 7 delta and ema 3 delta both
-    positive for entry long (opposite for short)" -- EMA7's slope alone
-    used to be enough; EMA3 (faster, noisier) had to agree too for a
-    while, then dropped ("remove ema3 delta positive") once EMA7's slope
-    was paired with the crossover condition below -- the two together
-    (velocity + position) covered the same ground EMA3 was added for,
-    without a third moving average's own noise added on top.
-
-    2026-08-25, user request: "add one more condition of ema 7 above ema
-    15 for entry long order and vice versa for short" -- a structural
-    condition alongside EMA7's slope: EMA7 must sit on the right side of
-    EMA15 -- above it for a long, below it for a short. The slope check
-    only looks at velocity (is the average still moving the right way
-    this minute); this adds position (is the fast average actually
-    leading the slow one), the classic fast-over-slow crossover reading
-    of "in an uptrend." Both conditions must hold together.
+    This is the per-minute recheck gate used by check_pending_entries_ema /
+    check_blocked_entries_ema / _maybe_rearm_reentry. It deliberately stays on
+    the lighter slope+crossover reading (works from EMA_TREND_MIN_BARS bars)
+    rather than the full 62-bar _entry_trend_snapshot: the signal-time entry
+    gate in _validate_trade already applied the strict snapshot, and these
+    per-minute paths just need to notice a trend turn, fast, from whatever
+    bars are currently available.
 
     Missing/insufficient bar data (fewer than EMA_TREND_MIN_BARS of 1-min
-    history) blocks the entry. EMA alignment is a required entry condition,
-    so an unavailable reading must not be treated as approval.
+    history) blocks the recheck. EMA alignment is required, so an unavailable
+    reading must not be treated as approval.
 
     force_fresh=True bypasses get_bars()'s per-scan-cycle cache (see its
-    2026-08-27 docstring update). Pass it from any per-minute recheck
-    running on the SoftwareStopPoller thread (check_pending_entries_ema,
-    check_blocked_entries_ema, _maybe_rearm_reentry) -- that thread's whole
-    job is noticing a trend change since the last check, on a different
-    cadence than the equity scan that owns this cache; reading the scan's
-    stale snapshot there defeats the recheck. Confirmed live: BTDR's
-    resting re-entry order sat unfilled 2026-08-27 11:05-11:18 ET while
-    EMA7 was demonstrably below EMA15 the entire time, and
-    check_pending_entries_ema never cancelled it. Leave False for
-    _validate_trade's original signal-time check -- that one runs inside
-    the scan cycle that just populated the cache, so it's already correct
-    and re-fetching would just waste an API call.
+    2026-08-27 docstring update). Pass it from any per-minute recheck running
+    on the SoftwareStopPoller thread -- that thread's whole job is noticing a
+    trend change since the last check, on a different cadence than the equity
+    scan that owns this cache; reading the scan's stale snapshot there defeats
+    the recheck.
     """
     bars = get_bars(signal.symbol, period="1d", interval="1m", bypass_cache=force_fresh)
     if bars.empty or "close" not in bars.columns or len(bars) < EMA_TREND_MIN_BARS:
@@ -211,10 +298,9 @@ def _check_ema_trend_alignment(signal: Signal, is_long: bool, force_fresh: bool 
             f"{signal.symbol}: EMA7 delta {ema7_delta:+.4f} / "
             f"EMA7 ${ema7_now:.2f} vs EMA15 ${ema15_now:.2f} "
             f"(need {'rising delta + EMA7 above EMA15' if is_long else 'falling delta + EMA7 below EMA15'}) "
-            f"— trend not aligned with the {'long' if is_long else 'short'} entry"
+            f"-- trend not aligned with the {'long' if is_long else 'short'} entry"
         )
     return True, None
-
 
 def _resolve_freshness_reject(signal: Signal, fresh: bool, fade_reason: Optional[str]) -> Tuple[bool, Optional[str]]:
     """Decide what _validate_trade does with a _check_momentum_freshness
@@ -227,7 +313,7 @@ def _resolve_freshness_reject(signal: Signal, fresh: bool, fade_reason: Optional
     THIN_LIQUIDITY_EXCLUDED_STRATEGIES (2026-08-15: ORB/GapBreakout,
     measured net-negative specifically on their bypass trades), in which
     case it's hard-blocked regardless of the toggle. Split out for
-    unit-testability without a broker/bars connection — mutates signal in
+    unit-testability without a broker/bars connection -- mutates signal in
     place same as the inline version would, callers pass their own Signal
     instance."""
     if fresh:
@@ -282,7 +368,7 @@ def _live_quote_mid(client, symbol: str, fallback: float) -> float:
 def _apply_thin_liquidity_override(risk_info: Dict, signal: Signal, equity: float) -> Dict:
     """If signal.thin_liquidity is set, replace dollar_amount with a flat
     THIN_LIQUIDITY_POSITION_SIZE_PCT of equity, overriding confidence-scaling
-    entirely rather than stacking on top of it — a predictable cap on the
+    entirely rather than stacking on top of it -- a predictable cap on the
     downside regardless of how confident the firing strategy was. Two
     independent reasons set this flag, same sizing either way: a rejected-
     list symbol admitted anyway (TRADE_THIN_LIQUIDITY_REJECTS, engine/
@@ -303,7 +389,7 @@ def _apply_thin_liquidity_override(risk_info: Dict, signal: Signal, equity: floa
         out["stop_loss_pct"] = halved
         log_extra = f" | stop {risk_info['stop_loss_pct']:.1f}% -> {halved:.1f}%"
     log.info(
-        f"[SIZE] {signal.symbol}: thin-liquidity admit — "
+        f"[SIZE] {signal.symbol}: thin-liquidity admit -- "
         f"${risk_info['dollar_amount']:,.0f} -> ${thin_dollars:,.0f} "
         f"({THIN_LIQUIDITY_POSITION_SIZE_PCT:.0f}% flat){log_extra}"
     )
@@ -362,11 +448,21 @@ def _apply_strategy_kelly_mult(risk_info: Dict, strategy: str, equity: float) ->
     return dict(risk_info, allocation_pct=new_pct, dollar_amount=round(equity * new_pct / 100.0, 2))
 
 
-def _trail_pct_for(symbol: str, price: float, entry_log: Dict, gain_pct: float = None) -> Tuple[float, str]:
+def _trail_pct_for(symbol: str, price: float, entry_log: Dict, gain_pct: float = None, atr: Optional[float] = None) -> Tuple[float, str]:
     """Trailing-stop % for `symbol`. 2026-08-22, user request: replaced the
     tiered/thin-liquidity system (get_dynamic_tier + THIN_LIQUIDITY_
     TRAILING_STOP_MULT) with one flat floor, TRAIL_STOP_PCT, for every
     position -- no more per-tier or per-liquidity variability.
+
+    2026-09-01, user request ("change the trail stop exit to atr based
+    values"): an optional `atr` distance can now widen the floor per-symbol
+    -- ATR scaled by ATR_TRAIL_MULTIPLIER, floored at TRAIL_STOP_PCT and
+    capped at ATR_TRAIL_MAX_PCT, so a volatile name gets a volatility-scaled
+    stop instead of the same fixed leash as a quiet one. This function stays
+    PURE (no network) -- the caller fetches ATR and passes it in, via the
+    _atr_trail_pct_for() wrapper below. `atr` omitted/None/<=0 falls back to
+    the flat floor, exactly the pre-ATR behavior (keeps every existing unit
+    test on this helper valid).
 
     If `gain_pct` (current unrealized %) is given and positive, widen past
     the floor to PROFIT_TRAIL_GIVEBACK_PCT of that gain once it computes
@@ -380,6 +476,12 @@ def _trail_pct_for(symbol: str, price: float, entry_log: Dict, gain_pct: float =
     drifting out of sync with each other."""
     trail_pct = TRAIL_STOP_PCT
     label = "FLAT"
+    if atr is not None and atr > 0 and price > 0 and ATR_TRAIL_ENABLED:
+        atr_pct = atr / price * 100.0 * ATR_TRAIL_MULTIPLIER
+        if atr_pct > ATR_TRAIL_MAX_PCT:
+            atr_pct = ATR_TRAIL_MAX_PCT
+        if atr_pct > trail_pct:
+            trail_pct, label = round(atr_pct, 2), "ATR"
     if gain_pct is not None and gain_pct > 0:
         profit_trail = round(gain_pct * (PROFIT_TRAIL_GIVEBACK_PCT / 100.0), 2)
         if profit_trail > trail_pct:
@@ -387,8 +489,24 @@ def _trail_pct_for(symbol: str, price: float, entry_log: Dict, gain_pct: float =
     return trail_pct, label
 
 
+def _atr_trail_pct_for(symbol: str, price: float, entry_log: Dict, gain_pct: float = None) -> Tuple[float, str]:
+    """ATR-aware trailing-stop % -- the wrapper every real call site uses.
+    Computes ATR(ATR_TRAIL_PERIOD) off the cached 1-min bars and passes it
+    into _trail_pct_for(); any fetch/compute failure, empty/insufficient
+    bars, or ATR below the floor falls back to the flat TRAIL_STOP_PCT
+    (fail-open -- a missing reading must never loosen a stop)."""
+    atr = 0.0
+    if ATR_TRAIL_ENABLED:
+        try:
+            _bars = get_bars(symbol, period="1d", interval="1m")
+            atr = calculate_atr(_bars, period=ATR_TRAIL_PERIOD)
+        except Exception:
+            atr = 0.0
+    return _trail_pct_for(symbol, price, entry_log, gain_pct=gain_pct, atr=atr)
+
+
 def _demo() -> None:
-    """python -m engine.execution.enhanced — asserts the ratchet math holds
+    """python -m engine.execution.enhanced -- asserts the ratchet math holds
     at its key points before it's trusted against a live account."""
     global _get_scan_targets, _check_ema_trend_alignment, get_bars, ENTRY_WINDOW_END_ET
     assert ratchet_scale(0.0) == 1.0, "below floor -> no tightening"
@@ -412,6 +530,19 @@ def _demo() -> None:
     r = _trail_pct_for("X", 10.0, {}, gain_pct=above)
     assert r == (round(above * PROFIT_TRAIL_GIVEBACK_PCT / 100.0, 2), "PROFIT"), r
     print("_trail_pct_for: all checks passed")
+
+    # _trail_pct_for ATR widening: 2026-09-01, user request ("change the
+    # trail stop exit to atr based values"). `atr` is a caller-provided
+    # distance (the wrapper fetches it) -- this helper stays pure.
+    assert _trail_pct_for("X", 10.0, {}, atr=0.0) == (TRAIL_STOP_PCT, "FLAT"), "zero ATR -> flat floor"
+    assert _trail_pct_for("X", 10.0, {}, atr=0.05) == (TRAIL_STOP_PCT, "FLAT"), "ATR below floor -> floor"
+    atr_widen = round(0.20 / 10.0 * 100.0 * ATR_TRAIL_MULTIPLIER, 2)  # $0.20 ATR on $10
+    assert _trail_pct_for("X", 10.0, {}, atr=0.20) == (atr_widen, "ATR"), "ATR wider than floor -> ATR label"
+    assert _trail_pct_for("X", 10.0, {}, atr=1.00) == (ATR_TRAIL_MAX_PCT, "ATR"), "huge ATR capped at ATR_TRAIL_MAX_PCT"
+    # Profit giveback must still widen past the ATR value once gain is large.
+    r_atr = _trail_pct_for("X", 10.0, {}, gain_pct=20.0, atr=0.20)  # ATR -> 3.0%, profit -> 4.0%
+    assert r_atr == (round(20.0 * PROFIT_TRAIL_GIVEBACK_PCT / 100.0, 2), "PROFIT"), r_atr
+    print("_trail_pct_for ATR widening: all checks passed")
 
     # _update_ema9_peak: tracks the running peak (long) / trough (short) of
     # EMA9 since entry -- the reference check_ema9_exit trails against
@@ -522,8 +653,9 @@ def _demo() -> None:
     # calls (_get_scan_targets, _check_ema_trend_alignment, get_bars,
     # ENTRY_WINDOW_END_ET) and restores them in a finally so this can't leak
     # into any other test or a real run.
-    _orig_scan_targets, _orig_gate, _orig_bars, _orig_window = (
-        _get_scan_targets, _check_ema_trend_alignment, get_bars, ENTRY_WINDOW_END_ET
+    _orig_scan_targets, _orig_gate, _orig_bars, _orig_window, _orig_reentry_perf, _orig_lunch_break = (
+        _get_scan_targets, _check_ema_trend_alignment, get_bars, ENTRY_WINDOW_END_ET,
+        EnhancedExecutor._check_30m_reentry_performance, in_lunch_break,
     )
     try:
         import pandas as _pd
@@ -557,6 +689,15 @@ def _demo() -> None:
                 self._ema9_trail_peak = {}
                 self._last_known_positions = {}
                 self._loss_reentry_required = set()
+                self._loss_block_morning = set()
+                self._loss_block_day = set()
+                self._symbol_loss_counts_today = {}
+                self._loss_block_date = None
+
+            def _record_symbol_loss(self, sym, tag):
+                # bare bookkeeping stub -- no date-sensitive morning/day block
+                # logic is needed for the re-entry-arming assertions below.
+                self._symbol_loss_counts_today[sym] = self._symbol_loss_counts_today.get(sym, 0) + 1
 
             def _get_account(self, force_refresh=False):
                 return SimpleNamespace(equity=10000.0, buying_power=10000.0)
@@ -567,8 +708,10 @@ def _demo() -> None:
                 return True
 
         ENTRY_WINDOW_END_ET = "23:59"  # never "past window" during this test run
+        in_lunch_break = lambda *_: False  # never inside the midday break during this test run
         _get_scan_targets = lambda: ["FOO", "BAR"]  # FOO in top-30, BAZ is not
         get_bars = lambda *a, **k: _pd.DataFrame({"close": [1.20, 1.22, 1.24]})
+        EnhancedExecutor._check_30m_reentry_performance = staticmethod(lambda symbol, is_long: (True, ""))
 
         rearm = EnhancedExecutor._maybe_rearm_reentry
         stopped_out = EnhancedExecutor.detect_stopped_out_positions
@@ -619,9 +762,10 @@ def _demo() -> None:
         assert len(s.client.submitted) == 1, "an unmarked disappeared position must be treated as a genuine stop and re-armed"
         assert s.order_cache.get("FOO") == "fake-order-id"
     finally:
-        _get_scan_targets, _check_ema_trend_alignment, get_bars, ENTRY_WINDOW_END_ET = (
-            _orig_scan_targets, _orig_gate, _orig_bars, _orig_window
+        _get_scan_targets, _check_ema_trend_alignment, get_bars, ENTRY_WINDOW_END_ET, in_lunch_break = (
+            _orig_scan_targets, _orig_gate, _orig_bars, _orig_window, _orig_lunch_break
         )
+        EnhancedExecutor._check_30m_reentry_performance = staticmethod(_orig_reentry_perf)
     print("_maybe_rearm_reentry / detect_stopped_out_positions: all checks passed")
 
     # check_pending_entries_ema: 2026-08-27, user request ("ensure 1min
@@ -738,7 +882,9 @@ def _demo() -> None:
     # fire/wait/expire, that one symbol's gate check raising doesn't take
     # down the rest, and that a raised gate check leaves that symbol
     # queued (not silently dropped) rather than treated as a pass or fail.
-    _orig_gate3, _orig_scan3, _orig_window3 = _check_ema_trend_alignment, _get_scan_targets, ENTRY_WINDOW_END_ET
+    _orig_gate3, _orig_scan3, _orig_window3, _orig_lunch_break3 = (
+        _check_ema_trend_alignment, _get_scan_targets, ENTRY_WINDOW_END_ET, in_lunch_break,
+    )
     try:
         class _BlockedClient:
             def __init__(self):
@@ -767,6 +913,7 @@ def _demo() -> None:
 
         ENTRY_WINDOW_END_ET = "23:59"
         _get_scan_targets = lambda: ["GOOD1", "GOOD2", "BAD", "RAISES"]
+        in_lunch_break = lambda *_: False  # never inside the midday break during this test run
 
         def _gate_by_symbol(sig, is_long, force_fresh=False):
             if sig.symbol == "RAISES":
@@ -800,7 +947,9 @@ def _demo() -> None:
 
         print("check_blocked_entries_ema: all checks passed")
     finally:
-        _check_ema_trend_alignment, _get_scan_targets, ENTRY_WINDOW_END_ET = _orig_gate3, _orig_scan3, _orig_window3
+        _check_ema_trend_alignment, _get_scan_targets, ENTRY_WINDOW_END_ET, in_lunch_break = (
+            _orig_gate3, _orig_scan3, _orig_window3, _orig_lunch_break3,
+        )
 
     # check_ema9_exit: same 2026-08-27 parallelization request, applied to
     # the fetch/decide phase (fresh bar fetch per same-day position).
@@ -871,8 +1020,6 @@ def _demo() -> None:
         get_bars = _orig_bars2
 
 
-
-
 class OrderType(Enum):
     LONG  = "long"
     SHORT = "short"
@@ -880,7 +1027,7 @@ class OrderType(Enum):
 
 @dataclass
 class PDTTracker:
-    """Pattern Day Trader tracking — syncs with live Alpaca daytrade_count."""
+    """Pattern Day Trader tracking -- syncs with live Alpaca daytrade_count."""
     trades: list = field(default_factory=list)
 
     def add(self, date: datetime.date) -> None:
@@ -894,9 +1041,6 @@ class PDTTracker:
             return 999
         used = max(live_count, len(self.trades))
         return max(0, PDT_MAX_TRADES - used)
-
-    def can_trade(self, equity: float, live_count: int = 0, pdt_flagged: bool = False) -> bool:
-        return self.remaining(equity, live_count, pdt_flagged) > 0
 
 
 @dataclass
@@ -916,7 +1060,7 @@ class PositionInfo:
 
     def total_market_value(self) -> float:
         """Sum of abs(market_value) across every open equity position
-        (options legs excluded — they're sized/margined separately, same
+        (options legs excluded -- they're sized/margined separately, same
         exclusion used throughout this file for concentration checks)."""
         total = 0.0
         for sym, pos in self.positions_dict.items():
@@ -931,7 +1075,7 @@ class PositionInfo:
 
 @dataclass
 class AccountSnapshot:
-    """Cached Alpaca account state — equity, buying power, live PDT count."""
+    """Cached Alpaca account state -- equity, buying power, live PDT count."""
     equity:              float
     buying_power:        float
     daytrade_count:      int
@@ -940,9 +1084,9 @@ class AccountSnapshot:
     timestamp:           float = field(default=0.0)
 
 
-# ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+# ----------------------------------------------------------------------------------------------------------------------------
 # Executor
-# ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+# ----------------------------------------------------------------------------------------------------------------------------
 class EnhancedExecutor:
     """Optimized trade executor with consolidated long/short logic."""
 
@@ -955,10 +1099,10 @@ class EnhancedExecutor:
         self._cache_timestamp: float = 0
         self._cache_ttl:       float = 5.0
         self._account_cache:  Optional[AccountSnapshot] = None
-        self._account_ttl:    float = 2.0   # tight TTL — buying power must be fresh between orders
+        self._account_ttl:    float = 2.0   # tight TTL -- buying power must be fresh between orders
         self._entry_submission_lock = threading.RLock()
         self._ema_entry_confirmations: Dict[str, Tuple[int, float]] = {}
-        self._htb_cache:      set   = set()   # hard-to-borrow symbols — skip shorts this session
+        self._htb_cache:      set   = set()   # hard-to-borrow symbols -- skip shorts this session
         self._entry_log:   Dict[str, dict] = {}  # {symbol: {"strategy": str, "date": date}}
         self._swap_cycle_closed: set = set()     # positions already swapped this scan cycle
         self._ratchet_done: set = set()          # symbols whose stop was already confidence-tightened
@@ -969,8 +1113,8 @@ class EnhancedExecutor:
         # _update_ema9_peak. Cleared on close in
         # detect_stopped_out_positions.
         self._ema9_trail_peak: Dict[str, float] = {}
-        self._pdt_stop_blocked: Dict[str, float] = {}  # {symbol: stop_price} — broker-rejected stops; monitored in software
-        self._last_known_positions: Dict[str, dict] = {}  # {symbol: {entry_price, last_price, is_long, qty}} — snapshot used to notice a position disappearing between polls
+        self._pdt_stop_blocked: Dict[str, float] = {}  # {symbol: stop_price} -- broker-rejected stops; monitored in software
+        self._last_known_positions: Dict[str, dict] = {}  # {symbol: {entry_price, last_price, is_long, qty}} -- snapshot used to notice a position disappearing between polls
         # 2026-08-26, user request ("I have put in 1% on the hope the new
         # orders will be placed immediately after the exit with conditions
         # check every minute, but it doesn't seem to work"): every
@@ -986,17 +1130,19 @@ class EnhancedExecutor:
         # the only path that already had re-entry logic) -- genuinely a stop,
         # so it's eligible for the same re-entry check as any other stop.
         self._no_rearm: set = set()
-        self._afterhours_chase_count: Dict[str, int] = {}  # {symbol: consecutive re-chase attempts} — widens slip each retry so a fast-falling after-hours book actually fills
+        self._afterhours_chase_count: Dict[str, int] = {}  # {symbol: consecutive re-chase attempts} -- widens slip each retry so a fast-falling after-hours book actually fills
         self._no_gain_chase_count: Dict[str, int] = {}  # same, for close_no_gain_positions's re-chase
-        self._pdt_overnight_forced: set = set()  # symbols where PDT also blocks close — forced overnight, no retries
+        self._pdt_overnight_forced: set = set()  # symbols where PDT also blocks close -- forced overnight, no retries
         self._pdt_violation_alerted: bool = False  # tracks whether the PDT violation email has been sent this session
-        self._force_close_pending: Dict[str, dict] = {}  # {symbol: {"reason": str, "chase_count": int}} — EOD/guardrail closes not yet confirmed flat; swept by _sweep_force_closes until filled
-        self._guardrail_eod_closed: Dict[object, set] = {}  # {date: {symbol, ...}} — symbols already force-closed today by close_guardrail_fail_positions, so its per-minute reruns don't re-cancel/resubmit an order already in flight
+        self._force_close_pending: Dict[str, dict] = {}  # {symbol: {"reason": str, "chase_count": int}} -- EOD/guardrail closes not yet confirmed flat; swept by _sweep_force_closes until filled
+        self._eod_closed: Dict[object, set] = {}  # {date: {symbol, ...}} -- EOD close orders already submitted today, including positions missing an entry-log row
+        self._exchange_close_cache: Dict[object, Tuple[datetime.datetime, datetime.datetime, str]] = {}  # {date: (exchange_close_et, eod_at_et, source)}
+        self._guardrail_eod_closed: Dict[object, set] = {}  # {date: {symbol, ...}} -- symbols already force-closed today by close_guardrail_fail_positions, so its per-minute reruns don't re-cancel/resubmit an order already in flight
         # {symbol: deque of the last N check_price_drift_stop prices, maxlen = PRICE_DRIFT_LOOKBACK_MIN / PRICE_DRIFT_CHECK_INTERVAL_MIN}
-        # deque[0] is the oldest sample kept — the ~PRICE_DRIFT_LOOKBACK_MIN-minutes-ago reference once full.
+        # deque[0] is the oldest sample kept -- the ~PRICE_DRIFT_LOOKBACK_MIN-minutes-ago reference once full.
         self._price_drift_history: Dict[str, Deque[float]] = {}
         # {symbol: {"order_id": str, "qty": int, "is_long": bool, "chase_count": int}}
-        # — resting entry orders not yet confirmed filled; swept by _sweep_pending_entries
+        # -- resting entry orders not yet confirmed filled; swept by _sweep_pending_entries
         self._entry_pending: Dict[str, dict] = {}
         # {symbol: {"signal": Signal, "order_type": OrderType, "queued_at": datetime}}
         # -- a signal that was blocked ONLY by _check_ema_trend_alignment,
@@ -1015,7 +1161,7 @@ class EnhancedExecutor:
         # cancelled to place a new in next minute" once conditions realign.
         self._pending_entry_signals: Dict[str, dict] = {}
         self._stale_exit_done: object = None  # date of last completed swing stale-exit check
-        # {symbol: count} — how many times a symbol has been entered today, reset
+        # {symbol: count} -- how many times a symbol has been entered today, reset
         # on a date rollover (_entries_today_date). 2026-08-18, user request: a
         # 2nd+ same-day entry uses a trailing BUY (see REENTRY_TRAIL_PCT) instead
         # of chasing a marketable limit -- PFSA that day, 2nd EarlySqueeze entry
@@ -1029,11 +1175,36 @@ class EnhancedExecutor:
         # consumed only after the next entry succeeds, so every re-entry route
         # (including the five-second scan retry) shares the same 30m gate.
         self._loss_reentry_required: set = set()
+        # {symbol: monotonic timestamp} -- short same-symbol submit debounce.
+        # Broker/order-cache visibility can lag the 5s poller; this catches
+        # same-process double-fires before they become duplicate live orders.
+        self._recent_entry_submits: Dict[str, float] = {}
+        # {symbol: {"tranches_done": int, "tranche_qty": int, "is_long": bool,
+        #          "entry_price": float}} -- staged-allocation bookkeeping.
+        # First tranche is submitted at signal time (_execute_entry); remaining
+        # tranches are added by maybe_add_staged_tranches() only while the
+        # position is not losing and the fresh EMA gate still aligns.
+        self._staged_allocation: Dict[str, dict] = {}
         # symbols confirmed to have zero prior broker fill history -- lets
         # _is_reentry_signal's broker fallback (_get_entry_datetime) skip the
         # round-trip on every future entry attempt for a genuinely new name.
         self._no_history_cache: set = set()
+        self._symbol_loss_counts_today: Dict[str, int] = {}
+        self._loss_block_morning: set = set()
+        self._loss_block_day: set = set()
+        self._loss_block_date: Optional[datetime.date] = None
         self.market_state: Optional[MarketState] = None
+        # 2026-09-02: guardian daily-loss halt state. _halt_until_eod blocks
+        # EVERY entry/re-entry path (checked in _submit_entry_order, the single
+        # order-submission funnel) once a guardian flat fires; cleared at the
+        # next daily reset. _guardian_halt_closed is a per-day dedupe so the
+        # orchestrator's poll tick only ever flattens once per day.
+        self._halt_until_eod: bool = False
+        self._guardian_halt_closed: Optional[datetime.date] = None
+        # Cached result of session.daily_loss_halted (15s TTL -- avoids hammering
+        # get_account on the 5s poller while keeping the halt fresh enough).
+        self._loss_halted_cache: Optional[bool] = None
+        self._loss_halted_cache_ts: float = 0.0
         self._rebuild_entry_log_from_orders()
         self._rebuild_order_cache_from_broker()
 
@@ -1041,36 +1212,252 @@ class EnhancedExecutor:
         """Store the active market snapshot for per-cycle execution decisions."""
         self.market_state = market_state
 
-    def _submit_entry_order(self, symbol: str, request) -> Optional[object]:
-        """Submit at most one active DAY trailing entry per symbol."""
+    @staticmethod
+    def _now_et() -> datetime.datetime:
+        import pytz as _pytz
+        return datetime.datetime.now(_pytz.timezone("America/New_York"))
+
+    def prewarm_entry_ema(self, symbols) -> None:
+        """Fetch premarket-inclusive 1-minute bars and evaluate EMA gates before 09:30."""
+        warm_symbols = [str(s).upper() for s in list(dict.fromkeys(symbols or []))[:60] if str(s).strip()]
+        ready = long_ready = short_ready = 0
+        for symbol in warm_symbols:
+            try:
+                bars = _entry_gate_bars(symbol, force_fresh=True)
+                closed = _closed_1m_bars(bars)
+                if len(closed) < 62:
+                    log.debug(f"[PREMARKET EMA] {symbol} not ready: need 62 closed 1-min bars, have {len(closed)}")
+                    continue
+
+                ready += 1
+                stub = SimpleNamespace(symbol=symbol)
+                long_ok, long_reason = _entry_trend_snapshot(stub, True, force_fresh=False)
+                short_ok, short_reason = _entry_trend_snapshot(stub, False, force_fresh=False)
+                if long_ok:
+                    long_ready += 1
+                    log.info(f"[PREMARKET EMA] {symbol} LONG READY: {long_reason}")
+                if short_ok:
+                    short_ready += 1
+                    log.info(f"[PREMARKET EMA] {symbol} SHORT READY: {short_reason}")
+                if not long_ok and not short_ok:
+                    log.debug(f"[PREMARKET EMA] {symbol} not aligned: long=({long_reason}); short=({short_reason})")
+            except Exception as exc:
+                log.debug(f"PREMARKET EMA warmup {symbol} failed: {exc}")
+        log.info(
+            f"[PREMARKET EMA] evaluated {ready}/{len(warm_symbols)} symbols before entry window; "
+            f"long_ready={long_ready}, short_ready={short_ready}"
+        )
+
+    def _reset_symbol_loss_blocks_if_needed(self) -> None:
+        today = self._now_et().date()
+        if getattr(self, "_loss_block_date", None) == today:
+            return
+        self._loss_block_date = today
+        self._symbol_loss_counts_today = {}
+        self._loss_block_morning = set()
+        self._loss_block_day = set()
+
+    def _record_symbol_loss(self, symbol: str, tag: str) -> None:
+        self._reset_symbol_loss_blocks_if_needed()
+        count = self._symbol_loss_counts_today.get(symbol, 0) + 1
+        self._symbol_loss_counts_today[symbol] = count
+        now_et = self._now_et()
+        session_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+        first_30_done = session_open + datetime.timedelta(minutes=30)
+        if session_open <= now_et < first_30_done:
+            self._loss_block_morning.add(symbol)
+            log.warning(f"SYMBOL BLOCK {symbol}: loss during first 30 minutes via {tag}; blocked until {LOSS_BLOCK_MORNING_END_ET} ET")
+        if count >= SYMBOL_DAILY_LOSS_BLOCK_COUNT:
+            self._loss_block_day.add(symbol)
+            log.warning(f"SYMBOL BLOCK {symbol}: {count} losses today; blocked for rest of day")
+
+    def _symbol_entry_block_reason(self, symbol: str) -> Optional[str]:
+        self._reset_symbol_loss_blocks_if_needed()
+        if is_dead_ticker(symbol):
+            return f"{symbol}: blocked due to 10+ consecutive stale/empty data fetches"
+        if symbol in self._loss_block_day:
+            return f"{symbol}: blocked for rest of day after {self._symbol_loss_counts_today.get(symbol, 0)} losses"
+        now_et = self._now_et()
+        if symbol in self._loss_block_morning and now_et.strftime("%H:%M") < LOSS_BLOCK_MORNING_END_ET:
+            return f"{symbol}: blocked for morning after first-30-minute loss until {LOSS_BLOCK_MORNING_END_ET} ET"
+        return None
+    def _entry_halt_active(self) -> bool:
+        """True when no new entry orders may be submitted.
+
+        Two independent halts feed it:
+          1. Guardian halt -- _halt_until_eod was set by guardian_halt_flatten()
+             (the loss guardian's flat_request.flag fired); entries stay blocked
+             until the next daily reset.
+          2. In-bot daily-loss limit -- session.daily_loss_halted() tripped.
+             The orchestrator's scan gate has always checked this inline, but
+             every RE-ENTRY path (_maybe_rearm_reentry, detect_stopped_out_
+             positions, check_blocked_entries_ema, check_pending_entries_ema,
+             staged tranches) skipped it -- the single biggest loss driver in
+             the 9/1 reconstruction. All of those submit through
+             _submit_entry_order, so gating here closes the hole by
+             construction. 15s cache: the 5s poller would otherwise hammer
+             get_account.
+        """
+        if getattr(self, "_halt_until_eod", False):
+            return True
+        now = time.time()
+        cached = getattr(self, "_loss_halted_cache", None)
+        cached_ts = getattr(self, "_loss_halted_cache_ts", 0.0)
+        if cached is not None and now - cached_ts < 15:
+            return cached
+        regime = "bull"
+        ms = getattr(self, "market_state", None)
+        if ms is not None and getattr(ms, "bull_regime", None) is False:
+            regime = "bear"
+        try:
+            halted = _session.daily_loss_halted(self.client, regime=regime)
+        except Exception as e:
+            log.warning(f"[LOSS-HALT] daily-loss check failed (fail-open): {e}")
+            halted = False
+        self._loss_halted_cache, self._loss_halted_cache_ts = halted, now
+        return halted
+
+    def _submit_entry_order(self, symbol: str, request, allow_existing_position: bool = False,
+                            scale_in: bool = False) -> Optional[object]:
+        """Submit at most one active DAY entry per symbol.
+
+        2026-08-31: add an in-process same-symbol debounce. Live RBLX showed
+        two accepted BUY orders inside ~9 seconds; broker order lists and the
+        one-slot order_cache can lag fast retry threads, so guard immediately
+        before the broker call and stamp only after Alpaca accepts.
+
+        allow_existing_position=True is used by staged-allocation adds
+        (maybe_add_staged_tranches): the whole point is to scale INTO an
+        already-open position, so the "position already open" duplicate guard
+        is skipped while every other guard (debounce, order_cache,
+        _entry_pending, _pending_entry_signals, resting broker order) still
+        applies.
+
+        scale_in=True (staged-allocation tranches only) additionally bypasses
+        the two FIRST-ENTRY-only local guards -- the 60s _recent_entry_submits
+        debounce and the order_cache slot holding the first tranche's order id.
+        Without this, tranche 2 could be blocked for the life of the position:
+        the first entry stamps both, and order_cache for a filled order is only
+        cleared opportunistically by check_pending_entries_ema's stale-cleanup.
+        This is safe because the staged path itself has already verified, via
+        the broker, that (a) a position is actually open (first tranche FILLED
+        -- an unfilled resting order has no position to scale into) and (b) the
+        fresh EMA gate passed. Every broker-side guard (active same-symbol DAY
+        order) and the local pending-entry guards (_entry_pending,
+        _pending_entry_signals) still apply, so a resting unfilled first
+        tranche can never produce a duplicate.
+
+        Broker-side duplicate checks (open position / resting active order)
+        are best-effort: a minimal or mocked client without the position/order
+        listing methods still submits (the in-process order_cache /
+        _entry_pending / _pending_entry_signals guards above remain the hard
+        ones). Real Alpaca clients expose both, so production keeps the
+        one-position-per-symbol enforcement.
+        """
         lock = getattr(self, "_entry_submission_lock", None)
         if lock is None:
             lock = threading.RLock()
             self._entry_submission_lock = lock
         with lock:
             try:
+                if self._entry_halt_active():
+                    log.warning(
+                        f"[LOSS-HALT] Entry blocked {symbol}: guardian/daily-loss halt active -- "
+                        f"no new entries until the next daily reset"
+                    )
+                    return None
+                now_mono = time.monotonic()
+                recent = getattr(self, "_recent_entry_submits", None)
+                if recent is None:
+                    recent = {}
+                    self._recent_entry_submits = recent
+                if not scale_in:
+                    # First-entry debounce + local cache slot: only meaningful
+                    # for a NEW position. A scale-in tranche has already proven
+                    # (broker position check in the staged path) that the first
+                    # entry filled, so these two are bypassed -- see docstring.
+                    last_submit = recent.get(symbol)
+                    if last_submit is not None:
+                        age = now_mono - last_submit
+                        if age < DUPLICATE_ENTRY_BLOCK_SECONDS:
+                            log.warning(
+                                f"Duplicate entry blocked {symbol}: recent submit {age:.1f}s ago "
+                                f"(< {DUPLICATE_ENTRY_BLOCK_SECONDS}s)"
+                            )
+                            return None
+                        recent.pop(symbol, None)
+
+                    if symbol in getattr(self, "order_cache", {}):
+                        log.warning(f"Duplicate entry blocked {symbol}: local order_cache already has {self.order_cache[symbol]}")
+                        return None
+                if symbol in getattr(self, "_entry_pending", {}):
+                    log.warning(f"Duplicate entry blocked {symbol}: local pending entry exists")
+                    return None
+                if symbol in getattr(self, "_pending_entry_signals", {}):
+                    log.warning(f"Duplicate entry blocked {symbol}: local pending entry signal exists")
+                    return None
+
+                if getattr(self.client, "get_all_positions", None) is not None:
+                    try:
+                        positions = self._get_positions(force_refresh=True)
+                        if positions.has_position(symbol) and not allow_existing_position:
+                            log.warning(f"Duplicate entry blocked {symbol}: position already open")
+                            return None
+                    except Exception as pos_err:
+                        log.warning(f"Entry position duplicate check failed for {symbol}: {pos_err} -- refusing submission")
+                        return None
+
                 active_statuses = {"new", "partially_filled", "pending_new", "accepted", "held"}
                 get_orders = getattr(self.client, "get_orders", None)
-                if get_orders is None:
-                    return self.client.submit_order(request)
-                for order in get_orders() or []:
-                    raw_type = getattr(order, "order_type", "")
-                    order_type = str(getattr(raw_type, "value", raw_type)).lower()
-                    raw_status = getattr(order, "status", "")
-                    status = str(getattr(raw_status, "value", raw_status)).lower()
-                    if (
-                        getattr(order, "symbol", None) == symbol
-                        and "trailing_stop" in order_type
-                        and getattr(order, "time_in_force", None) == TimeInForce.DAY
-                        and status in active_statuses
-                    ):
-                        log.warning(f"Duplicate entry blocked {symbol}: active order {order.id}")
-                        return None
+                if get_orders is not None:
+                    for order in get_orders() or []:
+                        raw_status = getattr(order, "status", "")
+                        status = str(getattr(raw_status, "value", raw_status)).lower()
+                        if getattr(order, "symbol", None) == symbol and status in active_statuses:
+                            log.warning(f"Duplicate entry blocked {symbol}: active broker order {order.id} status={status}")
+                            return None
             except Exception as e:
-                log.warning(f"Entry duplicate check failed for {symbol}: {e} — refusing submission")
+                log.warning(f"Entry duplicate check failed for {symbol}: {e} -- refusing submission")
                 return None
-            return self.client.submit_order(request)
 
+            order = self.client.submit_order(request)
+            getattr(self, "_recent_entry_submits", {})[symbol] = time.monotonic()
+            return order
+
+    def _cancel_opposite_orders_before_entry(self, symbol: str, is_long: bool) -> None:
+        """Cancel stale/opposite resting orders for `symbol` before entering.
+
+        User request (staged/allocation hardening): before submitting a fresh
+        entry, cancel any resting DAY order for the same symbol on the OPPOSITE
+        side (e.g. a leftover SELL when entering LONG, or a leftover BUY when
+        entering SHORT) so the new entry can't conflict with a stale opposite
+        book. GTC trailing stops (protective exits on a held position) are
+        deliberately untouched. Best-effort: any failure just logs and lets the
+        entry proceed (the duplicate guards in _submit_entry_order still block
+        a genuinely conflicting active order).
+        """
+        try:
+            expected_side = OrderSide.BUY if is_long else OrderSide.SELL
+            for order in (self.client.get_orders() or []):
+                if getattr(order, "symbol", None) != symbol:
+                    continue
+                if getattr(order, "time_in_force", None) == TimeInForce.GTC:
+                    continue  # protective stop -- never cancel before entry
+                raw_side = getattr(order, "side", "")
+                side = str(getattr(raw_side, "value", raw_side)).lower()
+                expected = str(getattr(expected_side, "value", expected_side)).lower()
+                if side and side != expected:
+                    try:
+                        self.client.cancel_order_by_id(str(order.id))
+                        time.sleep(0.2)
+                        log.warning(
+                            f"PRE-ENTRY CANCEL {symbol}: cancelled opposite-side resting "
+                            f"{side.upper()} order {order.id} before {expected.upper()} entry"
+                        )
+                    except Exception as cancel_err:
+                        log.warning(f"PRE-ENTRY CANCEL {symbol}: opposite order {order.id} cancel failed: {cancel_err}")
+        except Exception as e:
+            log.debug(f"PRE-ENTRY CANCEL {symbol}: order scan failed (non-fatal): {e}")
     # -- Entry Log Rebuild (survive restarts) ----------------------------
     def _rebuild_entry_log_from_orders(self) -> None:
         """On startup, reconstruct today's entry log from Alpaca filled orders.
@@ -1102,7 +1489,7 @@ class EnhancedExecutor:
             except Exception:
                 positions = []
             is_long_by_sym = {p.symbol: float(p.qty) > 0 for p in positions}
-            # Filter to today only — avoids fetching the full account order history
+            # Filter to today only -- avoids fetching the full account order history
             # on accounts with months of activity (can be thousands of orders).
             today_start = datetime.datetime.combine(today, datetime.time.min).replace(tzinfo=pytz.UTC)
             req = GetOrdersRequest(status=QueryOrderStatus.CLOSED, after=today_start)
@@ -1119,13 +1506,13 @@ class EnhancedExecutor:
                     continue
                 sym = order.symbol
                 if sym not in is_long_by_sym:
-                    continue  # no open position left for this symbol — nothing to protect
+                    continue  # no open position left for this symbol -- nothing to protect
                 # order.side is an OrderSide enum; str(enum) is "OrderSide.SELL", not
                 # "sell" -- comparing that against a bare "buy"/"sell" literal never
                 # matches. .value gives the plain string; getattr falls back to the
                 # raw attribute so a plain string (e.g. from a test double) still
                 # works. 2026-08-14: this was the actual root cause of the rebuild
-                # being a total no-op — the "Entry log rebuilt from today's orders"
+                # being a total no-op -- the "Entry log rebuilt from today's orders"
                 # log line had never once fired in the whole log history, for ANY
                 # symbol, long or short.
                 raw_side = getattr(order, "side", "")
@@ -1215,11 +1602,11 @@ class EnhancedExecutor:
     # -- Position Cache ----------------------------------------------------
     def _has_pending_close(self, symbol: str) -> bool:
         """True if *symbol* already has a resting non-GTC order (i.e. something
-        other than its routine protective trailing stop) — meaning a swap-close
+        other than its routine protective trailing stop) -- meaning a swap-close
         was already submitted for it on an earlier cycle and just hasn't filled
         yet (routine in pre/after-hours illiquidity). Candidate-finders use this
         to avoid re-selecting the same position for a second close order before
-        the first one clears — confirmed in production 2026-08-05: without this,
+        the first one clears -- confirmed in production 2026-08-05: without this,
         RRC and GCT each got a duplicate close submitted 10 minutes apart, and
         both swaps were for nothing since the intended new entry (PLTR/ONDS)
         still got skipped on insufficient buying power either time (freed cash
@@ -1242,7 +1629,7 @@ class EnhancedExecutor:
 
         Does NOT require qty_available > 0: every position here normally carries
         a full-size GTC trailing stop (qty_available is always 0 as a result),
-        and _attempt_swap already cancels that resting order before closing —
+        and _attempt_swap already cancels that resting order before closing --
         requiring qty_available > 0 here meant this never found a candidate in
         practice, silently defeating the whole swap-on-high-confidence feature.
         """
@@ -1273,7 +1660,7 @@ class EnhancedExecutor:
         """Return the symbol of the oldest closable long position held >= min_hours
         (default: same 24h bar as NO_GAIN_EXIT_HOURS), for swap-out when a new
         high-confidence signal arrives and the book is full. Age takes priority
-        over P&L here — a day-old idea makes room for a stronger new one whether
+        over P&L here -- a day-old idea makes room for a stronger new one whether
         it's currently green or red. This is on top of (not instead of)
         close_no_gain_positions, which separately force-exits anything stale
         AND non-positive every cycle regardless of new signals."""
@@ -1284,7 +1671,7 @@ class EnhancedExecutor:
             for p in positions:
                 sym = p.symbol
                 if re.match(r'^[A-Z]+\d{6}[CP]\d{8}$', sym):
-                    continue  # options legs — managed separately
+                    continue  # options legs -- managed separately
                 if float(p.qty) <= 0:
                     continue
                 if sym in self._swap_cycle_closed:
@@ -1370,12 +1757,12 @@ class EnhancedExecutor:
 
     @property
     def shorting_blocked(self) -> bool:
-        """Live account-wide short-selling gate — Alpaca's own Reg T equity
+        """Live account-wide short-selling gate -- Alpaca's own Reg T equity
         minimum (MIN_EQUITY_FOR_SHORT), read fresh off the 2s-TTL account
         cache every time so it self-corrects the moment equity crosses back
         above the floor. Replaces an old sticky `self.shorting_blocked = True`
         flag that a single misclassified broker rejection could leave stuck
-        for the rest of the session with no way back — confirmed 2026-08-07:
+        for the rest of the session with no way back -- confirmed 2026-08-07:
         one INDI no-borrow rejection, misread as account-wide, disabled every
         short for hours despite the account's Shorting Enabled setting being
         on the whole time."""
@@ -1388,11 +1775,11 @@ class EnhancedExecutor:
         (cash-starved even below max positions) and the max-positions gate.
 
         Returns (closed, block_reason):
-          closed=True        a position was closed — caller should refresh
+          closed=True        a position was closed -- caller should refresh
                               account/position state before re-checking gates.
           block_reason=str   the close attempt itself failed and entry should
                               be denied (position may be left unprotected).
-          Otherwise (False, None): no candidate to swap — caller proceeds
+          Otherwise (False, None): no candidate to swap -- caller proceeds
           without a swap (matches the pre-existing "allow entry anyway" path).
         """
         label = "SWAP (bear)" if swap_only else "SWAP"
@@ -1409,8 +1796,8 @@ class EnhancedExecutor:
             f"{label}: closing {weakest} ({swap_reason}) to make room for "
             f"{signal.symbol} (conf={signal.confidence:.0%})"
         )
-        # Any resting order for this symbol — the GTC trailing stop, or a
-        # leftover DAY close from a prior NO-GAIN/stale-exit attempt — reserves
+        # Any resting order for this symbol -- the GTC trailing stop, or a
+        # leftover DAY close from a prior NO-GAIN/stale-exit attempt -- reserves
         # qty and makes Alpaca reject close_position() as a wash trade (confirmed
         # in production: 40310000, "opposite side market/stop order exists").
         # Cancel ALL of them first, not just the GTC, so the swap-close actually
@@ -1431,12 +1818,12 @@ class EnhancedExecutor:
             self._no_rearm.add(weakest)  # portfolio rebalance, not a verdict on this symbol
             self.client.close_position(weakest)
             self._swap_cycle_closed.add(weakest)
-            # Closing a prior-day position is NOT a day trade — do not count against PDT
+            # Closing a prior-day position is NOT a day trade -- do not count against PDT
             return True, None
         except Exception as e:
             err_str = str(e)
             if "40310100" in err_str:
-                # Alpaca PDT protection: position was entered today — can't close same day.
+                # Alpaca PDT protection: position was entered today -- can't close same day.
                 # Mark as today's entry so it's never selected as swap candidate again.
                 self._entry_log[weakest] = {
                     "strategy": "restored",
@@ -1444,15 +1831,15 @@ class EnhancedExecutor:
                     "confidence": 0.0,
                 }
                 log.warning(
-                    f"SWAP skip {weakest}: PDT same-day protection (40310100) — "
+                    f"SWAP skip {weakest}: PDT same-day protection (40310100) -- "
                     f"marked as today entry, will not retry this session"
                 )
-                # Don't block the new signal — allow entry without the swap
+                # Don't block the new signal -- allow entry without the swap
                 return False, None
             log.warning(f"SWAP close failed for {weakest}: {e}")
             if weakest_gtc_id:
                 # We cancelled its GTC stop to attempt the close, and the
-                # close itself failed — re-arm protection immediately
+                # close itself failed -- re-arm protection immediately
                 # rather than leave the position naked.
                 try:
                     weakest_pos = next(
@@ -1461,7 +1848,7 @@ class EnhancedExecutor:
                     if weakest_pos is not None:
                         w_qty     = int(float(weakest_pos.qty))
                         w_current = float(weakest_pos.current_price)
-                        w_trail   = _trail_pct_for(weakest, w_current, self._entry_log)[0]
+                        w_trail   = _atr_trail_pct_for(weakest, w_current, self._entry_log)[0]
                         self.client.submit_order(TrailingStopOrderRequest(
                             symbol        = weakest,
                             qty           = abs(w_qty),
@@ -1472,7 +1859,7 @@ class EnhancedExecutor:
                         ))
                         log.warning(f"SWAP {weakest}: re-armed GTC trailing stop after failed close")
                 except Exception as rearm_err:
-                    log.error(f"SWAP {weakest}: close failed AND GTC re-arm failed — position may be UNPROTECTED: {rearm_err}")
+                    log.error(f"SWAP {weakest}: close failed AND GTC re-arm failed -- position may be UNPROTECTED: {rearm_err}")
             return False, f"Swap close failed: {e}"
 
     # -- Validation --------------------------------------------------------
@@ -1482,8 +1869,8 @@ class EnhancedExecutor:
             if not allow:
                 return False, f"VIX spike filter: {roc:.1f}% increase"
 
-        # PDT — use live broker count (survives restarts).
-        # Block only when the count EXCEEDS the limit (4+) — an actual PDT violation.
+        # PDT -- use live broker count (survives restarts).
+        # Block only when the count EXCEEDS the limit (4+) -- an actual PDT violation.
         # At exactly 3/3: new buys are allowed because they are held overnight (not same-day
         # round-trips) and therefore do NOT count as additional day trades.
         #
@@ -1501,7 +1888,7 @@ class EnhancedExecutor:
         if acct.pattern_day_trader and acct.equity < PDT_ACCOUNT_MIN and acct.daytrade_count > PDT_MAX_TRADES:
             msg = (
                 f"PDT VIOLATION: {acct.daytrade_count} day trades used "
-                f"(limit {PDT_MAX_TRADES}, equity ${acct.equity:,.0f}) — "
+                f"(limit {PDT_MAX_TRADES}, equity ${acct.equity:,.0f}) -- "
                 f"account may be flagged as Pattern Day Trader. Review immediately!"
             )
             log.error(msg)
@@ -1510,12 +1897,12 @@ class EnhancedExecutor:
                 self._pdt_violation_alerted = True
             if not bypass_pdt:
                 return False, f"PDT violation: {acct.daytrade_count}/{PDT_MAX_TRADES} day trades exceeded"
-            log.warning(f"{signal.symbol}: PDT ceiling exceeded but this is a re-entry — bypassing the bot's own limit, letting the broker decide")
+            log.warning(f"{signal.symbol}: PDT ceiling exceeded but this is a re-entry -- bypassing the bot's own limit, letting the broker decide")
         dt_left = self.pdt.remaining(acct.equity, acct.daytrade_count, acct.pattern_day_trader)
         if acct.pattern_day_trader and dt_left <= PDT_WARN_AT_REMAINING and acct.equity < PDT_ACCOUNT_MIN:
             log.warning(f"PDT WARNING: only {dt_left} day trade(s) remaining (equity ${acct.equity:,.0f})")
 
-        # Alpaca's own Reg T minimum to short at all — checked live every time
+        # Alpaca's own Reg T minimum to short at all -- checked live every time
         # (not cached/session-flag) so shorting resumes automatically the
         # moment equity crosses back above the floor, no restart needed.
         if order_type == OrderType.SHORT and acct.equity < MIN_EQUITY_FOR_SHORT:
@@ -1525,7 +1912,7 @@ class EnhancedExecutor:
         if order_type == OrderType.SHORT and signal.symbol in self._htb_cache:
             return False, f"{signal.symbol} hard-to-borrow (cached)"
 
-        # 2026-08-24, user request: no post-loss re-entry cooldown at all —
+        # 2026-08-24, user request: no post-loss re-entry cooldown at all --
         # every entry (cooldown or not) already goes through the trailing-buy
         # path (_create_bracket_order), which can't fill mid-fall the way a
         # marketable chase could. Protection against a re-firing signal is
@@ -1534,8 +1921,8 @@ class EnhancedExecutor:
         # (2026-08-05, 22 trades/-$605 net re-firing the same losing signal)
         # for why that stack matters if this gets revisited.
 
-        # Momentum entry freshness (long only — a short entry isn't chasing a
-        # gap up) — reject a gap/momentum signal that's already faded off its
+        # Momentum entry freshness (long only -- a short entry isn't chasing a
+        # gap up) -- reject a gap/momentum signal that's already faded off its
         # recent high by the time we're about to submit. See engine/config.py
         # MOMENTUM_FRESHNESS_* for the reasoning and known limitations.
         if order_type == OrderType.LONG:
@@ -1544,11 +1931,11 @@ class EnhancedExecutor:
             if not valid:
                 return False, block_reason
             if fade_reason:
-                log.info(f"[SIZE] {fade_reason} — trading anyway at reduced size")
+                log.info(f"[SIZE] {fade_reason} -- trading anyway at reduced size")
 
-        # EMA7 slope trend alignment (both directions) — see
+        # EMA7 slope trend alignment (both directions) -- see
         # _check_ema_trend_alignment for the reasoning.
-        trend_ok, trend_reason = _check_ema_trend_alignment(signal, order_type == OrderType.LONG)
+        trend_ok, trend_reason = _entry_trend_snapshot(signal, order_type == OrderType.LONG)
         if not trend_ok:
             self._ema_entry_confirmations.pop(signal.symbol, None)
             # 2026-08-25, user request: "each blocked trade should wait for
@@ -1567,21 +1954,8 @@ class EnhancedExecutor:
             }
             return False, trend_reason
 
-        now_mono = time.monotonic()
-        confirmations, last_check = self._ema_entry_confirmations.get(signal.symbol, (0, 0.0))
-        if confirmations == 0 or now_mono - last_check >= EMA_ENTRY_CONFIRM_SEC:
-            confirmations += 1
-            self._ema_entry_confirmations[signal.symbol] = (confirmations, now_mono)
-        if confirmations < EMA_ENTRY_CONFIRM_CHECKS:
-            self._ema_blocked_entries[signal.symbol] = {
-                "signal": signal, "order_type": order_type,
-                "queued_at": datetime.datetime.now(datetime.timezone.utc),
-            }
-            return False, (
-                f"{signal.symbol}: EMA alignment confirmation {confirmations}/"
-                f"{EMA_ENTRY_CONFIRM_CHECKS}; waiting for the next {EMA_ENTRY_CONFIRM_SEC}s check"
-            )
-        self._ema_entry_confirmations.pop(signal.symbol, None)
+
+        log.info(trend_reason)
 
         # Asset tradability check: skip halted or suspended symbols
         try:
@@ -1593,7 +1967,7 @@ class EnhancedExecutor:
             if not getattr(asset, "tradable", True):
                 return False, f"{signal.symbol} not tradable: asset.tradable=False"
         except Exception as e:
-            log.warning(f"{signal.symbol}: asset status check failed ({e}) — proceeding cautiously")
+            log.warning(f"{signal.symbol}: asset status check failed ({e}) -- proceeding cautiously")
 
         # Pending order guard: don't submit a second order if one is already live/filling
         if signal.symbol in self.order_cache:
@@ -1604,18 +1978,18 @@ class EnhancedExecutor:
                 if str(getattr(cached_order, "status", "")).lower() in active_statuses:
                     return False, f"Pending order already active for {signal.symbol} (id={cached_id})"
                 else:
-                    # Order is filled/cancelled — remove stale cache entry
+                    # Order is filled/cancelled -- remove stale cache entry
                     del self.order_cache[signal.symbol]
             except Exception:
-                # Can't verify — keep cache entry intact to avoid double-submit risk
-                return False, f"Could not verify order status for {signal.symbol} (id={cached_id}) — skipping to be safe"
+                # Can't verify -- keep cache entry intact to avoid double-submit risk
+                return False, f"Could not verify order status for {signal.symbol} (id={cached_id}) -- skipping to be safe"
 
         positions = self._get_positions()
 
         # Dynamic max positions: use equity-based strategic capacity (not raw buying_power).
         # buying_power can be artificially depressed by leveraged/inverse ETF margin requirements,
         # causing the bot to permanently block new entries even when capital is available.
-        # We compute effective_max from equity × position_size_pct, then separately gate each
+        # We compute effective_max from equity x position_size_pct, then separately gate each
         # execution on whether buying_power is sufficient for one position.
         #
         # 2026-08-13, user request ("max position increase to 24"): SMALL_ACCOUNT_MAX_POSITIONS
@@ -1625,7 +1999,7 @@ class EnhancedExecutor:
         # SMALL_ACCOUNT_EQUITY_THRESHOLD. Also switched the equity_capacity estimate to use
         # THIN_LIQUIDITY_POSITION_SIZE_PCT (3%) when the signal itself is a thin-liquidity
         # admit, not the flat 7.5% small-account rate -- otherwise the affordability math
-        # still silently caps out around 12 (7.5% x 12 ≈ 90% of equity) regardless of the new
+        # still silently caps out around 12 (7.5% x 12 ~ 90% of equity) regardless of the new
         # 24 ceiling, since today's guardrail widening means most newly-eligible signals will
         # actually execute at the smaller 3% size, not 7.5%.
         _pos_size_pct = (
@@ -1648,7 +2022,7 @@ class EnhancedExecutor:
             f"max_cap={_max_positions_cap}"
         )
 
-        # ── Buying power gate (must come first) ───────────────────────────
+        # -- Buying power gate (must come first) ---------------------------
         # Check if sufficient buying power for this trade (primary constraint).
         # This allows entry even when at max positions if capital is available.
         margin = 2.0 if order_type == OrderType.SHORT else 1.0
@@ -1659,7 +2033,7 @@ class EnhancedExecutor:
 
         if acct.buying_power < min_bp_needed:
             # Cash-starved even below max positions (e.g. margin tied up by
-            # leveraged/inverse ETFs) — a high-confidence signal should still
+            # leveraged/inverse ETFs) -- a high-confidence signal should still
             # be able to bump a stale/weak position for the cash rather than
             # just being skipped every cycle until something exits on its own.
             if SWAP_ON_FULL and signal.confidence >= SWAP_MIN_CONFIDENCE and positions.total_count > 0:
@@ -1675,10 +2049,10 @@ class EnhancedExecutor:
                     f"(need ${min_bp_needed:,.0f} for minimum position)"
                 )
 
-        # ── Max positions gate (secondary; optional swap if at limit) ─────
+        # -- Max positions gate (secondary; optional swap if at limit) -----
         if positions.total_count >= effective_max:
             if not (SWAP_ON_FULL and signal.confidence >= SWAP_MIN_CONFIDENCE):
-                # At max but BP available — allow entry (no swap needed)
+                # At max but BP available -- allow entry (no swap needed)
                 log.debug(
                     f"At max positions {positions.total_count}/{effective_max} but allowing entry "
                     f"due to available BP ${acct.buying_power:,.0f}"
@@ -1754,10 +2128,10 @@ class EnhancedExecutor:
             )
         return shares, None
 
-    # ── Bracket Prices ──────────────────────────────────────────────────────────
+    # -- Bracket Prices ----------------------------------------------------------
     def _calculate_bracket_prices(self, signal: Signal, risk_info: Dict, order_type: OrderType) -> tuple:
         if signal.atr_stop and signal.atr_stop > 0:
-            # ATR-based 2:1 R:R — stop at 1.5×ATR, target at 2× the risk
+            # ATR-based 2:1 R:R -- stop at 1.5xATR, target at 2x the risk
             risk_dist = signal.atr_stop
             if order_type == OrderType.LONG:
                 sl = round(signal.price - risk_dist, 2)
@@ -1775,23 +2149,23 @@ class EnhancedExecutor:
                 tp = round(signal.price * (1 - risk_info["tp"]            / 100), 2)
         return sl, tp
 
-    # ── Entry + Trailing Stop Order ──────────────────────────────────────────
+    # -- Entry + Trailing Stop Order ------------------------------------------
     def _handle_short_rejection(self, signal: Signal, e: Exception) -> None:
         """Broker rejected a short with "cannot be sold short" / 40310000 /
         "account is not allowed to short". Alpaca reuses that same wording for
         two different causes that need different handling: a genuine
         per-symbol no-borrow-available condition (should stick for the
         session) versus the account-wide Reg T equity minimum,
-        MIN_EQUITY_FOR_SHORT (transient — must NOT poison one ticker's cache).
+        MIN_EQUITY_FOR_SHORT (transient -- must NOT poison one ticker's cache).
         Confirmed 2026-08-10: FIG and RIG both got cached as hard-to-borrow
         from rejections that fired while equity was under $2,000, then stayed
         stuck "not shortable" for the rest of the session even after equity
-        recovered — checking equity here first is what `shorting_blocked`
+        recovered -- checking equity here first is what `shorting_blocked`
         already does live, so re-check it rather than caching the symbol."""
         if self.shorting_blocked:
             log.warning(
                 f"Short blocked {signal.symbol}: account equity below "
-                f"${MIN_EQUITY_FOR_SHORT:,.0f} minimum — not caching as HTB, "
+                f"${MIN_EQUITY_FOR_SHORT:,.0f} minimum -- not caching as HTB, "
                 "will retry once equity recovers"
             )
             return
@@ -1842,54 +2216,20 @@ class EnhancedExecutor:
         return has_history
 
     def _create_bracket_order(self, signal: Signal, shares: int, risk_info: Dict, order_type: OrderType) -> bool:
-        """Submit a trailing-buy entry, then a GTC trailing stop at
-        TRAIL_STOP_PCT%. TP bracket leg is intentionally dropped -- the
-        trailing stop locks in gains automatically; swap logic and EOD
-        close handle opportunity exits.
-
-        2026-08-22, user request: EVERY entry (not just 2nd+ same-day /
-        post-loss-cooldown re-entries) now submits a TrailingStopOrderRequest
-        -- it trails the adverse move (down for a long, up for a short) and
-        only fires once price reverses REENTRY_TRAIL_PCT% off the extreme it
-        reached, so an entry can't fill while the name is still actively
-        falling (or squeezing, for a short). Replaces the old marketable-
-        limit chase / passive-limit-faded-entry path entirely (see
-        _marketable_limit_price, now unused here). It's a resting order the
-        broker adjusts itself, so it bypasses _entry_pending/
-        _sweep_pending_entries entirely -- nothing for that re-chase loop to
-        do; _entry_pending now stays permanently empty.
-
-        2026-08-18, user request (superseded by the above but kept for the
-        PFSA incident this originally covered): REENTRY_TRAIL_PCT in
-        config.py. See _validate_trade's docstring -- as of 2026-08-24 there's
-        no post-loss cooldown left at all, just this trailing-buy entry plus
-        the trailing stop / check_ema9_exit / standalone stop-loss exit stack."""
+        """Submit a DAY trailing-stop entry. Protective 1.5% GTC trailing stop is attached after fill."""
         side          = OrderSide.BUY  if order_type == OrderType.LONG else OrderSide.SELL
-        stop_side     = OrderSide.SELL if order_type == OrderType.LONG else OrderSide.BUY
-        trail_pct     = TRAIL_STOP_PCT  # flat -- see _trail_pct_for()
+        trail_pct     = TRAIL_STOP_PCT
         is_long_entry = order_type == OrderType.LONG
-        is_reentry    = self._is_reentry_signal(signal.symbol, is_long_entry)  # kept for logging only
+        is_reentry    = self._is_reentry_signal(signal.symbol, is_long_entry)
 
-        # ── Step 1: Entry order (failure aborts the whole bracket) ──────────
         try:
-            stop_price = round(
-                signal.price * (1 - TRAIL_STOP_PCT / 100) if is_long_entry
-                else signal.price * (1 + TRAIL_STOP_PCT / 100),
-                2,
-            )
-            take_profit = round(
-                signal.price * (1 + ATR_TP_RATIO * TRAIL_STOP_PCT / 100) if is_long_entry
-                else signal.price * (1 - ATR_TP_RATIO * TRAIL_STOP_PCT / 100),
-                2,
-            )
-            entry_req = MarketOrderRequest(
+            entry_req = TrailingStopOrderRequest(
                 symbol          = signal.symbol,
                 qty             = shares,
                 side            = side,
+                type            = AlpacaOrderType.TRAILING_STOP,
                 time_in_force   = TimeInForce.DAY,
-                order_class     = OrderClass.BRACKET,
-                take_profit     = TakeProfitRequest(limit_price=take_profit),
-                stop_loss       = StopLossRequest(stop_price=stop_price),
+                trail_percent   = REENTRY_TRAIL_PCT,
                 client_order_id = f"apex-entry-{signal.strategy}-{signal.symbol}-{int(time.time())}",
             )
             order = self._submit_entry_order(signal.symbol, entry_req)
@@ -1897,53 +2237,23 @@ class EnhancedExecutor:
                 return False
             self.order_cache[signal.symbol] = order.id
             self._pending_entry_signals[signal.symbol] = {"signal": signal, "order_type": order_type}
-            log.info(
-                f"{signal.symbol}: {'re-entry' if is_reentry else 'entry'} -- market bracket "
-                f"{'BUY' if is_long_entry else 'SELL'} with fixed {TRAIL_STOP_PCT:.1f}% protection"
-            )
             self._entries_today[signal.symbol] = self._entries_today.get(signal.symbol, 0) + 1
-
-            # Store ATR-based TP target — checked each scan cycle by check_tp_targets()
-            self._tp_targets[signal.symbol] = take_profit
-
+            log.info(
+                f"{signal.symbol}: {'re-entry' if is_reentry else 'entry'} -- {REENTRY_TRAIL_PCT:.2f}% trailing-stop "
+                f"{'BUY' if is_long_entry else 'SELL'} entry; exit protection {TRAIL_STOP_PCT:.1f}% after fill"
+            )
         except Exception as e:
             err = str(e).lower()
             if order_type == OrderType.SHORT and ("cannot be sold short" in err or "40310000" in err or "account is not allowed to short" in err):
                 self._handle_short_rejection(signal, e)
             elif order_type != OrderType.SHORT and ("cannot be sold short" in err or "40310000" in err):
-                # Inverse ETF or other buy rejected by broker — do not poison short flag
                 log.warning(f"Buy rejected for {signal.symbol} (broker): {e}")
             elif "insufficient buying power" in err:
-                log.warning(f"Bracket skip {signal.symbol}: insufficient buying power")
+                log.warning(f"Entry skip {signal.symbol}: insufficient buying power")
             else:
-                log.error(f"Bracket order failed {signal.symbol}: {e}")
+                log.error(f"Entry order failed {signal.symbol}: {e}")
             return False
 
-        # ── Step 2: Trailing stop ─────────────────────────────────────────
-        # 2026-08-28, user: no SEC/FINRA PDT rule blocks a GTC SELL stop on
-        # shares bought same-day (PDT restricts day-trade *count*, not order
-        # placement) -- the old "if LIVE: skip" here was an untested guess.
-        # BUT the entry order placed in Step 1 is itself a resting
-        # TRAILING-STOP BUY (0.5% pullback trigger, not a market fill) -- so
-        # attempting the protective SELL stop synchronously right here, before
-        # the entry has actually filled, is structurally guaranteed to fail
-        # every time ("cannot open a short sell while a long buy order is
-        # open", confirmed live 2026-08-28: AGQ/UMC/PALL/BEKE/SBSW all hit
-        # this on every entry). No point paying for a doomed API call.
-        # _cover_naked_positions (the 5s fast-thread, enhanced.py) is the
-        # correct place for this: it checks get_all_positions() /
-        # get_orders() and only attempts the real broker stop once the
-        # position genuinely exists and the entry order has cleared.
-        #
-        # 2026-08-28, user request ("fix the trail stop exit order immediately
-        # after the order is placed, check it with the 5sec check rule"): run
-        # that same check right here too, not just on the standing 5s timer --
-        # covers the (rare but real) case where the trailing-buy entry fills
-        # near-instantly, so the stop attaches this tick instead of waiting up
-        # to 5s for the background thread's next pass. Best-effort/swallowed:
-        # the recurring 5s thread is still the real safety net if this
-        # immediate call errors or the entry hasn't filled yet (normal case --
-        # it'll just see the order still open and skip, same as always).
         try:
             self._cover_naked_positions()
         except Exception as e:
@@ -1966,25 +2276,15 @@ class EnhancedExecutor:
             log.info(f"{action} {signal.symbol}: {shares} @ ${signal.price:.2f} submitted "
                      f"| TRAILING SL {trail_pct:.1f}% | Tier: {tier} | {signal.strategy}")
 
-    # ΓöÇΓöÇ Simple Order ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+    # ---- Simple Order --------------------------------------------------------------------------------------
     def _create_simple_order(self, signal: Signal, shares: int, order_type: OrderType) -> bool:
         """Non-bracket entry path -- fires when _create_bracket_order's own
         TrailingStopOrderRequest attempt raised (see its except block) or
-        outside regular hours. Used to submit a bounded marketable
-        LimitOrderRequest instead (see _marketable_limit_price/
-        _live_quote_mid); _entry_pending/_sweep_pending_entries then
-        re-chased it at a fresh price if it sat unfilled.
-
-        2026-08-25, user request: "all entry orders should be trail stop
-        orders" -- every entry submission is now a TrailingStopOrderRequest,
-        same as _create_bracket_order's (REENTRY_TRAIL_PCT, resting order
-        the broker adjusts itself). No _entry_pending registration needed
-        for the same reason _create_bracket_order's docstring gives: a
-        trailing order never needs re-chasing, so this bypasses
-        _sweep_pending_entries entirely too now.
-        ponytail: that leaves _entry_pending/_sweep_pending_entries with
-        nothing left to populate them (dead code, not deleted -- ask if you
-        want it cleaned up like check_ema15_exit was).
+        outside regular hours. Submits a bracket MarketOrderRequest (market
+        entry leg plus a take_profit and a stop_loss leg) so the fallback
+        path still carries a hard maximum-loss limit at fill, priced off
+        signal.price (no re-chase loop: a bracket either fills or cancels at
+        end of day on its own, so nothing for _sweep_pending_entries to do).
 
         2026-08-18, user request: entries never use extended hours -- EXTENDED_HOURS
         now only governs exit paths (a stop-loss must be able to fire outside
@@ -2022,6 +2322,8 @@ class EnhancedExecutor:
             if order is None:
                 return False
             self.order_cache[signal.symbol] = order.id
+            if not hasattr(self, "_pending_entry_signals"):
+                self._pending_entry_signals = {}
             self._pending_entry_signals[signal.symbol] = {"signal": signal, "order_type": order_type}
             log.info(
                 f"{action} {signal.symbol}: {shares} @ ${signal.price:.2f} -- trailing "
@@ -2034,7 +2336,7 @@ class EnhancedExecutor:
             if order_type == OrderType.SHORT and ("cannot be sold short" in err or "40310000" in err or "account is not allowed to short" in err):
                 self._handle_short_rejection(signal, e)
             elif order_type != OrderType.SHORT and ("cannot be sold short" in err or "40310000" in err):
-                # Inverse ETF or other buy rejected by broker — do not poison short flag
+                # Inverse ETF or other buy rejected by broker -- do not poison short flag
                 log.warning(f"Buy rejected for {signal.symbol} (broker): {e}")
             elif "insufficient buying power" in err:
                 log.warning(f"Skip {signal.symbol}: insufficient buying power")
@@ -2044,6 +2346,11 @@ class EnhancedExecutor:
 
     # -- Entry (unified) ---------------------------------------------------
     def _execute_entry(self, signal: Signal, acct: AccountSnapshot, order_type: OrderType, swap_only: bool = False, bypass_pdt: bool = False) -> bool:
+        symbol_block = self._symbol_entry_block_reason(signal.symbol)
+        if symbol_block:
+            log.info(f"Skip {signal.symbol}: {symbol_block}")
+            self._ema_blocked_entries.pop(signal.symbol, None)
+            return False
         valid, reason = self._validate_trade(signal, acct, order_type, swap_only=swap_only, bypass_pdt=bypass_pdt)
         if not valid:
             if reason:
@@ -2051,14 +2358,24 @@ class EnhancedExecutor:
             return False
 
         risk_info = calculate_risk_adjusted_size(acct.equity, signal.symbol, signal.price)
+        if signal.symbol in getattr(self, "_loss_reentry_required", set()):
+            factor = max(0.0, 1.0 - REENTRY_SIZE_REDUCTION_PCT / 100.0)
+            old_amt = risk_info.get("dollar_amount", 0.0)
+            old_pct = risk_info.get("allocation_pct", 0.0)
+            risk_info["dollar_amount"] = old_amt * factor
+            risk_info["allocation_pct"] = old_pct * factor
+            log.info(
+                f"REENTRY SIZE {signal.symbol}: prior-loss re-entry reduced by "
+                f"{REENTRY_SIZE_REDUCTION_PCT:.0f}% (${old_amt:,.0f} -> ${risk_info['dollar_amount']:,.0f})"
+            )
 
         # Every signal reaching this point already passed the hard confidence
         # and EMA gates. Do not halve its allocation at the confidence floor;
         # use the full configured position target and let buying power,
         # concentration, and actual-position leverage caps control exposure.
         log.debug(
-            f"[SIZE] {signal.symbol} conf={signal.confidence:.0%} → "
-            f"scale=1.00x → ${risk_info['dollar_amount']:,.0f}"
+            f"[SIZE] {signal.symbol} conf={signal.confidence:.0%} -> "
+            f"scale=1.00x -> ${risk_info['dollar_amount']:,.0f}"
         )
 
         _pre_bonus_pct = risk_info["allocation_pct"]
@@ -2066,7 +2383,7 @@ class EnhancedExecutor:
         if risk_info["allocation_pct"] != _pre_bonus_pct:
             log.debug(
                 f"[SIZE] {signal.symbol} conf={signal.confidence:.0%} > {CONF_SCALE_FULL_CONF:.0%} "
-                f"— confidence size ramp: allocation {_pre_bonus_pct:.1f}% → {risk_info['allocation_pct']:.1f}% "
+                f"-- confidence size ramp: allocation {_pre_bonus_pct:.1f}% -> {risk_info['allocation_pct']:.1f}% "
                 f"(${risk_info['dollar_amount']:,.0f})"
             )
 
@@ -2076,7 +2393,7 @@ class EnhancedExecutor:
             log.debug(
                 f"[SIZE] {signal.symbol} [{signal.strategy}] Kelly mult "
                 f"{STRATEGY_KELLY_MULT.get(signal.strategy, STRATEGY_KELLY_MULT_DEFAULT):.2f}x: "
-                f"allocation {_pre_kelly_pct:.1f}% → {risk_info['allocation_pct']:.1f}% "
+                f"allocation {_pre_kelly_pct:.1f}% -> {risk_info['allocation_pct']:.1f}% "
                 f"(${risk_info['dollar_amount']:,.0f})"
             )
 
@@ -2085,7 +2402,7 @@ class EnhancedExecutor:
         shares, skip_reason = self._size_with_buying_power(acct.buying_power, signal, risk_info, order_type)
         if shares < 1:
             # Confidence-swap: if a held position has lower entry confidence, rotate into the new signal.
-            # Skip entirely when PDT = 0 — closing a same-day position would itself be a day trade.
+            # Skip entirely when PDT = 0 -- closing a same-day position would itself be a day trade.
             _dt_left_swap = self.pdt.remaining(acct.equity, acct.daytrade_count)
             if order_type == OrderType.LONG and _dt_left_swap > 0:
                 victim, victim_conf = self._find_least_confident_position(signal.confidence)
@@ -2099,7 +2416,7 @@ class EnhancedExecutor:
                         # reserved by its own GTC trailing stop, so close_position()
                         # rejects with "insufficient qty available" unless that
                         # resting order is cancelled first (confirmed failing on
-                        # every cycle in production before this — AMLX, 40310000).
+                        # every cycle in production before this -- AMLX, 40310000).
                         try:
                             for o in (self.client.get_orders() or []):
                                 if o.symbol == victim:
@@ -2124,7 +2441,7 @@ class EnhancedExecutor:
             cap_shares = max(0, int(acct.equity * (MAX_SHORT_FLOAT_PCT / 100) / signal.price))
             if shares > cap_shares:
                 log.info(
-                    f"Short-float cap {signal.symbol}: {shares}→{cap_shares} shares "
+                    f"Short-float cap {signal.symbol}: {shares}->{cap_shares} shares "
                     f"({MAX_SHORT_FLOAT_PCT:.0f}% equity max, equity ${acct.equity:,.0f})"
                 )
                 shares = cap_shares
@@ -2135,6 +2452,45 @@ class EnhancedExecutor:
         if order_type == OrderType.SHORT and LONG_ONLY_MODE:
             log.info(f"Skipping {signal.symbol} SHORT because LONG_ONLY_MODE is active")
             return False
+
+        # Cancel stale/opposite resting DAY orders before entry (requested
+        # hardening): a leftover opposite-side order must not conflict with the
+        # fresh entry we're about to place.
+        self._cancel_opposite_orders_before_entry(signal.symbol, order_type == OrderType.LONG)
+
+        # Staged allocation (25% x 4), never adding while losing. A FRESH
+        # (first-time) entry is split into STAGED_ALLOCATION_TRANCHES equal
+        # tranches: only the first tranche is submitted now, and the remaining
+        # tranches are added by maybe_add_staged_tranches() -- each add
+        # requires (a) the position to be NOT losing (gain strictly above
+        # STAGED_ALLOCATION_MIN_GAIN_PCT) and (b) a fresh EMA trend-alignment
+        # check immediately before the tranche. Re-entries (2nd+ same day) and
+        # symbols already being staged are not re-staged.
+        staged_state = getattr(self, "_staged_allocation", {})
+        if (
+            STAGED_ALLOCATION_ENABLED
+            and signal.symbol not in staged_state
+            and not self._is_reentry_signal(signal.symbol, order_type == OrderType.LONG)
+        ):
+            total_tranches = max(1, STAGED_ALLOCATION_TRANCHES)
+            tranche_qty    = max(1, shares // total_tranches)
+            if STAGED_ALLOCATION_MAX_ADD_PCT > 0:
+                max_add = max(1, int(shares * STAGED_ALLOCATION_MAX_ADD_PCT / 100.0))
+                tranche_qty = min(tranche_qty, max_add)
+            if tranche_qty < shares:
+                staged_state[signal.symbol] = {
+                    "tranches_done": 1,
+                    "tranche_qty": tranche_qty,
+                    "is_long": order_type == OrderType.LONG,
+                    "entry_price": signal.price,
+                    "total_tranches": total_tranches,
+                }
+                log.info(
+                    f"STAGED ENTRY {signal.symbol}: full {shares} sh split into "
+                    f"{total_tranches} tranches -- submitting first {tranche_qty} sh now; "
+                    f"remaining tranches only while NOT losing"
+                )
+                shares = tranche_qty
 
         if self.use_bracket_orders and self._current_market_state().is_regular_hours:
             if self._create_bracket_order(signal, shares, risk_info, order_type):
@@ -2155,6 +2511,110 @@ class EnhancedExecutor:
 
         return False
 
+    def maybe_add_staged_tranches(self) -> None:
+        """Periodic poller (PENDING_ENTRY_RECHECK_SEC cadence) for staged
+        allocation (25% x 4), never adding while losing. For each symbol
+        currently being staged (first tranche already submitted), add the next
+        tranche ONLY while:
+
+          - the entry actually filled and a position is open (if the first
+            order never filled or the position was closed, staging is done);
+          - the position is NOT losing -- unrealized gain strictly above
+            STAGED_ALLOCATION_MIN_GAIN_PCT ("never adding while losing");
+          - a FRESH EMA trend-alignment check still passes immediately
+            before this tranche (fresh EMA check before each tranche) --
+            same gate a fresh entry would need;
+          - tranches remain.
+
+        Each add submits a DAY trailing-stop entry for one tranche_qty via
+        _submit_entry_order(allow_existing_position=True, scale_in=True): the
+        broker-side one-active-entry-per-symbol guards still apply (a resting
+        unfilled first tranche blocks the add), but the FIRST-ENTRY-only local
+        guards (60s submit debounce, order_cache slot holding the first
+        tranche's order id) are bypassed -- they would otherwise block tranche
+        2 for the life of the position -- while _entry_pending /
+        _pending_entry_signals remain hard blocks.
+        """
+        staged_state = getattr(self, "_staged_allocation", {})
+        if not staged_state:
+            return
+        # 2026-09-01, two-window schedule: no scale-in tranche orders during
+        # the midday break -- the lunch flat closed the positions this would
+        # add to at 11:00 ET. Staged state survives the break (any position
+        # re-entered at 14:45 is a fresh signal/state anyway).
+        import pytz as _pytz
+        if in_lunch_break(datetime.datetime.now(_pytz.timezone("America/New_York"))):
+            return
+        try:
+            positions = self._get_positions(force_refresh=True)
+        except Exception as e:
+            log.warning(f"maybe_add_staged_tranches: position fetch failed: {e}")
+            return
+
+        for sym, state in list(staged_state.items()):
+            try:
+                total  = int(state.get("total_tranches", STAGED_ALLOCATION_TRANCHES))
+                done   = int(state.get("tranches_done", 1))
+                if done >= total:
+                    staged_state.pop(sym, None)
+                    continue
+
+                if not positions.has_position(sym):
+                    # First tranche never filled, or the position has since been
+                    # closed (stop-out/EOD/swap) -- nothing left to scale into.
+                    log.info(f"STAGED {sym}: no open position -- dropping staged state")
+                    staged_state.pop(sym, None)
+                    continue
+
+                is_long = bool(state.get("is_long", True))
+                pos = positions.positions_dict[sym]
+                current = float(getattr(pos, "current_price", 0) or 0)
+                entry   = float(state.get("entry_price", 0) or 0)
+                if current <= 0 or entry <= 0:
+                    continue
+                gain_pct = (current - entry) / entry * 100.0 if is_long else (entry - current) / entry * 100.0
+                if gain_pct <= STAGED_ALLOCATION_MIN_GAIN_PCT:
+                    # Never adding while losing. Keep staging state so a later
+                    # recovery can still add -- this is the whole point of
+                    # scaling into a winner.
+                    log.info(
+                        f"STAGED {sym}: not adding while losing (gain {gain_pct:+.2f}% <= "
+                        f"{STAGED_ALLOCATION_MIN_GAIN_PCT:+.2f}%) -- tranche {done + 1}/{total} held"
+                    )
+                    continue
+
+                # Fresh EMA check immediately before each tranche.
+                stub = SimpleNamespace(symbol=sym)
+                gate_ok, gate_reason = _check_ema_trend_alignment(stub, is_long, force_fresh=True)
+                if not gate_ok:
+                    log.info(f"STAGED {sym}: fresh EMA gate failed -- tranche {done + 1}/{total} held ({gate_reason})")
+                    continue
+
+                qty = int(state.get("tranche_qty", 0) or 0)
+                if qty < 1:
+                    staged_state.pop(sym, None)
+                    continue
+
+                side = OrderSide.BUY if is_long else OrderSide.SELL
+                req = TrailingStopOrderRequest(
+                    symbol=sym, qty=qty, side=side,
+                    type=AlpacaOrderType.TRAILING_STOP,
+                    time_in_force=TimeInForce.DAY,
+                    trail_percent=REENTRY_TRAIL_PCT,
+                    client_order_id=f"apex-staged-{sym}-{int(time.time())}",
+                )
+                order = self._submit_entry_order(sym, req, allow_existing_position=True, scale_in=True)
+                if order is None:
+                    continue
+                self.order_cache[sym] = order.id
+                state["tranches_done"] = done + 1
+                log.warning(
+                    f"STAGED ADD {sym}: tranche {done + 1}/{total} ({qty} sh) "
+                    f"@ gain {gain_pct:+.2f}% -- trailing {REENTRY_TRAIL_PCT:.2f}% DAY entry"
+                )
+            except Exception as e:
+                log.warning(f"maybe_add_staged_tranches {sym}: {e}")
+
     # -- Public: Execute ---------------------------------------------------
     def execute(self, signal: Signal, swap_only: bool = False) -> bool:
         if is_never_trade(signal.symbol):
@@ -2171,8 +2631,10 @@ class EnhancedExecutor:
                 if signal.symbol in getattr(self, "_loss_reentry_required", set()):
                     ok, reason = EnhancedExecutor._check_30m_reentry_performance(signal.symbol, True)
                     if not ok:
-                        log.info(f"Skip {signal.symbol}: {reason} — loss re-entry 30m gate")
+                        log.info(f"Skip {signal.symbol}: {reason} -- loss re-entry 30m gate")
                         return False
+                    if reason:
+                        log.info(f"LOSS REENTRY {signal.symbol}: {reason}")
                 result = self._execute_entry(signal, acct, order_type, swap_only=swap_only)
                 if result:
                     getattr(self, "_loss_reentry_required", set()).discard(signal.symbol)
@@ -2196,8 +2658,10 @@ class EnhancedExecutor:
                 if signal.symbol in getattr(self, "_loss_reentry_required", set()):
                     ok, reason = EnhancedExecutor._check_30m_reentry_performance(signal.symbol, False)
                     if not ok:
-                        log.info(f"Skip {signal.symbol}: {reason} — loss re-entry 30m gate")
+                        log.info(f"Skip {signal.symbol}: {reason} -- loss re-entry 30m gate")
                         return False
+                    if reason:
+                        log.info(f"LOSS REENTRY {signal.symbol}: {reason}")
                 result = self._execute_entry(signal, acct, order_type, swap_only=swap_only)
                 if result:
                     getattr(self, "_loss_reentry_required", set()).discard(signal.symbol)
@@ -2207,7 +2671,7 @@ class EnhancedExecutor:
             log.error(f"Execute error {signal.symbol}: {e}")
         return False
 
-    # ΓöÇΓöÇ Close Short ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+    # ---- Close Short ----------------------------------------------------------------------------------------
     def _close_short_position(self, signal: Signal, equity: float) -> bool:
         positions = self._get_positions()
         if not positions.has_position(signal.symbol):
@@ -2256,13 +2720,13 @@ class EnhancedExecutor:
             log.error(f"Cover error {signal.symbol}: {e}")
             return False
 
-    # ΓöÇΓöÇ Close Long ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+    # ---- Close Long ------------------------------------------------------------------------------------------
     def _close_long_position(self, signal: Signal, equity: float) -> bool:
         positions = self._get_positions()
         if not positions.has_position(signal.symbol):
             log.info(f"No position in {signal.symbol}")
             return False
-        # Closes are ALWAYS allowed regardless of PDT — never block an exit
+        # Closes are ALWAYS allowed regardless of PDT -- never block an exit
 
         qty = abs(int(float(positions.positions_dict[signal.symbol].qty)))
         try:
@@ -2284,7 +2748,7 @@ class EnhancedExecutor:
                     time.sleep(0.4)
             except Exception:
                 pass
-            # A plain MarketOrderRequest gets rejected outside regular hours — this
+            # A plain MarketOrderRequest gets rejected outside regular hours -- this
             # path (a strategy-driven "sell" signal on a held long) is reachable
             # any time scan_and_trade runs, which spans the full 07:00-20:00
             # is_market_open window, not just 09:30-16:00. Its sibling
@@ -2293,7 +2757,7 @@ class EnhancedExecutor:
             self._submit_closing_order(signal.symbol, qty, OrderSide.SELL, signal.price)
             # NOTE: closing an existing position is NOT a new day trade.
             # Alpaca counts the round-trip (open+close same day) as one trade;
-            # pdt.add() is intentionally omitted here — it was already counted at entry.
+            # pdt.add() is intentionally omitted here -- it was already counted at entry.
             self._get_positions(force_refresh=True)
             log.info(f"SELL {signal.symbol}: {qty} shares | {signal.strategy}")
             return True
@@ -2301,14 +2765,14 @@ class EnhancedExecutor:
             log.error(f"Sell error {signal.symbol}: {e}")
             return False
 
-    # ─── Protect Open Positions ──────────────────────────────────────────────
+    # --- Protect Open Positions ----------------------------------------------
     def protect_positions(self) -> None:
         """
         For every open position whose shares are fully free (qty_available > 0
         AND no existing sell/buy-to-cover order on that symbol), place a GTC
         trailing stop.  Skips any position already covered by an active order.
 
-        Covers today's entries too — if the bracket-order step-2 trailing stop
+        Covers today's entries too -- if the bracket-order step-2 trailing stop
         was rejected by the broker (common for inverse ETFs), this re-places it
         so the position is never left naked intraday.  A GTC trailing stop that
         fills same-day will count as a day trade; the PDT violation alert in
@@ -2337,9 +2801,10 @@ class EnhancedExecutor:
         for pos in positions:
             sym = pos.symbol
 
-            # Skip options legs — OCC symbols (e.g. AEHR260515C00080000) are managed
-            # by OptionsExecutor.monitor_positions(); trailing stops are invalid for options
-            # (Alpaca error 42210000).  OCC symbols always match <ticker><YYMMDD><C|P><8digits>.
+            # Skip options legs -- OCC symbols (e.g. AEHR260515C00080000) can
+            # still exist in the account from before options trading was removed
+            # (2026-09-01); trailing stops are invalid for them (Alpaca error
+            # 42210000). OCC symbols always match <ticker><YYMMDD><C|P><8digits>.
             if re.match(r'^[A-Z]+\d{6}[CP]\d{8}$', sym):
                 continue
 
@@ -2353,7 +2818,7 @@ class EnhancedExecutor:
 
             # Secondary guard: skip if broker reports zero available qty. Alpaca
             # mirrors qty_available's sign to qty for shorts (a fully-free -26
-            # share short reports qty_available=-26, not +26) — checking <= 0
+            # share short reports qty_available=-26, not +26) -- checking <= 0
             # is only correct for longs. Confirmed live 2026-08-12: every open
             # short (ACHR, CORZ, IREN, MARA, ONON, SE, WULF) has a negative
             # qty_available and was being skipped here every single cycle,
@@ -2377,7 +2842,7 @@ class EnhancedExecutor:
                 except (TypeError, ValueError, AttributeError):
                     gain_pct = None
 
-                trail_pct, tier_label = _trail_pct_for(sym, current, self._entry_log, gain_pct)
+                trail_pct, tier_label = _atr_trail_pct_for(sym, current, self._entry_log, gain_pct)
 
                 stop_side = OrderSide.SELL if is_long_pos else OrderSide.BUY
                 self.client.submit_order(TrailingStopOrderRequest(
@@ -2403,7 +2868,7 @@ class EnhancedExecutor:
                     if sym not in self._pdt_stop_blocked:
                         try:
                             entry_price = float(pos.avg_entry_price or pos.current_price)
-                            stop_pct    = _trail_pct_for(sym, float(pos.current_price), self._entry_log)[0]
+                            stop_pct    = _atr_trail_pct_for(sym, float(pos.current_price), self._entry_log)[0]
                             stop_price  = round(
                                 entry_price * (1 - stop_pct / 100) if qty > 0
                                 else entry_price * (1 + stop_pct / 100),
@@ -2411,7 +2876,7 @@ class EnhancedExecutor:
                             )
                             self._pdt_stop_blocked[sym] = stop_price
                             log.warning(
-                                f"protect_positions {sym}: broker PDT stop rejected — "
+                                f"protect_positions {sym}: broker PDT stop rejected -- "
                                 f"software SL set at ${stop_price:.2f} ({stop_pct:.1f}% from ${entry_price:.2f})"
                             )
                         except Exception:
@@ -2424,7 +2889,7 @@ class EnhancedExecutor:
     def ratchet_confident_winners(self) -> None:
         """Tighten the trailing stop on a position once it's up
         CONF_RATCHET_TRIGGER_GAIN_PCT or more, scaled by how confident the
-        original entry signal was — a trade we were more sure about locks in
+        original entry signal was -- a trade we were more sure about locks in
         its gain sooner instead of riding the full tier-width stop like every
         other trade. Runs once per position for its whole life (tracked via
         _ratchet_done); protect_positions() never revisits a symbol once it
@@ -2434,7 +2899,7 @@ class EnhancedExecutor:
         Skips: positions still at/under their entry price, confidence at or
         below SWAP_MIN_CONFIDENCE (includes the 0.0 placeholder that
         _rebuild_entry_log_from_orders uses for positions restored after a
-        bot restart — we don't actually know those were high-confidence, so
+        bot restart -- we don't actually know those were high-confidence, so
         never tighten them), and anything already ratcheted.
         """
         if not CONF_RATCHET_ENABLED:
@@ -2450,7 +2915,7 @@ class EnhancedExecutor:
             if sym in self._ratchet_done:
                 continue
             if re.match(r'^[A-Z]+\d{6}[CP]\d{8}$', sym):
-                continue  # options legs — managed separately
+                continue  # options legs -- managed separately
             confidence = self._entry_log.get(sym, {}).get("confidence", 0.0)
             if confidence <= SWAP_MIN_CONFIDENCE:
                 continue
@@ -2464,7 +2929,7 @@ class EnhancedExecutor:
 
             try:
                 current  = float(pos.current_price)
-                base_pct = _trail_pct_for(sym, current, self._entry_log)[0]
+                base_pct = _atr_trail_pct_for(sym, current, self._entry_log)[0]
                 tightened_pct = round(base_pct * ratchet_scale(confidence), 2)
                 if tightened_pct >= base_pct:
                     self._ratchet_done.add(sym)  # nothing to tighten to; don't recheck every cycle
@@ -2486,7 +2951,7 @@ class EnhancedExecutor:
                 ))
                 self._ratchet_done.add(sym)
                 log.info(
-                    f"RATCHET {sym}: +{gain_pct:.1f}% unrealized, entry conf={confidence:.0%} — "
+                    f"RATCHET {sym}: +{gain_pct:.1f}% unrealized, entry conf={confidence:.0%} -- "
                     f"trailing stop {base_pct:.1f}% -> {tightened_pct:.1f}%"
                 )
             except Exception as e:
@@ -2535,7 +3000,7 @@ class EnhancedExecutor:
 
         2026-08-17, CDTG: the bracket-order trailing stop used to be
         deliberately deferred for every live same-day entry on an assumed
-        PDT block that was never real (removed 2026-08-28 — see enhanced.py
+        PDT block that was never real (removed 2026-08-28 -- see enhanced.py
         entry-order step 2), and protect_positions() only ran on the
         adaptive scan cadence -- CDTG sat with literally zero stop coverage
         for 3+ minutes while it fell from $2.97 to $2.73, and by the time a
@@ -2553,7 +3018,7 @@ class EnhancedExecutor:
         for pos in positions:
             sym = pos.symbol
             if re.match(r'^[A-Z]+\d{6}[CP]\d{8}$', sym):
-                continue  # options legs — managed separately
+                continue  # options legs -- managed separately
             if sym in self._pdt_stop_blocked:
                 continue
             try:
@@ -2561,18 +3026,28 @@ class EnhancedExecutor:
                 if qty == 0:
                     continue
                 is_long_pos = qty > 0
-                stop_pct    = TRAIL_STOP_PCT
+                stop_pct    = _atr_trail_pct_for(sym, float(pos.current_price or 0), self._entry_log)[0]
                 position_side = OrderSide.SELL if is_long_pos else OrderSide.BUY
                 symbol_orders = [o for o in open_orders if o.symbol == sym]
                 trailing_stops = []
+                has_day_protection = False
                 for order in symbol_orders:
                     raw_type = getattr(order, "order_type", "")
                     order_type = str(getattr(raw_type, "value", raw_type)).lower()
+                    order_class = str(getattr(getattr(order, "order_class", ""), "value", getattr(order, "order_class", ""))).lower()
                     raw_side = getattr(order, "side", "")
                     order_side = str(getattr(raw_side, "value", raw_side)).lower()
                     tif = getattr(order, "time_in_force", None)
                     expected_side = "sell" if is_long_pos else "buy"
-                    if tif == TimeInForce.DAY and order_side == expected_side and "limit" in order_type:
+                    is_day_exit = (
+                        tif == TimeInForce.DAY
+                        and order_side == expected_side
+                        and (
+                            order_class in ("bracket", "oco")
+                            or any(kind in order_type for kind in ("limit", "stop"))
+                        )
+                    )
+                    if is_day_exit:
                         submitted_at = getattr(order, "submitted_at", None) or getattr(order, "created_at", None)
                         if submitted_at is not None:
                             if submitted_at.tzinfo is None:
@@ -2585,11 +3060,14 @@ class EnhancedExecutor:
                                 self.client.cancel_order_by_id(str(order.id))
                                 time.sleep(0.4)
                                 log.warning(
-                                    f"PROTECT {sym}: converted DAY limit exit {order.id} "
+                                    f"PROTECT {sym}: converted DAY bracket exit {order.id} "
                                     f"to fixed {stop_pct:.1f}% GTC trailing stop after {age_seconds:.0f}s"
                                 )
                             except Exception as cancel_err:
-                                log.warning(f"PROTECT {sym}: limit-exit conversion failed for {order.id}: {cancel_err}")
+                                has_day_protection = True
+                                log.warning(f"PROTECT {sym}: bracket-exit conversion failed for {order.id}: {cancel_err}")
+                        else:
+                            has_day_protection = True
                         continue
                     if tif != TimeInForce.GTC:
                         continue
@@ -2629,6 +3107,8 @@ class EnhancedExecutor:
                         except Exception as cancel_err:
                             log.warning(f"PROTECT {sym}: duplicate trailing-stop cancel failed: {cancel_err}")
                     continue
+                if has_day_protection:
+                    continue
 
                 try:
                     self.client.submit_order(TrailingStopOrderRequest(
@@ -2642,7 +3122,7 @@ class EnhancedExecutor:
                     log.info(f"PROTECT {sym} [fast-thread]: trailing stop {stop_pct:.1f}% GTC")
                     continue
                 except Exception as broker_e:
-                    log.warning(f"_cover_naked_positions {sym}: broker stop rejected ({broker_e}) — falling back to software SL")
+                    log.warning(f"_cover_naked_positions {sym}: broker stop rejected ({broker_e}) -- falling back to software SL")
 
                 entry_price = float(pos.avg_entry_price or pos.current_price)
                 stop_price  = round(
@@ -2652,11 +3132,11 @@ class EnhancedExecutor:
                 )
                 self._pdt_stop_blocked[sym] = stop_price
                 log.warning(
-                    f"_cover_naked_positions {sym}: no order coverage yet — "
+                    f"_cover_naked_positions {sym}: no order coverage yet -- "
                     f"software SL set at ${stop_price:.2f} ({stop_pct:.1f}% from ${entry_price:.2f})"
                 )
             except Exception:
-                continue  # best-effort — next 5s tick tries again
+                continue  # best-effort -- next 5s tick tries again
 
     def check_software_stops(self) -> None:
         """Close any position whose broker-rejected PDT stop has been breached.
@@ -2685,7 +3165,7 @@ class EnhancedExecutor:
                         self._submit_closing_order(sym, abs(qty), side, current)
                         self._pdt_stop_blocked.pop(sym, None)
                         log.warning(
-                            f"SOFTWARE SL HIT {sym}: price ${current:.2f} crossed stop ${stop_price:.2f} — "
+                            f"SOFTWARE SL HIT {sym}: price ${current:.2f} crossed stop ${stop_price:.2f} -- "
                             f"{'SELL' if is_long else 'BUY-TO-COVER'} submitted"
                         )
                         self._maybe_rearm_reentry(
@@ -2694,13 +3174,13 @@ class EnhancedExecutor:
                         )
                     except Exception as close_err:
                         if "40310100" in str(close_err):
-                            # Broker PDT also blocks same-day close — position is a forced
+                            # Broker PDT also blocks same-day close -- position is a forced
                             # overnight hold.  Stop retrying; it will carry to next session.
                             self._pdt_stop_blocked.pop(sym, None)
                             self._pdt_overnight_forced.add(sym)
                             log.warning(
                                 f"SOFTWARE SL {sym}: stop breached at ${current:.2f} but PDT blocks "
-                                f"same-day close — holding overnight (stop was ${stop_price:.2f})"
+                                f"same-day close -- holding overnight (stop was ${stop_price:.2f})"
                             )
                         else:
                             log.error(f"check_software_stops {sym}: {close_err}")
@@ -2710,14 +3190,14 @@ class EnhancedExecutor:
                 log.error(f"check_software_stops {sym}: {e}")
 
     def detect_stopped_out_positions(self) -> None:
-        """Catch a position closing via ANY route — most commonly a normal
-        broker-side GTC trailing stop filling on its own — and reset its
+        """Catch a position closing via ANY route -- most commonly a normal
+        broker-side GTC trailing stop filling on its own -- and reset its
         ratchet-tightening state so a later re-entry gets fresh confidence-
         ratchet protection instead of none (see the _ratchet_done.discard
         call below).
 
         2026-08-24, user request: this used to also arm a post-loss re-entry
-        cooldown here (and in check_afterhours_stops()'s own close path) —
+        cooldown here (and in check_afterhours_stops()'s own close path) --
         removed. No cooldown left anywhere; the exit stack (trailing stop,
         per-minute check_ema9_exit, standalone stop-loss) is the only
         protection now.
@@ -2728,7 +3208,7 @@ class EnhancedExecutor:
         that gap actually lived. check_ema9_exit, check_software_stops,
         check_afterhours_stops, check_price_drift_stop all now call
         _maybe_rearm_reentry() directly, synchronously, right after their
-        own close — but a genuine broker-side GTC trailing stop filling
+        own close -- but a genuine broker-side GTC trailing stop filling
         entirely on its own never goes through any of those; this poll is
         the only place that ever notices it happened at all. Confirmed
         2026-08-26: this was the dominant exit route (~51 of 73 trades), and
@@ -2744,9 +3224,9 @@ class EnhancedExecutor:
         enforce_portfolio_leverage/_attempt_swap/_execute_entry's weakest-
         position swap), emergency_close_all (kill-switch), and
         close_eod_positions (explicit follow-up request: "don't reenter
-        after end of day exit"). Every other close in the file — stale-
+        after end of day exit"). Every other close in the file -- stale-
         swing, no-gain, swing-drift, take-profit, a contradicting strategy
-        signal — is unmarked on purpose, so it falls through here and gets
+        signal -- is unmarked on purpose, so it falls through here and gets
         the same re-entry check as a genuine stop.
         """
         try:
@@ -2759,7 +3239,7 @@ class EnhancedExecutor:
         for p in positions:
             sym = p.symbol
             if re.match(r'^[A-Z]+\d{6}[CP]\d{8}$', sym):
-                continue  # options legs — managed separately
+                continue  # options legs -- managed separately
             try:
                 current[sym] = {
                     "entry_price": float(p.avg_entry_price),
@@ -2773,24 +3253,32 @@ class EnhancedExecutor:
         for sym, last in self._last_known_positions.items():
             if sym in current:
                 continue  # still open
-            # Closed via any route — eligible for confidence-ratchet protection
+            # Closed via any route -- eligible for confidence-ratchet protection
             # again next time it's re-entered (was symbol-keyed and add-only,
-            # so a re-entry after an earlier ratcheted win got none — 2026-08-10:
+            # so a re-entry after an earlier ratcheted win got none -- 2026-08-10:
             # ABCL ran +6.3% unrealized on a fresh entry after an earlier lot had
             # already ratcheted, and never got tightened).
             self._ratchet_done.discard(sym)
             # A stale peak from the lot that just closed must never carry
             # over and get trailed against by a later, differently-priced
             # re-entry.
-            self._ema9_trail_peak.pop(sym, None)
+            if hasattr(self, "_ema9_trail_peak"):
+                self._ema9_trail_peak.pop(sym, None)
+            for attr in ("_entry_ema15_delta", "_entry_ema15", "_reclaimed_ema15"):
+                state = getattr(self, attr, None)
+                if state is not None:
+                    state.discard(sym) if hasattr(state, "discard") else state.pop(sym, None)
 
-            if sym in self._no_rearm:
-                self._no_rearm.discard(sym)
-                continue  # closed on purpose — respect it, don't re-arm
+            no_rearm = getattr(self, "_no_rearm", set())
+            if sym in no_rearm:
+                no_rearm.discard(sym)
+                continue  # closed on purpose -- respect it, don't re-arm
             qty = last.get("qty")
             if not qty:
-                continue  # no qty on record (pre-upgrade snapshot) — skip rather than guess
-            signed_pnl = (last["last_price"] - last["entry_price"]) * qty * (1 if last["is_long"] else -1)
+                continue  # no qty on record (pre-upgrade snapshot) -- skip rather than guess
+            close_lookup = getattr(self, "_get_recent_close_price", lambda *_args, **_kwargs: None)
+            close_price = close_lookup(sym, is_long=last["is_long"]) or last["last_price"]
+            signed_pnl = (close_price - last["entry_price"]) * qty * (1 if last["is_long"] else -1)
             self._maybe_rearm_reentry(
                 sym, last["is_long"], qty, "STOPPED OUT", was_loss=signed_pnl < 0,
             )
@@ -2799,17 +3287,17 @@ class EnhancedExecutor:
 
     def check_afterhours_stops(self) -> None:
         """Actively watch every open position's loss while the market is NOT in
-        regular hours — the broker-side GTC trailing stop from protect_positions()
+        regular hours -- the broker-side GTC trailing stop from protect_positions()
         sits inert outside 09:30-16:00 ET, so a position can free-fall pre-market
         or after-hours with no protection until regular hours resume. Uses a flat
         stop from avg_entry_price at the same trail % as the resting trailing
-        stop (not a true trailing high-water-mark — good enough for a software
+        stop (not a true trailing high-water-mark -- good enough for a software
         backstop). Skips symbols already handled by check_software_stops to
         avoid double-submitting a close. Meant to be polled frequently (the
         10s software-stop thread) since after-hours moves can be sharp.
 
         The resting GTC trailing stop reserves the position's qty, so Alpaca
-        won't accept a replacement close order while it's still open — it's
+        won't accept a replacement close order while it's still open -- it's
         cancelled up front, deterministically, rather than waiting to see if
         the close gets rejected. If the close then fails for any reason, a
         fresh GTC trailing stop is immediately re-armed as a fallback so the
@@ -2831,7 +3319,7 @@ class EnhancedExecutor:
             log.warning(f"check_afterhours_stops: fetch failed: {e}")
             return
 
-        # Position closed since the last poll — its re-chase count is stale, drop it
+        # Position closed since the last poll -- its re-chase count is stale, drop it
         # so a future breach of the same symbol starts back at the base slip.
         _live_syms = {p.symbol for p in positions}
         for _sym in [s for s in self._afterhours_chase_count if s not in _live_syms]:
@@ -2848,7 +3336,7 @@ class EnhancedExecutor:
         for pos in positions:
             sym = pos.symbol
             if re.match(r'^[A-Z]+\d{6}[CP]\d{8}$', sym):
-                continue  # options legs — managed separately
+                continue  # options legs -- managed separately
             if sym in self._pdt_stop_blocked:
                 continue
             try:
@@ -2858,7 +3346,7 @@ class EnhancedExecutor:
                 is_long = qty > 0
                 current = float(pos.current_price)
                 entry   = float(pos.avg_entry_price)
-                trail_pct  = _trail_pct_for(sym, current, self._entry_log)[0]
+                trail_pct  = _atr_trail_pct_for(sym, current, self._entry_log)[0]
                 stop_price = entry * (1 - trail_pct / 100) if is_long else entry * (1 + trail_pct / 100)
                 hit = (is_long and current <= stop_price) or (not is_long and current >= stop_price)
                 if not hit:
@@ -2870,14 +3358,14 @@ class EnhancedExecutor:
                     submitted_at = getattr(existing, "submitted_at", None) or getattr(existing, "created_at", None)
                     age_s = (now_utc - submitted_at).total_seconds() if submitted_at else 0.0
                     if age_s < AFTERHOURS_CHASE_STALE_SECONDS:
-                        continue  # close already in flight — give it time to fill
+                        continue  # close already in flight -- give it time to fill
                     try:
                         self.client.cancel_order_by_id(str(existing.id))
                         time.sleep(0.4)
                     except Exception as e:
                         log.warning(f"check_afterhours_stops {sym}: stale-close cancel failed, will retry next poll: {e}")
                         continue
-                    log.warning(f"AFTER-HOURS SL {sym}: prior close unfilled after {age_s:.0f}s — re-chasing at fresh price")
+                    log.warning(f"AFTER-HOURS SL {sym}: prior close unfilled after {age_s:.0f}s -- re-chasing at fresh price")
                 else:
                     # First attempt for this breach: the resting GTC trailing
                     # stop reserves the qty, so it must go before Alpaca will
@@ -2900,7 +3388,7 @@ class EnhancedExecutor:
                     _pnl = (current - entry) * qty
                     log.warning(
                         f"AFTER-HOURS SL HIT {sym} [{_strategy}]: price ${current:.2f} crossed stop ${stop_price:.2f} "
-                        f"({trail_pct:.1f}% from entry ${entry:.2f}) | P&L ${_pnl:+,.2f} — extended-hours "
+                        f"({trail_pct:.1f}% from entry ${entry:.2f}) | P&L ${_pnl:+,.2f} -- extended-hours "
                         f"{'SELL' if is_long else 'BUY-TO-COVER'} submitted @ {slip_pct:.1f}% slip "
                         f"(attempt {chase_n + 1})"
                     )
@@ -2913,7 +3401,7 @@ class EnhancedExecutor:
                         )
                 except Exception as close_err:
                     log.error(f"AFTER-HOURS SL {sym}: close order failed after GTC cancel: {close_err}")
-                    # GTC is gone and the replacement didn't go through — without
+                    # GTC is gone and the replacement didn't go through -- without
                     # a fallback the position would sit fully unprotected until
                     # the next protect_positions() cycle. Re-arm one now.
                     try:
@@ -2927,11 +3415,11 @@ class EnhancedExecutor:
                         ))
                         log.warning(f"AFTER-HOURS SL {sym}: re-armed GTC trailing stop as fallback after failed close")
                     except Exception as rearm_err:
-                        log.error(f"AFTER-HOURS SL {sym}: close failed AND GTC re-arm failed — position may be UNPROTECTED: {rearm_err}")
+                        log.error(f"AFTER-HOURS SL {sym}: close failed AND GTC re-arm failed -- position may be UNPROTECTED: {rearm_err}")
             except Exception as e:
                 log.error(f"check_afterhours_stops {sym}: {e}")
 
-    # ── Position Concentration Cap ───────────────────────────────────────────
+    # -- Position Concentration Cap -------------------------------------------
     @staticmethod
     def _effective_concentration_cap_pct(gain_pct: float) -> float:
         """2026-08-17, user request: "maximum holding as 20% of the
@@ -2946,12 +3434,12 @@ class EnhancedExecutor:
 
     def enforce_position_concentration(self) -> None:
         """Trim any position whose market value exceeds its effective
-        concentration cap (see _effective_concentration_cap_pct — the base
+        concentration cap (see _effective_concentration_cap_pct -- the base
         MAX_POSITION_CONCENTRATION_PCT for a losing/flat position, growing
         room for a winner). Entry sizing caps new buys at the plain base
         cap (see _size_with_buying_power -- a brand-new position has no
         gain yet to grow from), but an existing winner can drift past its
-        (possibly wider) cap through further price appreciation — this is
+        (possibly wider) cap through further price appreciation -- this is
         the backstop for that case."""
         try:
             acct = self._get_account()
@@ -2964,7 +3452,7 @@ class EnhancedExecutor:
         for pos in positions:
             sym = pos.symbol
             if re.match(r'^[A-Z]+\d{6}[CP]\d{8}$', sym):
-                continue  # options legs — sized/managed separately
+                continue  # options legs -- sized/managed separately
             qty = int(float(pos.qty))
             if qty == 0:
                 continue
@@ -2987,7 +3475,7 @@ class EnhancedExecutor:
                 self._free_shares_for_trim(sym, trim_qty)
                 self._submit_closing_order(sym, trim_qty, side, current)
                 log.warning(
-                    f"CONCENTRATION TRIM {sym}: {trim_qty} shares — ${market_value:,.0f} was "
+                    f"CONCENTRATION TRIM {sym}: {trim_qty} shares -- ${market_value:,.0f} was "
                     f"{market_value / acct.equity:.0%} of equity, cap {cap_pct:.0f}% "
                     f"(gain {gain_pct:+.1f}%)"
                 )
@@ -3065,7 +3553,7 @@ class EnhancedExecutor:
                 continue
 
             excess = total_value - cap_value
-            # Trim largest positions first — fewer orders, and it's the biggest
+            # Trim largest positions first -- fewer orders, and it's the biggest
             # single contributor to the breach.
             for pos in sorted(group_positions, key=lambda p: abs(float(p.market_value)), reverse=True):
                 if excess <= 0:
@@ -3082,7 +3570,7 @@ class EnhancedExecutor:
                     self._no_rearm.add(sym)  # portfolio-level risk control, not a verdict on this symbol
                     self._submit_closing_order(sym, trim_qty, side, current)
                     log.warning(
-                        f"CORRELATION TRIM [{group_name}] {sym}: {trim_qty} shares — group was "
+                        f"CORRELATION TRIM [{group_name}] {sym}: {trim_qty} shares -- group was "
                         f"${total_value:,.0f} ({total_value / acct.equity:.0%} of equity), cap {group['max_pct']:.0f}%"
                     )
                     excess -= trim_qty * current
@@ -3144,7 +3632,7 @@ class EnhancedExecutor:
                 self._no_rearm.add(sym)  # portfolio-level risk control, not a verdict on this symbol
                 self._submit_closing_order(sym, trim_qty, side, current)
                 log.warning(
-                    f"PORTFOLIO LEVERAGE TRIM {sym}: {trim_qty} shares — book was "
+                    f"PORTFOLIO LEVERAGE TRIM {sym}: {trim_qty} shares -- book was "
                     f"${total_value:,.0f} ({total_value / acct.equity:.1f}x equity), cap {MAX_PORTFOLIO_LEVERAGE:.1f}x"
                 )
                 excess -= trim_qty * current
@@ -3176,21 +3664,21 @@ class EnhancedExecutor:
                         pass
                 if sym_orders:
                     log.warning(
-                        f"PORTFOLIO LEVERAGE: cancelled outstanding entry order(s) for {sym} — "
+                        f"PORTFOLIO LEVERAGE: cancelled outstanding entry order(s) for {sym} -- "
                         f"book over {MAX_PORTFOLIO_LEVERAGE:.1f}x cap, not adding more exposure"
                     )
                 self._pending_entry_signals.pop(sym, None)
             except Exception as e:
                 log.warning(f"enforce_portfolio_leverage: cancel pending entry {sym} failed: {e}")
 
-    # ── EOD Close ─────────────────────────────────────────────────────────────
+    # -- EOD Close -------------------------------------------------------------
     @staticmethod
     def _guardrail_fail_reason(
         avg_daily_vol: Optional[float], shares_float: Optional[float], market_cap: Optional[float]
     ) -> Optional[str]:
         """Pure decision logic for close_guardrail_fail_positions: return the
         reason string if any known metric is below its guardrail, else None
-        (passes, or all three are unavailable — missing data never forces a
+        (passes, or all three are unavailable -- missing data never forces a
         close). Split out from the method below so it's unit-testable without
         a broker connection."""
         if avg_daily_vol is not None and avg_daily_vol < MIN_AVG_DAILY_VOLUME_REGULAR_HOURS:
@@ -3200,6 +3688,60 @@ class EnhancedExecutor:
         if market_cap is not None and market_cap < MIN_MARKET_CAP:
             return f"mcap ${market_cap/1e6:.0f}M < ${MIN_MARKET_CAP/1e6:.0f}M"
         return None
+
+    def _exchange_close_for_today(self, now_et: datetime.datetime) -> Tuple[datetime.datetime, datetime.datetime, str]:
+        """Return (official close ET, EOD close ET, source), cached per day.
+
+        Uses Alpaca's exchange calendar so early-close sessions flatten 10
+        minutes before the actual close, not 15:50 by habit. Falls back to
+        configured MARKET_CLOSE/EOD_CLOSE_TIME if the calendar is unavailable.
+        """
+        import pytz
+
+        et = pytz.timezone("America/New_York")
+        today = now_et.date()
+        cached = getattr(self, "_exchange_close_cache", {}).get(today)
+        if cached:
+            return cached
+
+        close_at = None
+        source = "config"
+        try:
+            from alpaca.trading.requests import GetCalendarRequest
+            today_s = today.isoformat()
+            cal = self.client.get_calendar(GetCalendarRequest(start=today_s, end=today_s)) or []
+            if cal:
+                close_value = getattr(cal[0], "close", None)
+                close_dt = close_value.to_pydatetime() if hasattr(close_value, "to_pydatetime") else close_value
+                if isinstance(close_dt, str):
+                    close_dt = datetime.datetime.fromisoformat(close_dt.replace("Z", "+00:00"))
+                if isinstance(close_dt, datetime.time):
+                    close_dt = datetime.datetime.combine(today, close_dt)
+                if getattr(close_dt, "tzinfo", None) is None:
+                    close_dt = et.localize(close_dt)
+                close_at = close_dt.astimezone(et)
+                source = "exchange-calendar"
+        except Exception as e:
+            log.debug(f"exchange calendar close lookup failed, using configured close times: {e}")
+
+        if close_at is None:
+            close_h, close_m = map(int, MARKET_CLOSE.split(":"))
+            close_at = now_et.replace(hour=close_h, minute=close_m, second=0, microsecond=0)
+
+        eod_at = close_at - datetime.timedelta(minutes=10)
+        configured_h, configured_m = map(int, EOD_CLOSE_TIME.split(":"))
+        configured_eod = now_et.replace(hour=configured_h, minute=configured_m, second=0, microsecond=0)
+        if source == "config":
+            eod_at = configured_eod
+
+        if not hasattr(self, "_exchange_close_cache"):
+            self._exchange_close_cache = {}
+        self._exchange_close_cache = {today: (close_at, eod_at, source)}
+        log.info(
+            f"EOD schedule for {today}: exchange_close={close_at.strftime('%H:%M')} ET, "
+            f"eod_exit={eod_at.strftime('%H:%M')} ET ({source})"
+        )
+        return close_at, eod_at, source
 
     def close_eod_positions(self) -> Optional[dict]:
         """Close every same-day position at EOD_CLOSE_TIME, regardless of
@@ -3235,12 +3777,17 @@ class EnhancedExecutor:
             return None
 
         import pytz
-        now_et = datetime.datetime.now(pytz.timezone("America/New_York"))
-        close_h, close_m = map(int, EOD_CLOSE_TIME.split(":"))
-        if now_et.hour < close_h or (now_et.hour == close_h and now_et.minute < close_m):
+        et = pytz.timezone("America/New_York")
+        now_et = datetime.datetime.now(et)
+        market_state = MarketState.from_now(now_et)
+        if not market_state.weekday or not market_state.is_regular_hours:
+            return None  # Only submit EOD closes during regular hours on market weekdays
+
+        exchange_close_at, eod_at, _source = self._exchange_close_for_today(now_et)
+        if now_et < eod_at:
             return None  # Not yet EOD close time
-        if now_et.hour >= 16:
-            return None  # Market already closed
+        if now_et >= exchange_close_at:
+            return None  # Official exchange close has passed
 
         try:
             positions = self.client.get_all_positions()
@@ -3248,7 +3795,9 @@ class EnhancedExecutor:
             log.error(f"close_eod_positions: fetch failed: {e}")
             return None
 
-        today = datetime.date.today()
+        today = now_et.date()
+        already_closed = getattr(self, "_eod_closed", {}).setdefault(today, set())
+        self._eod_closed = {today: already_closed}
         closed_items = []
         failed_items = []
 
@@ -3257,12 +3806,11 @@ class EnhancedExecutor:
             qty = int(float(pos.qty))
             if qty == 0:
                 continue
+            if sym in already_closed:
+                continue
 
-            entry_info = self._entry_log.get(sym)
-            if not entry_info:
-                continue
-            if entry_info.get("date") != today:
-                continue
+            entry_info = self._entry_log.get(sym) or {}
+            strategy = entry_info.get("strategy", "unknown")
 
             side = OrderSide.SELL if qty > 0 else OrderSide.BUY
             try:
@@ -3297,11 +3845,10 @@ class EnhancedExecutor:
                 except Exception:
                     pass
 
-                # 2026-08-18, user request: no force_extended_hours -- EOD closes
-                # never chase into after-hours anymore. Unfilled by the 16:00 close,
-                # this expires worthless and the position carries overnight under its
-                # existing GTC trailing stop; _sweep_force_closes (below) gives up
-                # the same way once regular hours end instead of re-chasing.
+                # Submit the first EOD close as a regular-session DAY limit.
+                # If it misses the bell, _sweep_force_closes keeps chasing
+                # with extended-hours limits because Alpaca equity trailing
+                # stops do not execute after-hours.
                 # 2026-08-26, user request ("irrespective of exit type
                 # reentry should happen for the top 30 list") briefly left
                 # this unmarked on the reasoning that ENTRY_WINDOW_END_ET
@@ -3311,20 +3858,21 @@ class EnhancedExecutor:
                 # rather than relying on that time-window side effect.
                 self._no_rearm.add(sym)
                 self._submit_closing_order(sym, abs(qty), side, float(pos.current_price), no_extended_hours=True)
+                already_closed.add(sym)
                 self._entry_log.pop(sym, None)
-                self._force_close_pending[sym] = {"reason": f"eod:{entry_info.get('strategy', 'unknown')}", "chase_count": 0}
+                self._force_close_pending[sym] = {"reason": f"eod:{strategy}", "chase_count": 0}
 
                 pnl = float(pos.unrealized_pl)
                 closed_items.append({
                     "symbol": sym,
                     "qty": abs(qty),
-                    "strategy": entry_info.get("strategy", "unknown"),
+                    "strategy": strategy,
                     "pnl": pnl,
                 })
 
                 log.info(
                     f"EOD CLOSE {sym}: {abs(qty)} shares | "
-                    f"strategy={entry_info.get('strategy', 'unknown')} | P&L ${pnl:.2f}"
+                    f"strategy={strategy} | P&L ${pnl:.2f}"
                 )
             except Exception as e:
                 failed_items.append({"symbol": sym, "error": str(e)})
@@ -3333,7 +3881,7 @@ class EnhancedExecutor:
                 # so a close failure for some other reason doesn't leave the
                 # position unprotected overnight.
                 try:
-                    trail_pct, _ = _trail_pct_for(sym, float(pos.current_price), self._entry_log)
+                    trail_pct, _ = _atr_trail_pct_for(sym, float(pos.current_price), self._entry_log)
                     self.client.submit_order(TrailingStopOrderRequest(
                         symbol=sym, qty=abs(qty), side=side,
                         type=AlpacaOrderType.TRAILING_STOP, time_in_force=TimeInForce.GTC,
@@ -3341,7 +3889,7 @@ class EnhancedExecutor:
                     ))
                     log.warning(f"close_eod_positions {sym}: re-armed GTC trailing stop after failed close")
                 except Exception as rearm_err:
-                    log.error(f"close_eod_positions {sym}: close failed AND GTC re-arm failed — position may be UNPROTECTED: {rearm_err}")
+                    log.error(f"close_eod_positions {sym}: close failed AND GTC re-arm failed -- position may be UNPROTECTED: {rearm_err}")
 
         summary = {
             "date": today.isoformat(),
@@ -3354,7 +3902,7 @@ class EnhancedExecutor:
         return summary
 
     def close_guardrail_fail_positions(self) -> Optional[dict]:
-        """5 min before close, force-close any open position (any strategy —
+        """5 min before close, force-close any open position (any strategy --
         unlike close_eod_positions, not limited to EOD_CLOSE_STRATEGIES) that
         currently fails the standard liquidity/quality guardrails: avg daily
         volume, float shares, or market cap. Only guardrail-passing names get
@@ -3398,7 +3946,7 @@ class EnhancedExecutor:
         for pos in positions:
             sym = pos.symbol
             if re.match(r'^[A-Z]+\d{6}[CP]\d{8}$', sym):
-                continue  # options legs — managed separately
+                continue  # options legs -- managed separately
 
             qty = int(float(pos.qty))
             if qty == 0:
@@ -3420,7 +3968,7 @@ class EnhancedExecutor:
 
             fail_reason = self._guardrail_fail_reason(avg_daily_vol, shares_float, market_cap)
             if fail_reason is None:
-                continue  # passes guardrails (or data unavailable) — fine to hold overnight
+                continue  # passes guardrails (or data unavailable) -- fine to hold overnight
 
             try:
                 sym_orders = [o for o in (self.client.get_orders() or []) if o.symbol == sym]
@@ -3461,6 +4009,231 @@ class EnhancedExecutor:
         }
         return summary
 
+
+    def lunch_flat_positions(self) -> Optional[dict]:
+        """Close EVERY position and cancel EVERY open order when the midday
+        break begins (LUNCH_FLAT_TIME_ET = 11:00 ET), then keep the book flat
+        through the 11:00-14:45 break.
+
+        2026-09-01, user request ("at 11AM close all positions and open
+        orders, and reenter only at 2:45PM and again exist all at 3:50"): the
+        entry window is now two disjoint segments (09:14-11:00 and 14:45-15:50)
+        and the book must be FULLY flat in between -- positions do not carry
+        across the break. Shares the close_eod_positions machinery: per-symbol
+        cancel-every-resting-order first (GTC stops included -- a resting stop
+        reserves the shares and would reject the close), _no_rearm marking so
+        detect_stopped_out_positions never re-arms a lunch-flattened name,
+        _force_close_pending population so _sweep_force_closes chases any
+        unfilled close on its poll until actually flat, and a per-day
+        per-symbol done set so it's safe to call every minute (the
+        orchestrator's _lunch_flat_job runs it on schedule.every(1).minutes).
+        On top of that it also cancels EVERY open order sweep-wide (not just
+        per-position), so a resting entry for a symbol with no position --
+        e.g. a trailing-buy that never filled -- can't fill mid-break either.
+        Options legs (OCC symbols) are skipped: options trading was removed
+        2026-09-01 and any legacy legs are left untouched."""
+        if not LUNCH_FLAT_ENABLED:
+            return None
+
+        import pytz
+        et = pytz.timezone("America/New_York")
+        now_et = datetime.datetime.now(et)
+        market_state = MarketState.from_now(now_et)
+        if not market_state.weekday or not market_state.is_regular_hours:
+            return None
+
+        lunch_start = datetime.datetime.strptime(LUNCH_FLAT_TIME_ET, "%H:%M").time()
+        break_end = datetime.datetime.strptime(ENTRY_WINDOW_BREAK_END_ET, "%H:%M").time()
+        if not (lunch_start <= now_et.time() < break_end):
+            return None  # not inside the break window
+
+        today = now_et.date()
+        already_closed = getattr(self, "_lunch_closed", {}).setdefault(today, set())
+        self._lunch_closed = {today: already_closed}
+
+        # 1) Cancel EVERY open order sweep-wide. Re-runs each minute so an
+        #    order that raced the previous pass (placed 10:59:50, resting as
+        #    this fires) still dies this pass instead of filling mid-break.
+        cancelled_ids: set = set()
+        cancelled_orders = 0
+        try:
+            open_orders = self.client.get_orders() or []
+            for _o in open_orders:
+                try:
+                    self.client.cancel_order_by_id(str(_o.id))
+                    cancelled_ids.add(str(_o.id))
+                    cancelled_orders += 1
+                except Exception:
+                    pass
+        except Exception as e:
+            log.warning(f"lunch_flat_positions: open-order cancel pass failed: {e}")
+
+        try:
+            positions = self.client.get_all_positions()
+        except Exception as e:
+            log.error(f"lunch_flat_positions: fetch failed: {e}")
+            return None
+
+        closed_items = []
+        failed_items = []
+        for pos in positions:
+            sym = pos.symbol
+            qty = int(float(pos.qty))
+            if qty == 0:
+                continue
+            if re.match(r'^[A-Z]+\d{6}[CP]\d{8}$', sym):
+                continue  # legacy options leg -- untouched (options removed 2026-09-01)
+            if sym in already_closed:
+                continue
+
+            entry_info = self._entry_log.get(sym) or {}
+            strategy = entry_info.get("strategy", "unknown")
+            side = OrderSide.SELL if qty > 0 else OrderSide.BUY
+            try:
+                try:
+                    sym_orders = [o for o in (self.client.get_orders() or []) if o.symbol == sym and str(o.id) not in cancelled_ids]
+                    for _o in sym_orders:
+                        try:
+                            self.client.cancel_order_by_id(str(_o.id))
+                        except Exception:
+                            pass
+                    if sym_orders:
+                        time.sleep(0.4)
+                except Exception:
+                    pass
+
+                # No re-entry after the lunch flat: directly mark the symbol so
+                # detect_stopped_out_positions/_maybe_rearm_reentry never
+                # re-arm a lunch-flattened name (same reasoning as EOD).
+                self._no_rearm.add(sym)
+                self._submit_closing_order(sym, abs(qty), side, float(pos.current_price), no_extended_hours=True)
+                already_closed.add(sym)
+                self._entry_log.pop(sym, None)
+                self._force_close_pending[sym] = {"reason": "lunch", "chase_count": 0}
+
+                pnl = float(pos.unrealized_pl)
+                closed_items.append({"symbol": sym, "qty": abs(qty), "strategy": strategy, "pnl": pnl})
+                log.info(f"LUNCH-FLAT CLOSE {sym}: {abs(qty)} shares | {strategy} | P&L ${pnl:.2f}")
+            except Exception as e:
+                failed_items.append({"symbol": sym, "error": str(e)})
+                log.error(f"LUNCH-FLAT CLOSE failed {sym}: {e}")
+
+        summary = {
+            "date": today.isoformat(),
+            "closed_count": len(closed_items),
+            "cancelled_orders": cancelled_orders,
+            "failed_count": len(failed_items),
+            "closed_items": closed_items,
+            "failed_items": failed_items,
+            "asof": now_et.isoformat(),
+        }
+        if closed_items or cancelled_orders:
+            log.warning(
+                f"[LUNCH-FLAT] {now_et.strftime('%H:%M')} ET -- closed {len(closed_items)} position(s), "
+                f"cancelled {cancelled_orders} open order(s), {len(failed_items)} failed"
+            )
+        return summary
+
+    def guardian_halt_flatten(self, reason: str = "guardian") -> Optional[dict]:
+        """Emergency flatten for the loss-guardian daily-loss backstop
+        (scripts/guardian.py -> flat_request.flag -> orchestrator poll tick).
+
+        Same mechanics as lunch_flat_positions -- cancel EVERY resting order
+        (GTC stops included: a resting stop reserves the shares and would
+        reject the close), _no_rearm so nothing ever re-arms the flattened
+        name, _force_close_pending so _sweep_force_closes chases unfilled
+        closes -- but deliberately NOT time-gated: it fires the moment the
+        guardian flag is seen, regular hours or not. Once fired it also sets
+        _halt_until_eod so every entry/re-entry path (gated in
+        _submit_entry_order) stays blocked until the next daily reset.
+        Per-day deduped (_guardian_halt_closed) -- safe to call on every
+        5s poll tick.
+        """
+        import pytz
+        now_et = datetime.datetime.now(pytz.timezone("America/New_York"))
+        today = now_et.date()
+        if getattr(self, "_guardian_halt_closed", None) == today:
+            # Already flattened today -- keep entries blocked, do not re-close.
+            self._halt_until_eod = True
+            return None
+
+        log.warning("=" * 70)
+        log.warning(f"[GUARDIAN-HALT] {reason} -- closing ALL positions and cancelling ALL orders")
+        log.warning("=" * 70)
+
+        # 1) Cancel EVERY open order sweep-wide (a racing order must not fill
+        #    after the halt decision).
+        cancelled_orders = 0
+        try:
+            for _o in (self.client.get_orders() or []):
+                try:
+                    self.client.cancel_order_by_id(str(_o.id))
+                    cancelled_orders += 1
+                except Exception:
+                    pass
+        except Exception as e:
+            log.warning(f"guardian_halt_flatten: open-order cancel pass failed: {e}")
+
+        # 2) Market-close every non-option position.
+        try:
+            positions = self.client.get_all_positions() or []
+        except Exception as e:
+            log.error(f"guardian_halt_flatten: positions fetch failed: {e}")
+            positions = []
+
+        closed = failed = 0
+        for pos in positions:
+            sym = pos.symbol
+            qty = int(float(pos.qty))
+            if qty == 0 or re.match(r"^[A-Z]+\d{6}[CP]\d{8}$", sym):
+                continue  # legacy options leg -- untouched (options removed 2026-09-01)
+            side = OrderSide.SELL if qty > 0 else OrderSide.BUY
+            try:
+                try:
+                    for _o in (self.client.get_orders() or []):
+                        if _o.symbol == sym:
+                            try:
+                                self.client.cancel_order_by_id(str(_o.id))
+                            except Exception:
+                                pass
+                    time.sleep(0.4)
+                except Exception:
+                    pass
+                self._no_rearm.add(sym)
+                self._submit_closing_order(sym, abs(qty), side, float(pos.current_price), no_extended_hours=True)
+                self._force_close_pending[sym] = {"reason": "guardian", "chase_count": 0}
+                self._entry_log.pop(sym, None)
+                closed += 1
+                log.warning(f"[GUARDIAN-HALT] CLOSE {sym}: {abs(qty)} shares @ ${pos.current_price}")
+            except Exception as e:
+                failed += 1
+                log.error(f"[GUARDIAN-HALT] CLOSE failed {sym}: {e}")
+
+        self._guardian_halt_closed = today
+        self._halt_until_eod = True
+        log.warning(
+            f"[GUARDIAN-HALT] Flat sweep done -- {closed} closed, {failed} failed, "
+            f"{cancelled_orders} orders cancelled. Entries blocked until the next daily reset."
+        )
+        try:
+            send_email(
+                "[APEXTRADER] GUARDIAN HALT -- positions flattened",
+                f"ApexTrader was hard-flattened by the loss guardian at {now_et.isoformat()}.\n\n"
+                f"Reason: {reason}\n"
+                f"Positions closed: {closed} | failed: {failed} | open orders cancelled: {cancelled_orders}\n\n"
+                f"All new entries are blocked until the next daily reset.",
+            )
+        except Exception as e:
+            log.error(f"[GUARDIAN-HALT] alert email failed: {e}")
+
+        return {
+            "closed": closed,
+            "failed": failed,
+            "cancelled_orders": cancelled_orders,
+            "date": today.isoformat(),
+        }
+
+
     def _sweep_force_closes(self) -> None:
         """Poll every symbol close_eod_positions / close_guardrail_fail_positions
         submitted a close for but hasn't confirmed flat yet (self._force_close_pending).
@@ -3476,14 +4249,10 @@ class EnhancedExecutor:
         indefinitely. Add a max-attempts giveup (with an alert) if that's ever
         observed live.
 
-        2026-08-18, user request: the only two reasons that land in
-        _force_close_pending (close_eod_positions/close_guardrail_fail_positions,
-        "eod:..."/"guardrail:...") are deadline/liquidity driven, not "price
-        moved against the position" -- so neither chases into extended hours
-        anymore. Gives up the instant regular hours end and leaves the position
-        to carry overnight under its GTC trailing stop; check_afterhours_stops
-        is the only path allowed to actually exit a position outside regular
-        hours."""
+        If the regular-session close misses, keep chasing into extended hours
+        with extended-hours limits. Alpaca equity trailing stops do not execute
+        after-hours, so a resting GTC trail is not considered sufficient EOD
+        protection."""
         if not self._force_close_pending:
             return
         try:
@@ -3508,43 +4277,41 @@ class EnhancedExecutor:
             sym_orders = orders_by_sym.get(sym, [])
 
             if not self._current_market_state().is_regular_hours:
-                # Give up -- EOD/guardrail closes don't chase into extended hours
-                # (see docstring). Carries overnight under its GTC trailing stop,
-                # re-arming one only if a still-regular-hours chase attempt above
-                # already cancelled it and never got a replacement order in.
-                has_gtc = any(getattr(o, "time_in_force", None) == TimeInForce.GTC for o in sym_orders)
-                if has_gtc:
-                    self._force_close_pending.pop(sym, None)
-                    log.warning(f"_sweep_force_closes {sym} [{info.get('reason')}]: market closed — giving up chase, carrying overnight under existing GTC stop")
-                    continue
-
-                # No GTC resting -- cancel any stale non-GTC close order first (it
-                # still reserves the qty against a new order, same reservation
-                # issue _free_shares_for_trim exists for) before re-arming.
-                # Deliberately NOT popped from _force_close_pending on failure --
-                # left for the next 10s poll to retry rather than silently giving
-                # up with the position unprotected.
-                stale = next((o for o in sym_orders if getattr(o, "time_in_force", None) != TimeInForce.GTC), None)
-                if stale is not None:
-                    try:
-                        self.client.cancel_order_by_id(str(stale.id))
-                        time.sleep(0.4)
-                    except Exception as e:
-                        log.warning(f"_sweep_force_closes {sym} [{info.get('reason')}]: market closed, stale-close cancel failed before GTC re-arm, will retry next poll: {e}")
+                # Alpaca equity trailing stops do not execute in extended
+                # hours. If an EOD/force close missed the bell, keep chasing
+                # with extended-hours marketable limits instead of assuming a
+                # resting GTC trail is meaningful protection overnight.
+                pending = next((o for o in sym_orders if getattr(o, "time_in_force", None) != TimeInForce.GTC), None)
+                if pending is not None:
+                    submitted_at = getattr(pending, "submitted_at", None) or getattr(pending, "created_at", None)
+                    age_s = (now_utc - submitted_at).total_seconds() if submitted_at else 0.0
+                    if age_s < AFTERHOURS_CHASE_STALE_SECONDS:
                         continue
+                cancel_failed = False
+                for order in sym_orders:
+                    try:
+                        self.client.cancel_order_by_id(str(order.id))
+                    except Exception as e:
+                        cancel_failed = True
+                        log.warning(f"_sweep_force_closes {sym} [{info.get('reason')}]: after-hours order cancel failed, will retry next poll: {e}")
+                        break
+                if cancel_failed:
+                    continue
+                if sym_orders:
+                    time.sleep(0.4)
 
                 side = OrderSide.SELL if qty > 0 else OrderSide.BUY
                 try:
-                    trail_pct, _ = _trail_pct_for(sym, float(pos.current_price), self._entry_log)
-                    self.client.submit_order(TrailingStopOrderRequest(
-                        symbol=sym, qty=abs(qty), side=side,
-                        type=AlpacaOrderType.TRAILING_STOP,
-                        time_in_force=TimeInForce.GTC, trail_percent=trail_pct,
-                    ))
-                    self._force_close_pending.pop(sym, None)
-                    log.warning(f"_sweep_force_closes {sym} [{info.get('reason')}]: market closed — giving up chase, re-armed GTC trailing stop, carrying overnight")
+                    chase_n = info.get("chase_count", 0)
+                    slip_pct = min(0.5 * (chase_n + 1), 3.0)
+                    self._submit_closing_order(sym, abs(qty), side, float(pos.current_price), slip_pct=slip_pct, force_extended_hours=True)
+                    info["chase_count"] = chase_n + 1
+                    log.warning(
+                        f"AFTER-HOURS FORCE-CLOSE {sym} [{info.get('reason')}]: GTC trails inactive after-hours -- "
+                        f"submitted extended-hours close @ {slip_pct:.1f}% slip (attempt {chase_n + 1})"
+                    )
                 except Exception as e:
-                    log.error(f"_sweep_force_closes {sym} [{info.get('reason')}]: market closed, giving up chase, GTC re-arm failed, will retry next poll — position may be UNPROTECTED overnight in the meantime: {e}")
+                    log.error(f"_sweep_force_closes {sym} [{info.get('reason')}]: after-hours close failed, will retry next poll: {e}")
                 continue
 
             pending = next((o for o in sym_orders if getattr(o, "time_in_force", None) != TimeInForce.GTC), None)
@@ -3552,7 +4319,7 @@ class EnhancedExecutor:
                 submitted_at = getattr(pending, "submitted_at", None) or getattr(pending, "created_at", None)
                 age_s = (now_utc - submitted_at).total_seconds() if submitted_at else 0.0
                 if age_s < AFTERHOURS_CHASE_STALE_SECONDS:
-                    continue  # still fresh — give it time to fill
+                    continue  # still fresh -- give it time to fill
                 try:
                     self.client.cancel_order_by_id(str(pending.id))
                     time.sleep(0.4)
@@ -3585,7 +4352,7 @@ class EnhancedExecutor:
                 info["chase_count"] = chase_n + 1
                 log.warning(
                     f"FORCE-CLOSE RE-CHASE {sym} [{info.get('reason')}]: unfilled after prior attempt "
-                    f"— resubmitted @ {slip_pct:.1f}% slip (attempt {chase_n + 1})"
+                    f"-- resubmitted @ {slip_pct:.1f}% slip (attempt {chase_n + 1})"
                 )
             except Exception as e:
                 log.error(f"_sweep_force_closes {sym}: re-chase failed: {e}")
@@ -3594,7 +4361,7 @@ class EnhancedExecutor:
                 # poll. Re-arm one now, same as check_afterhours_stops.
                 if gtc_cancelled:
                     try:
-                        trail_pct, _ = _trail_pct_for(sym, float(pos.current_price), self._entry_log)
+                        trail_pct, _ = _atr_trail_pct_for(sym, float(pos.current_price), self._entry_log)
                         self.client.submit_order(TrailingStopOrderRequest(
                             symbol        = sym,
                             qty           = abs(qty),
@@ -3605,7 +4372,7 @@ class EnhancedExecutor:
                         ))
                         log.warning(f"_sweep_force_closes {sym}: re-armed GTC trailing stop as fallback after failed re-chase")
                     except Exception as rearm_err:
-                        log.error(f"_sweep_force_closes {sym}: re-chase failed AND GTC re-arm failed — position may be UNPROTECTED: {rearm_err}")
+                        log.error(f"_sweep_force_closes {sym}: re-chase failed AND GTC re-arm failed -- position may be UNPROTECTED: {rearm_err}")
 
     def _sweep_pending_entries(self) -> None:
         """Re-chase a resting ENTRY order that hasn't filled within
@@ -3640,6 +4407,14 @@ class EnhancedExecutor:
         cancel+resubmit, silently over-buying the position."""
         if not self._entry_pending:
             return
+        # 2026-09-01, two-window schedule: no entry re-chase during the midday
+        # break -- the lunch flat (lunch_flat_positions, 11:00 ET) cancels
+        # every resting entry order anyway, and re-chasing here would just
+        # re-place a morning entry into the break. Pending entries WAIT for
+        # the 14:45 afternoon segment. The poller cycle itself keeps running.
+        import pytz as _pytz
+        if in_lunch_break(datetime.datetime.now(_pytz.timezone("America/New_York"))):
+            return
         try:
             open_orders = self.client.get_orders() or []
         except Exception as e:
@@ -3666,7 +4441,7 @@ class EnhancedExecutor:
                 else AFTERHOURS_CHASE_STALE_SECONDS
             )
             if age_s < stale_threshold:
-                continue  # still fresh — give it time to fill
+                continue  # still fresh -- give it time to fill
 
             filled_so_far = int(float(getattr(pending, "filled_qty", 0) or 0))
             remaining = info["qty"] - filled_so_far
@@ -3706,6 +4481,12 @@ class EnhancedExecutor:
                     trail_percent=REENTRY_TRAIL_PCT,
                     client_order_id=f"apex-reentry-trail-{sym}-{int(time.time())}",
                 )
+                # Temporarily drop our own tracking slot so _submit_entry_order's
+                # one-pending-entry-per-symbol guard doesn't block the
+                # replacement -- this is an intentional re-chase of the SAME
+                # slot (the old order was just cancelled above), not a
+                # duplicate. Restored with the fresh order id below.
+                self._entry_pending.pop(sym, None)
                 new_order = self._submit_entry_order(sym, req)
                 if new_order is None:
                     raise RuntimeError(f"duplicate entry blocked for {sym}")
@@ -3713,21 +4494,22 @@ class EnhancedExecutor:
                 info["order_id"] = str(new_order.id)
                 info["qty"] = remaining
                 info["chase_count"] = chase_n + 1
+                self._entry_pending[sym] = info
                 log.warning(
                     f"ENTRY RE-CHASE {sym}: unfilled after prior attempt "
-                    f"— converted to {remaining}-share {REENTRY_TRAIL_PCT:.2f}% trailing entry "
+                    f"-- converted to {remaining}-share {REENTRY_TRAIL_PCT:.2f}% trailing entry "
                     f"(attempt {chase_n + 1})"
                 )
             except Exception as e:
                 log.error(f"_sweep_pending_entries {sym}: re-chase failed: {e}")
                 self._entry_pending.pop(sym, None)  # give up tracking rather than loop on a hard failure
 
-    # ── Stale Swing Exit ─────────────────────────────────────────────────────
+    # -- Stale Swing Exit -----------------------------------------------------
     def _get_entry_date(self, symbol: str) -> Optional[datetime.date]:
         """Return the date a position was opened.
 
         Checks the in-memory entry log first, then falls back to the broker's
-        MOST RECENT filled BUY order for the symbol — covers positions opened
+        MOST RECENT filled BUY order for the symbol -- covers positions opened
         on a prior day whose entry_log record was lost to a bot restart (the
         startup rebuild in _rebuild_entry_log_from_orders only restores today's
         orders).
@@ -3766,7 +4548,7 @@ class EnhancedExecutor:
         return None
 
     def _get_entry_datetime(self, symbol: str, is_long: bool = True) -> Optional[datetime.datetime]:
-        """Return the UTC fill timestamp a position was opened — hour-precision
+        """Return the UTC fill timestamp a position was opened -- hour-precision
         counterpart to _get_entry_date, needed for the NO_GAIN_EXIT_HOURS check.
         Same broker fallback for positions opened before a bot restart.
 
@@ -3805,6 +4587,41 @@ class EnhancedExecutor:
             log.warning(f"_get_entry_datetime {symbol}: lookup failed: {e}")
         return None
 
+    def _get_recent_close_price(self, symbol: str, is_long: bool = True) -> Optional[float]:
+        """Return the most recent filled close price for a just-closed equity lot.
+
+        detect_stopped_out_positions() runs from a polling loop, so its last
+        cached mark can be several seconds older than the actual broker fill.
+        Use the broker's latest filled close-side order first, and let callers
+        fall back to the poll mark if the lookup is unavailable.
+        """
+        try:
+            from alpaca.common.enums import Sort
+            from alpaca.trading.requests import GetOrdersRequest
+            from alpaca.trading.enums import QueryOrderStatus
+            side = OrderSide.SELL if is_long else OrderSide.BUY
+            req = GetOrdersRequest(
+                status=QueryOrderStatus.CLOSED,
+                symbols=[symbol],
+                side=side,
+                direction=Sort.DESC,
+                limit=50,
+            )
+            orders = self.client.get_orders(filter=req) or []
+            for order in orders:
+                status = str(getattr(getattr(order, "status", ""), "value", getattr(order, "status", ""))).lower()
+                if status and status != "filled":
+                    continue
+                price = getattr(order, "filled_avg_price", None)
+                if price is None:
+                    continue
+                price = float(price)
+                if price > 0:
+                    return price
+        except Exception as e:
+            log.debug(f"_get_recent_close_price {symbol}: lookup failed: {e}")
+        return None
+
     def close_stale_swing_positions(self) -> Optional[dict]:
         """Close swing-strategy positions (i.e. any long NOT opened by a strategy
         in EOD_CLOSE_STRATEGIES, since those already close same-day) that have
@@ -3812,7 +4629,7 @@ class EnhancedExecutor:
         SWING_STALE_MIN_GAIN_PCT% unrealized gain. Runs once per calendar day.
 
         These positions otherwise ride only the GTC trailing stop, which only
-        protects against a reversal from the peak — it never exits a position
+        protects against a reversal from the peak -- it never exits a position
         that just goes nowhere. This is the "cut dead capital loose" check."""
         if not SWING_STALE_EXIT_ENABLED:
             return None
@@ -3833,7 +4650,7 @@ class EnhancedExecutor:
         for pos in positions:
             sym = pos.symbol
             if re.match(r'^[A-Z]+\d{6}[CP]\d{8}$', sym):
-                continue  # options legs — managed separately
+                continue  # options legs -- managed separately
 
             qty = int(float(pos.qty))
             if qty <= 0:
@@ -3858,15 +4675,15 @@ class EnhancedExecutor:
                 continue
 
             if gain_pct >= SWING_STALE_MIN_GAIN_PCT:
-                continue  # performing fine — leave it to the trailing stop
+                continue  # performing fine -- leave it to the trailing stop
 
             try:
-                # Cancel ALL resting orders first, including GTC — this method has no
+                # Cancel ALL resting orders first, including GTC -- this method has no
                 # regular-hours gate (only "once per calendar day"), so it can run
                 # after-hours too, and a resting GTC trailing stop reserves qty and
                 # gets a close rejected as a wash trade regardless of time of day
                 # (same root cause already fixed for check_afterhours_stops,
-                # close_no_gain_positions, the weakest-swap path, and check_tp_targets —
+                # close_no_gain_positions, the weakest-swap path, and check_tp_targets --
                 # confirmed in production via BHC's repeated "insufficient qty
                 # available" TP-close rejections on 2026-07-31).
                 try:
@@ -3954,7 +4771,7 @@ class EnhancedExecutor:
         for pos in positions:
             sym = pos.symbol
             if re.match(r'^[A-Z]+\d{6}[CP]\d{8}$', sym):
-                continue  # options legs — managed separately
+                continue  # options legs -- managed separately
 
             qty = int(float(pos.qty))
             if qty == 0:
@@ -3979,13 +4796,13 @@ class EnhancedExecutor:
                 continue
 
             if NO_GAIN_EXIT_MAX_LOSS_PCT < gain_pct <= NO_GAIN_EXIT_MIN_PCT:
-                continue  # still flat / a small loss — give it more time
-            # Otherwise exit: either gain_pct > NO_GAIN_EXIT_MIN_PCT (positive —
+                continue  # still flat / a small loss -- give it more time
+            # Otherwise exit: either gain_pct > NO_GAIN_EXIT_MIN_PCT (positive --
             # stop waiting once it's decided) or gain_pct <= NO_GAIN_EXIT_MAX_LOSS_PCT
             # (dropped enough to cut early rather than ride the full trailing stop).
 
             # A close already in flight for this symbol? Don't blindly cancel-and-resubmit
-            # every cycle (that's what spammed FRMI 186x and NG 38x — the old version
+            # every cycle (that's what spammed FRMI 186x and NG 38x -- the old version
             # re-issued an identical close order every scan cycle with no fill check).
             # Give a fresh close AFTERHOURS_CHASE_STALE_SECONDS to fill; only re-chase,
             # with escalating slip, once it's actually stale.
@@ -4001,7 +4818,7 @@ class EnhancedExecutor:
                 submitted_at = getattr(pending, "submitted_at", None) or getattr(pending, "created_at", None)
                 age_s = (now_utc - submitted_at).total_seconds() if submitted_at else 0.0
                 if age_s < AFTERHOURS_CHASE_STALE_SECONDS:
-                    continue  # close already in flight — give it time to fill
+                    continue  # close already in flight -- give it time to fill
                 try:
                     self.client.cancel_order_by_id(str(pending.id))
                     time.sleep(0.4)
@@ -4010,7 +4827,7 @@ class EnhancedExecutor:
                     continue
 
             # The resting GTC trailing stop reserves this position's qty and can cause
-            # the close to be rejected as a wash trade — cancel it first, same fix as
+            # the close to be rejected as a wash trade -- cancel it first, same fix as
             # check_afterhours_stops. Re-armed below as a fallback if the close fails.
             gtc_order = next((o for o in sym_orders if getattr(o, "time_in_force", None) == TimeInForce.GTC), None)
             if gtc_order:
@@ -4048,10 +4865,10 @@ class EnhancedExecutor:
                 failed_items.append({"symbol": sym, "error": str(e)})
                 log.error(f"NO-GAIN EXIT failed {sym}: {e}")
                 if gtc_order:
-                    # GTC is gone and the replacement didn't go through — re-arm one now
+                    # GTC is gone and the replacement didn't go through -- re-arm one now
                     # rather than leave the position unprotected until the next cycle.
                     try:
-                        trail_pct = _trail_pct_for(sym, float(pos.current_price), self._entry_log)[0]
+                        trail_pct = _atr_trail_pct_for(sym, float(pos.current_price), self._entry_log)[0]
                         self.client.submit_order(TrailingStopOrderRequest(
                             symbol=sym, qty=abs(qty), side=close_side,
                             type=AlpacaOrderType.TRAILING_STOP,
@@ -4059,7 +4876,7 @@ class EnhancedExecutor:
                         ))
                         log.warning(f"NO-GAIN EXIT {sym}: re-armed GTC trailing stop after failed close")
                     except Exception as rearm_err:
-                        log.error(f"NO-GAIN EXIT {sym}: close failed AND GTC re-arm failed — position may be UNPROTECTED: {rearm_err}")
+                        log.error(f"NO-GAIN EXIT {sym}: close failed AND GTC re-arm failed -- position may be UNPROTECTED: {rearm_err}")
 
         return {
             "closed_count": len(closed_items),
@@ -4068,7 +4885,7 @@ class EnhancedExecutor:
             "failed_items": failed_items,
         }
 
-    # ── Price Drift Stop (10-min poll, 30-min lookback, same-day entries) ──
+    # -- Price Drift Stop (10-min poll, 30-min lookback, same-day entries) --
     @staticmethod
     def _drift_stop_reason(
         current: float, entry: Optional[float], reference: Optional[float], is_long: bool, stop_pct: float,
@@ -4155,14 +4972,14 @@ class EnhancedExecutor:
         for pos in positions:
             sym = pos.symbol
             if re.match(r'^[A-Z]+\d{6}[CP]\d{8}$', sym):
-                continue  # options legs — managed separately
+                continue  # options legs -- managed separately
             qty = int(float(pos.qty))
             if qty == 0:
                 continue
 
             entry_info = self._entry_log.get(sym)
             if not entry_info or entry_info.get("date") != today:
-                continue  # not a same-day entry — out of scope, leave on its normal trailing stop
+                continue  # not a same-day entry -- out of scope, leave on its normal trailing stop
 
             live_syms.add(sym)
             try:
@@ -4208,7 +5025,7 @@ class EnhancedExecutor:
                 reference = history[0] if len(history) == lookback_ticks else self._backfill_drift_reference(sym)
             reason = self._drift_stop_reason(current, entry, reference, is_long, PRICE_DRIFT_STOP_PCT)
 
-            # Record this check's price regardless of outcome — the deque
+            # Record this check's price regardless of outcome -- the deque
             # naturally evicts the oldest sample once full, keeping the
             # lookback window rolling forward.
             history.append(current)
@@ -4239,10 +5056,10 @@ class EnhancedExecutor:
                 )
             except Exception as e:
                 log.error(f"PRICE DRIFT STOP {sym}: close failed: {e}")
-                # The resting GTC was just cancelled above — re-arm a fallback
+                # The resting GTC was just cancelled above -- re-arm a fallback
                 # so the position isn't left fully unprotected.
                 try:
-                    trail_pct, _ = _trail_pct_for(sym, current, self._entry_log)
+                    trail_pct, _ = _atr_trail_pct_for(sym, current, self._entry_log)
                     self.client.submit_order(TrailingStopOrderRequest(
                         symbol=sym, qty=abs(qty), side=side,
                         type=AlpacaOrderType.TRAILING_STOP, time_in_force=TimeInForce.GTC,
@@ -4250,7 +5067,7 @@ class EnhancedExecutor:
                     ))
                     log.warning(f"check_price_drift_stop {sym}: re-armed GTC trailing stop after failed close")
                 except Exception as rearm_err:
-                    log.error(f"check_price_drift_stop {sym}: close failed AND GTC re-arm failed — position may be UNPROTECTED: {rearm_err}")
+                    log.error(f"check_price_drift_stop {sym}: close failed AND GTC re-arm failed -- position may be UNPROTECTED: {rearm_err}")
 
         # Drop history for symbols no longer held or no longer in scope
         for sym in [s for s in self._price_drift_history if s not in live_syms]:
@@ -4301,7 +5118,7 @@ class EnhancedExecutor:
             return None
         return (
             f"EMA9 ${ema9_now:.2f} pulled back {EMA9_TRAIL_PCT:.1f}% from its "
-            f"{'peak' if is_long else 'trough'} ${peak:.2f} since entry — trailing EMA9 stop hit"
+            f"{'peak' if is_long else 'trough'} ${peak:.2f} since entry -- trailing EMA9 stop hit"
         )
 
     @staticmethod
@@ -4312,47 +5129,88 @@ class EnhancedExecutor:
             return None
         return (
             f"EMA7 ${ema7_now:.2f} {'below' if is_long else 'above'} "
-            f"EMA15 ${ema15_now:.2f} — EMA trend reversed against the "
+            f"EMA15 ${ema15_now:.2f} -- EMA trend reversed against the "
             f"{'long' if is_long else 'short'} position"
         )
 
     @staticmethod
     def _check_30m_reentry_performance(symbol: str, is_long: bool) -> Tuple[bool, str]:
-        """Require completed 30-minute performance to agree with re-entry."""
+        """For loss re-entry, require first-30 direction and recent 30m momentum."""
         try:
-            bars = get_bars(symbol, "5d", "30m", bypass_cache=True)
-            if bars.empty or "close" not in bars.columns or len(bars) < 3:
-                return False, f"{symbol}: 30m performance unavailable"
-            completed = bars
+            import pytz as _pytz
+
+            eastern = _pytz.timezone("America/New_York")
+            now_et = datetime.datetime.now(eastern)
+            session_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+            first_30_done = session_open + datetime.timedelta(minutes=30)
+            if now_et < first_30_done:
+                # Before 10:00 the first-30 window isn't complete, so the gate
+                # has nothing to evaluate. Skip it (pass) rather than block --
+                # the morning-loss block (LOSS_BLOCK_MORNING_END_ET) is the
+                # cooldown that applies this early, not this performance gate.
+                return True, f"{symbol}: first 30 minutes not complete; skipping loss re-entry 30m gate until 10:00 ET"
+
+            bars = _closed_1m_bars(_entry_gate_bars(symbol, force_fresh=True))
+            high_col = "high" if "high" in bars.columns else "close"
+            needed = {"open", "close", high_col}
+            if bars.empty or not needed.issubset(bars.columns):
+                return False, f"{symbol}: today's 1m bars unavailable for loss re-entry"
+
+            regular = bars
             if "time" in bars.columns:
-                now_utc = datetime.datetime.now(datetime.timezone.utc)
-                bar_times = bars["time"]
-                completed = bars[
-                    bar_times.apply(
-                        lambda value: value + datetime.timedelta(minutes=30) <= now_utc
-                        if getattr(value, "tzinfo", None) is not None
-                        else False
-                    )
+                def _to_et(value):
+                    ts = value.to_pydatetime() if hasattr(value, "to_pydatetime") else value
+                    if isinstance(ts, str):
+                        ts = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                    if getattr(ts, "tzinfo", None) is None:
+                        ts = eastern.localize(ts)
+                    return ts.astimezone(eastern)
+
+                et_times = bars["time"].apply(_to_et)
+                regular = bars[
+                    (et_times >= session_open)
+                    & (et_times < now_et)
+                    & et_times.apply(lambda ts: ts.date() == now_et.date())
                 ]
-            if len(completed) < 3:
-                return False, f"{symbol}: fewer than 3 completed 30m bars"
-            closes = completed["close"]
-            ema7 = closes.ewm(span=7, adjust=False).mean()
-            ema15 = closes.ewm(span=15, adjust=False).mean()
-            move = float(closes.iloc[-1] - closes.iloc[-2])
-            ema7_delta = float(ema7.iloc[-1] - ema7.iloc[-2])
-            aligned = (
-                move > 0 and ema7_delta > 0 and ema7.iloc[-1] > ema15.iloc[-1]
-                if is_long else
-                move < 0 and ema7_delta < 0 and ema7.iloc[-1] < ema15.iloc[-1]
-            )
+
+            if len(regular) < 31:
+                return False, f"{symbol}: fewer than 31 regular-session 1m bars for 30m re-entry check"
+
+            day_open = float(regular["open"].iloc[0])
+            first_30_close = float(regular["close"].iloc[29])
+            current = float(regular["close"].iloc[-1])
+            trailing_ref = float(regular["close"].iloc[-31])
+            first_30_move = first_30_close - day_open
+            open_to_current = current - day_open
+            trailing30_pct = ((current - trailing_ref) / trailing_ref * 100.0) if trailing_ref else 0.0
+            recent_high = float(regular[high_col].iloc[-30:].max())
+            previous_high = float(regular[high_col].iloc[-60:-30].max())
+
+            if is_long:
+                aligned = (
+                    first_30_move > 0
+                    and open_to_current > 0
+                    and trailing30_pct > EMA_ENTRY_MIN_TRAILING_30M_RETURN_PCT
+                    and recent_high > previous_high
+                )
+            else:
+                aligned = (
+                    first_30_move < 0
+                    and open_to_current < 0
+                    and trailing30_pct < -EMA_ENTRY_MIN_TRAILING_30M_RETURN_PCT
+                    and recent_high < previous_high
+                )
             if not aligned:
                 return False, (
-                    f"{symbol}: 30m move {move:+.2f}, EMA7 delta {ema7_delta:+.2f}, "
-                    f"EMA7 {ema7.iloc[-1]:.2f} vs EMA15 {ema15.iloc[-1]:.2f} "
-                    f"not aligned for {'long' if is_long else 'short'} re-entry"
+                    f"{symbol}: first30 {first_30_move:+.2f}, open-to-current {open_to_current:+.2f}, "
+                    f"trailing30 {trailing30_pct:+.2f}%, recent30 high ${recent_high:.2f} vs prior30 high ${previous_high:.2f} "
+                    f"not aligned for {'long' if is_long else 'short'} loss re-entry"
                 )
-            return True, ""
+            return True, (
+                f"30m gate passed for {'long' if is_long else 'short'} loss re-entry -- "
+                f"first30 {first_30_move:+.2f}, open-to-current {open_to_current:+.2f}, "
+                f"trailing30 {trailing30_pct:+.2f}%, recent30 high ${recent_high:.2f} > prior30 high ${previous_high:.2f}"
+            )
         except Exception as exc:
             return False, f"{symbol}: 30m performance check failed: {exc}"
 
@@ -4424,14 +5282,23 @@ class EnhancedExecutor:
         """
         self._no_rearm.add(sym)
         if was_loss:
+            self._record_symbol_loss(sym, tag)
             getattr(self, "_loss_reentry_required", set()).add(sym)
         else:
             getattr(self, "_loss_reentry_required", set()).discard(sym)
         try:
             import pytz as _pytz
             _now_et = datetime.datetime.now(_pytz.timezone("America/New_York"))
+            if in_lunch_break(_now_et):
+                # 2026-09-01, two-window schedule: no re-arming during the
+                # midday break -- the symbol stays _no_rearm'd (already set
+                # above) so detect_stopped_out_positions won't double-process
+                # this close either; re-entry only happens after the 14:45
+                # afternoon segment opens, via a fresh scan/re-arm.
+                log.info(f"{tag} {sym}: midday break ({ENTRY_WINDOW_BREAK_START_ET}-{ENTRY_WINDOW_BREAK_END_ET} ET) -- not re-arming a re-entry until the afternoon segment opens")
+                return
             if _now_et.strftime("%H:%M") > ENTRY_WINDOW_END_ET:
-                log.info(f"{tag} {sym}: past entry window ({ENTRY_WINDOW_END_ET} ET) — not re-arming a re-entry")
+                log.info(f"{tag} {sym}: past entry window ({ENTRY_WINDOW_END_ET} ET) -- not re-arming a re-entry")
                 return
             # 2026-08-26, user request ("reentry should happen for the top 30
             # list" / "trade only top 30 stocks, but update the top 30 based
@@ -4443,13 +5310,15 @@ class EnhancedExecutor:
             # TI" without being one of the 30 the equity scan is actually
             # trading right now.
             if sym not in _get_scan_targets():
-                log.info(f"{tag} {sym}: no longer in the top-30 scan universe — not re-arming a re-entry")
+                log.info(f"{tag} {sym}: no longer in the top-30 scan universe -- not re-arming a re-entry")
                 return
             if was_loss:
                 performance_ok, performance_reason = EnhancedExecutor._check_30m_reentry_performance(sym, is_long)
                 if not performance_ok:
-                    log.info(f"{tag} {sym}: {performance_reason} — not re-arming after loss/reversal")
+                    log.info(f"{tag} {sym}: {performance_reason} -- not re-arming after loss/reversal")
                     return
+                if performance_reason:
+                    log.info(f"{tag} {sym}: {performance_reason}")
             sig_stub = SimpleNamespace(symbol=sym)
             gate_ok, gate_reason = _check_ema_trend_alignment(sig_stub, is_long, force_fresh=True)
             if not gate_ok:
@@ -4468,7 +5337,7 @@ class EnhancedExecutor:
                 # aligns, the entry window closes, or the symbol drops out
                 # of the top-30 -- genuinely "every minute check after
                 # exit," not just once.
-                log.info(f"{tag} {sym}: entry conditions not currently met ({gate_reason}) — queuing for per-minute recheck")
+                log.info(f"{tag} {sym}: entry conditions not currently met ({gate_reason}) -- queuing for per-minute recheck")
                 if sym not in self._ema_blocked_entries:
                     try:
                         _bars = get_bars(sym, period="1d", interval="1m")
@@ -4490,7 +5359,7 @@ class EnhancedExecutor:
             _bars = get_bars(sym, period="1d", interval="1m")
             _px = float(_bars["close"].iloc[-1]) if not _bars.empty else 0.0
             if _px <= 0:
-                log.info(f"{tag} {sym}: no current price data — not re-arming")
+                log.info(f"{tag} {sym}: no current price data -- not re-arming")
                 return
             _strategy = self._entry_log.get(sym, {}).get("strategy", "reentry")
             _reentry_signal = Signal(
@@ -4508,7 +5377,7 @@ class EnhancedExecutor:
                 OrderType.LONG if is_long else OrderType.SHORT,
                 bypass_pdt=True,
             ):
-                log.info(f"{tag} {sym}: entry conditions still met — re-entry passed all hard checks")
+                log.info(f"{tag} {sym}: entry conditions still met -- re-entry passed all hard checks")
         except Exception as e:
             log.warning(f"{tag} {sym}: re-entry watch order failed (exit itself still succeeded): {e}")
 
@@ -4575,14 +5444,14 @@ class EnhancedExecutor:
         for pos in positions:
             sym = pos.symbol
             if re.match(r'^[A-Z]+\d{6}[CP]\d{8}$', sym):
-                continue  # options legs — managed separately
+                continue  # options legs -- managed separately
             qty = int(float(pos.qty))
             if qty == 0:
                 continue
 
             entry_info = self._entry_log.get(sym)
             if not entry_info or entry_info.get("date") != today:
-                continue  # not a same-day entry — out of scope
+                continue  # not a same-day entry -- out of scope
 
             try:
                 current = float(pos.current_price)
@@ -4658,10 +5527,10 @@ class EnhancedExecutor:
                 )
             except Exception as e:
                 log.error(f"EMA9 EXIT {sym}: close failed: {e}")
-                # The resting GTC was just cancelled above — re-arm a fallback
+                # The resting GTC was just cancelled above -- re-arm a fallback
                 # so the position isn't left fully unprotected.
                 try:
-                    trail_pct, _ = _trail_pct_for(sym, current, self._entry_log)
+                    trail_pct, _ = _atr_trail_pct_for(sym, current, self._entry_log)
                     self.client.submit_order(TrailingStopOrderRequest(
                         symbol=sym, qty=abs(qty), side=side,
                         type=AlpacaOrderType.TRAILING_STOP, time_in_force=TimeInForce.GTC,
@@ -4669,7 +5538,7 @@ class EnhancedExecutor:
                     ))
                     log.warning(f"check_ema9_exit {sym}: re-armed GTC trailing stop after failed close")
                 except Exception as rearm_err:
-                    log.error(f"check_ema9_exit {sym}: close failed AND GTC re-arm failed — position may be UNPROTECTED: {rearm_err}")
+                    log.error(f"check_ema9_exit {sym}: close failed AND GTC re-arm failed -- position may be UNPROTECTED: {rearm_err}")
 
     def check_pending_entries_ema(self) -> None:
         """Every STAGNANT_STOP_CHECK_INTERVAL_MIN (1 min), re-check the
@@ -4736,6 +5605,15 @@ class EnhancedExecutor:
         writes) stay strictly sequential afterward in the main thread --
         no shared mutable state is touched from worker threads, only the
         read-only gate check runs concurrently."""
+        # 2026-09-01, two-window schedule: no entry-order recheck/requeue
+        # during the midday break -- the lunch flat already cancelled every
+        # resting entry order at 11:00 ET, and requeueing a morning signal
+        # into _ema_blocked_entries here would fire it on the 14:45 reopen.
+        # check_blocked_entries_ema's own break gate holds those queues intact
+        # until then; this function just skips the broker round-trip.
+        import pytz as _pytz
+        if in_lunch_break(datetime.datetime.now(_pytz.timezone("America/New_York"))):
+            return
         try:
             from alpaca.trading.requests import GetOrdersRequest
             from alpaca.trading.enums import QueryOrderStatus
@@ -4745,12 +5623,15 @@ class EnhancedExecutor:
             log.warning(f"check_pending_entries_ema: could not list open orders, skipping this recheck: {e}")
             return
 
+        tracked_entry_orders = {str(v): k for k, v in getattr(self, "order_cache", {}).items()}
         candidates = []  # (order, order_id, sym, is_long)
         pending_syms_seen = set()
         for order in open_orders:
+            order_id = str(getattr(order, "id", ""))
             raw_type = getattr(order, "order_type", "")
             otype = str(getattr(raw_type, "value", raw_type)).lower()
-            if "trailing_stop" not in otype:
+            is_tracked_entry = order_id in tracked_entry_orders
+            if "trailing_stop" not in otype and not is_tracked_entry:
                 continue
             if getattr(order, "time_in_force", None) != TimeInForce.DAY:
                 continue  # GTC == protective exit stop, never touch it here
@@ -4758,7 +5639,7 @@ class EnhancedExecutor:
             pending_syms_seen.add(sym)
             raw_side = getattr(order, "side", "")
             side = str(getattr(raw_side, "value", raw_side)).lower()
-            candidates.append((order, str(order.id), sym, side == "buy"))
+            candidates.append((order, order_id, sym, side == "buy"))
 
         def _gate(item):
             _order, order_id, sym, is_long = item
@@ -4789,7 +5670,7 @@ class EnhancedExecutor:
                         "signal": pending["signal"], "order_type": pending["order_type"],
                         "queued_at": datetime.datetime.now(datetime.timezone.utc),
                     }
-                    log.warning(f"PENDING ENTRY CANCELLED {sym}: still unfilled and {reason} — requeued for retry")
+                    log.warning(f"PENDING ENTRY CANCELLED {sym}: still unfilled and {reason} -- requeued for retry")
                 else:
                     log.warning(f"PENDING ENTRY CANCELLED {sym}: still unfilled and {reason}")
             except Exception as e:
@@ -4892,6 +5773,12 @@ class EnhancedExecutor:
         import pytz as _pytz
         _now_et = datetime.datetime.now(_pytz.timezone("America/New_York"))
         past_window = _now_et.strftime("%H:%M") > ENTRY_WINDOW_END_ET
+        # 2026-09-01, two-window schedule: during the midday break the queued
+        # entries neither fire nor expire -- they WAIT (intact) for the 14:45
+        # afternoon segment, per "reenter only at 2:45PM". The past_window
+        # expiry below still applies at the 15:50 final cutoff.
+        if in_lunch_break(_now_et):
+            return
         ti_universe = set(_get_scan_targets())
 
         queued = list(self._ema_blocked_entries.items())
@@ -4938,9 +5825,11 @@ class EnhancedExecutor:
                 if sym in getattr(self, "_loss_reentry_required", set()):
                     performance_ok, performance_reason = EnhancedExecutor._check_30m_reentry_performance(sym, is_long)
                     if not performance_ok:
-                        log.info(f"BLOCKED ENTRY {sym}: {performance_reason} — loss re-entry 30m gate")
+                        log.info(f"BLOCKED ENTRY {sym}: {performance_reason} -- loss re-entry 30m gate")
                         self._ema_blocked_entries[sym] = info
                         continue
+                    if performance_reason:
+                        log.info(f"BLOCKED ENTRY {sym}: {performance_reason}")
                 bypass_pdt = self._is_reentry_signal(sym, is_long)
                 if self._execute_entry(signal, acct, order_type, bypass_pdt=bypass_pdt):
                     getattr(self, "_loss_reentry_required", set()).discard(sym)
@@ -4983,14 +5872,14 @@ class EnhancedExecutor:
         for pos in positions:
             sym = pos.symbol
             if re.match(r'^[A-Z]+\d{6}[CP]\d{8}$', sym):
-                continue  # options legs — managed separately
+                continue  # options legs -- managed separately
             qty = int(float(pos.qty))
             if qty == 0:
                 continue
 
             entry_info = self._entry_log.get(sym)
             if entry_info and entry_info.get("date") == today:
-                continue  # same-day — covered by check_price_drift_stop() already
+                continue  # same-day -- covered by check_price_drift_stop() already
 
             try:
                 current = float(pos.current_price)
@@ -5025,7 +5914,7 @@ class EnhancedExecutor:
             except Exception as e:
                 log.error(f"SWING DRIFT STOP {sym}: close failed: {e}")
                 try:
-                    trail_pct, _ = _trail_pct_for(sym, current, self._entry_log)
+                    trail_pct, _ = _atr_trail_pct_for(sym, current, self._entry_log)
                     self.client.submit_order(TrailingStopOrderRequest(
                         symbol=sym, qty=abs(qty), side=side,
                         type=AlpacaOrderType.TRAILING_STOP, time_in_force=TimeInForce.GTC,
@@ -5033,17 +5922,17 @@ class EnhancedExecutor:
                     ))
                     log.warning(f"check_swing_drift_stop {sym}: re-armed GTC trailing stop after failed close")
                 except Exception as rearm_err:
-                    log.error(f"check_swing_drift_stop {sym}: close failed AND GTC re-arm failed — position may be UNPROTECTED: {rearm_err}")
+                    log.error(f"check_swing_drift_stop {sym}: close failed AND GTC re-arm failed -- position may be UNPROTECTED: {rearm_err}")
 
-    # ── Kill Mode: Emergency Close All ───────────────────────────────────────
+    # -- Kill Mode: Emergency Close All ---------------------------------------
     def emergency_close_all(self, equity: float) -> None:
         """
         Kill mode emergency exit. Closes every open position as safely as possible.
 
         PDT rules (equity < $25k):
-          - Positions opened on a PRIOR day → cancel any open orders then market-close.
+          - Positions opened on a PRIOR day -> cancel any open orders then market-close.
             These are NOT day trades so no PDT count is consumed.
-          - Positions opened TODAY → cannot close without a day-trade violation.
+          - Positions opened TODAY -> cannot close without a day-trade violation.
             Instead, a hairpin trailing stop of KILL_MODE_TRAIL_PCT (0.5%) is placed
             so the position exits automatically within minutes via the stop engine.
 
@@ -5078,7 +5967,7 @@ class EnhancedExecutor:
             is_today   = entry_date == today
 
             if not pdt_exempt and is_today:
-                # Today's position — tighten trailing stop to hairpin; do NOT market-close
+                # Today's position -- tighten trailing stop to hairpin; do NOT market-close
                 for o in orders_by_sym.get(sym, []):
                     try:
                         self.client.cancel_order_by_id(str(o.id))
@@ -5099,7 +5988,7 @@ class EnhancedExecutor:
                     log.warning(
                         f"KILL MODE [PDT-SAFE] {sym}: hairpin trailing stop "
                         f"{KILL_MODE_TRAIL_PCT}% @ ${cur:.2f} "
-                        f"(opened today — closing via stop to avoid PDT violation)"
+                        f"(opened today -- closing via stop to avoid PDT violation)"
                     )
                     protected.append(sym)
                 except Exception as e:
@@ -5116,7 +6005,7 @@ class EnhancedExecutor:
 
             try:
                 side = OrderSide.SELL if qty > 0 else OrderSide.BUY
-                # A plain MarketOrderRequest gets rejected outside regular hours —
+                # A plain MarketOrderRequest gets rejected outside regular hours --
                 # kill mode is only reachable while is_market_open (07:00-20:00 ET),
                 # not just regular hours, and every crash this account has actually
                 # hit (BIOA, FIRY, SQQQ) happened after-hours. This is the emergency
@@ -5135,17 +6024,17 @@ class EnhancedExecutor:
                 log.error(f"KILL MODE: close failed {sym}: {e}")
 
         log.warning(
-            f"KILL MODE COMPLETE — "
+            f"KILL MODE COMPLETE -- "
             f"market-closed: {len(closed)} {closed} | "
             f"hairpin stops (PDT-safe): {len(protected)} {protected}"
         )
 
-    # ── Stale Order Updater ───────────────────────────────────────────────────
+    # -- Stale Order Updater ---------------------------------------------------
     def update_stale_orders(self) -> None:
         """
         Find open orders older than STALE_ORDER_MINUTES and re-submit them:
-          - Regular hours   → cancel + market order (instant fill)
-          - Extended hours  → cancel + limit order at current price (IOC)
+          - Regular hours   -> cancel + market order (instant fill)
+          - Extended hours  -> cancel + limit order at current price (IOC)
         Only applies to entry/exit orders (buy/sell), not bracket legs (stop/limit TP-SL).
         Also resets _swap_cycle_closed so each scan cycle starts fresh.
         """
@@ -5166,7 +6055,7 @@ class EnhancedExecutor:
             order_class = str(getattr(order, "order_class", "") or "")
             if order_class in ("bracket", "oco"):
                 continue
-            # Never cancel GTC trailing stop orders — they are protective stops,
+            # Never cancel GTC trailing stop orders -- they are protective stops,
             # not stale entry orders.  Killing them leaves positions unprotected.
             if "trailing_stop" in str(order_type).lower():
                 continue
@@ -5194,9 +6083,9 @@ class EnhancedExecutor:
             order_id = str(order.id)
 
             log.info(
-                f"STALE ORDER: {sym} {side} {qty} — age {age_secs/60:.1f}m "
+                f"STALE ORDER: {sym} {side} {qty} -- age {age_secs/60:.1f}m "
                 f"(cutoff {'intraday 30m' if is_intraday else '6h'}) "
-                f"→ {'market' if regular else 'limit @ current price'}"
+                f"-> {'market' if regular else 'limit @ current price'}"
             )
 
             try:
@@ -5205,7 +6094,7 @@ class EnhancedExecutor:
 
                 if regular:
                     # If the original was a limit buy and the limit was more than 1%
-                    # below the current ask, the order was defensive/passive — don't
+                    # below the current ask, the order was defensive/passive -- don't
                     # blast it to market (bad fill); just cancel and let the next
                     # scan cycle re-evaluate.
                     orig_limit = float(getattr(order, "limit_price", None) or 0)
@@ -5218,7 +6107,7 @@ class EnhancedExecutor:
                         if cur_ask > 0 and orig_limit < cur_ask * 0.99:
                             log.info(
                                 f"STALE ORDER {sym}: limit ${orig_limit:.2f} is defensive "
-                                f"(ask=${cur_ask:.2f}) — cancelling without re-entry"
+                                f"(ask=${cur_ask:.2f}) -- cancelling without re-entry"
                             )
                             continue  # skip re-submit; cancelled above
 
@@ -5250,7 +6139,7 @@ class EnhancedExecutor:
             except Exception as e:
                 log.warning(f"STALE ORDER {sym}: replace failed: {e}")
 
-    # ── ATR Take-Profit Checker ────────────────────────────────────────────────
+    # -- ATR Take-Profit Checker ------------------------------------------------
     def check_tp_targets(self) -> None:
         """Scan open positions against stored ATR-based TP targets.
         Submits a market close (sell/buy-to-cover) when current price reaches TP.
@@ -5281,12 +6170,12 @@ class EnhancedExecutor:
             hit = (is_long and cur_price >= tp_price) or (not is_long and cur_price <= tp_price)
             if hit:
                 try:
-                    # Cancel ALL resting orders for this symbol first — a GTC trailing
+                    # Cancel ALL resting orders for this symbol first -- a GTC trailing
                     # stop (or leftover DAY order) reserves qty and gets this rejected
                     # as "insufficient qty available" (confirmed in production: BHC
                     # rejected 13+ times over an hour on 2026-07-31, same root cause
                     # already fixed for check_afterhours_stops/close_no_gain_positions/
-                    # the weakest-swap path — this one just never got it).
+                    # the weakest-swap path -- this one just never got it).
                     try:
                         for o in (self.client.get_orders() or []):
                             if o.symbol == sym:
@@ -5298,7 +6187,7 @@ class EnhancedExecutor:
                     side = OrderSide.SELL if is_long else OrderSide.BUY
                     # A plain MarketOrderRequest also gets rejected outside regular
                     # hours (07:00-20:00 is_market_open spans well past 09:30-16:00,
-                    # and this method runs on every cycle in that whole window) —
+                    # and this method runs on every cycle in that whole window) --
                     # _submit_closing_order already handles the extended-hours case.
                     # 2026-08-26, user request ("irrespective of exit type"):
                     # NOT marked _no_rearm -- a take-profit hit followed by a
@@ -5312,7 +6201,7 @@ class EnhancedExecutor:
                         _pnl = 0.0
                     log.info(
                         f"TP HIT {sym} [{_strategy}]: ${cur_price:.2f} {'>=  ' if is_long else '<= '}"
-                        f"${tp_price:.2f} | P&L ${_pnl:+,.2f} → {'sell' if is_long else 'buy-to-cover'} submitted"
+                        f"${tp_price:.2f} | P&L ${_pnl:+,.2f} -> {'sell' if is_long else 'buy-to-cover'} submitted"
                     )
                     triggered.append(sym)
                 except Exception as e:
@@ -5320,23 +6209,6 @@ class EnhancedExecutor:
 
         for sym in triggered:
             self._tp_targets.pop(sym, None)
-
-    # ── Health ─────────────────────────────────────────────────────────────────
-    def get_health(self) -> Dict:
-        try:
-            acct = self._get_account(force_refresh=True)
-            dt_left = self.pdt.remaining(acct.equity, acct.daytrade_count)
-            return {
-                "equity":           acct.equity,
-                "cash":             acct.buying_power,
-                "buying_power":     acct.buying_power,
-                "pdt_protected":    acct.equity >= PDT_ACCOUNT_MIN,
-                "day_trade_count":  acct.daytrade_count,
-                "day_trades_left":  dt_left,
-            }
-        except Exception as e:
-            log.error(f"Health check error: {e}")
-            return {}
 
 
 # 2026-08-24, user request: this guard used to sit right after _demo()'s own

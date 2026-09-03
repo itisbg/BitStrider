@@ -1,36 +1,3 @@
-# Adaptive equity allocation based on pre-intelligence (market regime, signal quality, or pre-market indicators)
-from typing import Optional, Union
-
-from engine.utils import MarketState
-
-
-def get_adaptive_equity_allocation(
-    market_state: MarketState,
-    avg_signal_conf: Optional[float] = None,
-    premarket_strength: Optional[float] = None,
-) -> float:
-    """
-    Returns adaptive position size percentage for equities based on pre-intelligence.
-    - In strong bull regime or high signal confidence, increase allocation.
-    - In bear regime or weak signals, decrease allocation.
-    - Optionally, use premarket_strength (0-1) if available.
-    """
-    from engine.config import POSITION_SIZE_PCT
-    from engine.utils.market import get_allocation_split
-    base = POSITION_SIZE_PCT
-    equity_pct, _ = get_allocation_split(market_state)
-    base *= equity_pct
-    # If average signal confidence is provided, scale further
-    if avg_signal_conf is not None:
-        if avg_signal_conf > 0.85:
-            base *= 1.15
-        elif avg_signal_conf < 0.75:
-            base *= 0.85
-    # If premarket_strength is provided (0-1), scale linearly between 0.8x and 1.2x
-    if premarket_strength is not None:
-        base *= (0.8 + 0.4 * premarket_strength)
-    # Clamp to reasonable bounds (e.g., 3% to 15%)
-    return max(3.0, min(base, 15.0))
 """ApexTrader scan nucleus.
 
 Contains reusable scanning functions for main loop and run_top3 tools.
@@ -73,6 +40,12 @@ from engine.utils.bars import get_data_client as _get_data_client
 from alpaca.data import StockSnapshotRequest as _StockSnapshotRequest
 from .universe import get_tier as _get_tier_live, get_latest_batch as _get_latest_batch, get_ti_primary as _get_ti_primary
 from .discovery import get_alpaca_movers_queue as _get_alpaca_movers_queue
+from .strategies import (
+    Signal,
+    get_strategy_instances,
+    _get_float_shares,
+    _get_market_cap,
+)
 
 _ET  = pytz.timezone("America/New_York")
 _log = logging.getLogger("ApexTrader")
@@ -82,7 +55,30 @@ _ACTIVE_SHORTS_FILE = Path(__file__).resolve().parents[2] / "data" / "ti_primary
 _DEFAULT_SCAN_SYMBOLS = set(_cfg.LOW_PRIORITY_SCAN_SYMBOLS)
 _active_scan_write_lock = threading.Lock()
 _last_active_scan_write = 0.0
-_last_directional_write = 0.0
+# 2026-09-02: total wall-clock budget for one scan_universe() worker-collection
+# loop. SCAN_WORKERS=16 workers at SCAN_SYMBOL_TIMEOUT=15s each can legitimately
+# take ~90-120s on a slow-data day (every symbol timing out); anything beyond
+# that means the pool itself is wedged and the main loop must move on.
+_SCAN_TOTAL_BUDGET_SEC = 120
+
+# 2026-09-02: restored module-level init for the adaptive-relax block at the
+# bottom of scan_universe() (lines ~948-964) -- the references survived but the
+# init dict + _ADAPTIVE_* constants had been dropped, crashing every scan with
+# `NameError: name '_adaptive_state' is not defined` (only reachable once the
+# scan actually completes, which the freeze/blocked mornings never allowed).
+# Purely informational today: nothing reads the relaxed values back into
+# enforcement (the regime-based RVOL at _passes_guardrails is the live gate);
+# restored so the block logs as designed instead of aborting the scan cycle.
+_ADAPTIVE_MAX_EMPTY  = 3
+_ADAPTIVE_MIN_RVOL   = 1.0
+_ADAPTIVE_STEP_RVOL  = 0.05
+_ADAPTIVE_MIN_CONF   = 0.60
+_ADAPTIVE_STEP_CONF  = 0.01
+_adaptive_state = {
+    "empty_scans": 0,
+    "rvol_min": RVOL_MIN,
+    "min_conf": MIN_SIGNAL_CONFIDENCE,
+}
 
 
 def _write_active_scan_list(tickers: List[str]) -> bool:
@@ -166,28 +162,31 @@ def _write_active_directional_lists(tickers: List[str]) -> None:
     longs = list(dict.fromkeys(longs))
     shorts = list(dict.fromkeys(shorts))
 
-    # Ensure the active long/short books stay populated from the merged Yahoo +
-    # Alpaca movers universe instead of collapsing to a tiny list when a few
-    # symbols are rejected at the edges. Preserve the original merged ordering
-    # while backfilling each side up to 30 names.
-    merged_order = list(dict.fromkeys(tickers + list(long_symbols | short_symbols | mover_symbols)))
-    for symbol in merged_order:
-        if len(longs) >= 30 and len(shorts) >= 30:
+    # Keep each side populated with at least 30 candidates when enough names
+    # exist: ranked Yahoo/Alpaca movers first, then deterministic defaults.
+    default_longs = list(dict.fromkeys(_cfg.PRIORITY_1_MOMENTUM + sorted(_DEFAULT_SCAN_SYMBOLS)))
+    default_shorts = list(dict.fromkeys(_cfg.PRIORITY_2_ESTABLISHED + sorted(_DEFAULT_SCAN_SYMBOLS)))
+    long_backfill = list(dict.fromkeys(
+        [s for s in tickers if s in long_symbols or s in mover_symbols]
+        + [s for s in tickers if s not in short_symbols]
+        + default_longs
+    ))
+    short_backfill = list(dict.fromkeys(
+        [s for s in tickers if s in short_symbols]
+        + [s for s in tickers if s in mover_symbols and s not in long_symbols]
+        + default_shorts
+    ))
+
+    for symbol in long_backfill:
+        if len(longs) >= 30:
             break
-        if symbol in _DEFAULT_SCAN_SYMBOLS:
-            continue
-        if len(longs) < 30 and symbol in long_symbols:
-            if symbol not in longs:
-                longs.append(symbol)
-        if len(shorts) < 30 and symbol in short_symbols:
-            if symbol not in shorts:
-                shorts.append(symbol)
-        if len(longs) < 30 and symbol in mover_symbols and symbol in long_symbols:
-            if symbol not in longs:
-                longs.append(symbol)
-        if len(shorts) < 30 and symbol in mover_symbols and symbol in short_symbols:
-            if symbol not in shorts:
-                shorts.append(symbol)
+        if symbol not in longs:
+            longs.append(symbol)
+    for symbol in short_backfill:
+        if len(shorts) >= 30:
+            break
+        if symbol not in shorts:
+            shorts.append(symbol)
 
     longs = longs[:30]
     shorts = shorts[:30]
@@ -214,95 +213,40 @@ def _write_active_directional_lists(tickers: List[str]) -> None:
         _log.warning(f"[SIGNALS] could not write active Yahoo directional lists: {e}")
 
 
-def _write_directional_signal_lists(signals: list) -> None:
-    """Persist the latest scanned long and short candidates at the same cadence."""
-    global _last_directional_write
-    now_mono = time.monotonic()
-    with _active_scan_write_lock:
-        if now_mono - _last_directional_write < _cfg.ACTIVE_SCAN_SNAPSHOT_INTERVAL_MIN * 60:
-            return
-        _last_directional_write = now_mono
-    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    payloads = (
-        (_ACTIVE_LONGS_FILE, [s for s in signals if s.action == "buy"], "longs"),
-        (_ACTIVE_SHORTS_FILE, [s for s in signals if s.action in ("sell", "short")], "shorts"),
-    )
+_PRIORITY_STRATEGIES = {"GapBreakout", "ORB"}
+
+
+def _strategy_selection_rank(signal: Signal) -> tuple:
+    """Prefer Gap Breakout/ORB, then use confidence within each tier."""
+    return (signal.strategy in _PRIORITY_STRATEGIES, signal.confidence)
+
+
+def _top_list_signal(symbol: str) -> Optional[Signal]:
+    """Fallback candidate for a guardrail-approved active-list symbol."""
+    bars = get_bars(symbol, "1d", "1m")
+    if bars.empty or "close" not in bars.columns:
+        return None
     try:
-        def _record(signal):
-            return {
-                "symbol": signal.symbol,
-                "action": signal.action,
-                "price": signal.price,
-                "confidence": signal.confidence,
-                "strategy": signal.strategy,
-                "reason": signal.reason,
-            }
+        price = float(bars["close"].iloc[-1])
+        if price <= 0:
+            return None
+    except Exception:
+        return None
 
-        def _default_record(symbol, action):
-            return {
-                "symbol": symbol,
-                "action": action,
-                "priority": "low",
-                "reason": "default candidate; normal strategy and EMA checks required",
-            }
+    try:
+        long_side = set(_get_tier_live(1))
+        short_side = set(_get_tier_live(2))
+    except Exception:
+        long_side, short_side = set(), set()
 
-        for path, selected, direction in payloads:
-            default_records = [
-                _default_record(symbol, "buy" if direction == "longs" else "short")
-                for symbol in sorted(_DEFAULT_SCAN_SYMBOLS)
-                if symbol not in {signal.symbol for signal in selected}
-            ]
-            records = [_record(signal) for signal in selected] + default_records
-            path.write_text(
-                json.dumps({
-                    "updated": now,
-                    "count": len(records),
-                    "signals": records,
-                }, indent=2) + "\n",
-                encoding="utf-8",
-            )
-        if _ACTIVE_SCAN_FILE.exists():
-            active = json.loads(_ACTIVE_SCAN_FILE.read_text(encoding="utf-8"))
-            active["updated"] = now
-            active["longs"] = [
-                _record(signal) for signal in payloads[0][1]
-            ] + [
-                _default_record(symbol, "buy")
-                for symbol in sorted(_DEFAULT_SCAN_SYMBOLS)
-                if symbol not in {signal.symbol for signal in payloads[0][1]}
-            ]
-            active["shorts"] = [
-                _record(signal) for signal in payloads[1][1]
-            ] + [
-                _default_record(symbol, "short")
-                for symbol in sorted(_DEFAULT_SCAN_SYMBOLS)
-                if symbol not in {signal.symbol for signal in payloads[1][1]}
-            ]
-            _ACTIVE_SCAN_FILE.write_text(json.dumps(active, indent=2) + "\n", encoding="utf-8")
-        _log.info(
-            f"[SIGNALS] active directional lists updated: "
-            f"longs={len(payloads[0][1])}, shorts={len(payloads[1][1])}"
-        )
-    except Exception as e:
-        _log.warning(f"[SIGNALS] could not write directional signal lists: {e}")
+    if symbol in short_side and symbol not in long_side and not LONG_ONLY_MODE:
+        return Signal(symbol, "short", price, MIN_SIGNAL_CONFIDENCE, "Top-list loser after guardrails; waiting on EMA entry conditions", "TopList")
+    return Signal(symbol, "buy", price, MIN_SIGNAL_CONFIDENCE, "Top-list candidate after guardrails; waiting on EMA entry conditions", "TopList")
 
-# ── Adaptive Filter State ──
-_adaptive_state = {
-    "empty_scans": 0,
-    "rvol_min": RVOL_MIN,
-    "min_conf": MIN_SIGNAL_CONFIDENCE,
-}
-_ADAPTIVE_MAX_EMPTY = 3  # Number of empty scans before relaxing
-_ADAPTIVE_MIN_RVOL = 1.2
-_ADAPTIVE_MIN_CONF = 0.60
-_ADAPTIVE_STEP_RVOL = 0.2
-_ADAPTIVE_STEP_CONF = 0.03
-from .strategies import get_strategy_instances, MomentumStrategy, TechnicalStrategy, SentimentStrategy, _get_float_shares, _get_market_cap
-
-# ── Batch snapshot cache ──────────────────────────────────────────────────────
+# -- Batch snapshot cache ------------------------------------------------------
 # Populated once at the start of each scan_universe() call via a single
 # batch request.  _passes_guardrails() reads from this cache to avoid
-# per-symbol 1-minute bars requests (390 bars × N symbols = dominant I/O cost).
+# per-symbol 1-minute bars requests (390 bars x N symbols = dominant I/O cost).
 _snapshot_cache: Dict = {}
 _SNAPSHOT_STALE_SECONDS = 300  # snapshot's latest_trade older than this -> fall back to fresh intraday bars
 
@@ -312,7 +256,7 @@ def _prefetch_snapshots(symbols: List[str]) -> None:
 
     A single API call replaces N individual get_bars("1d","1m") requests in
     _passes_guardrails(), reducing scan latency significantly for large universes.
-    Failures are silently swallowed — _passes_guardrails() falls back to bars.
+    Failures are silently swallowed -- _passes_guardrails() falls back to bars.
     """
     global _snapshot_cache
     _snapshot_cache = {}
@@ -407,7 +351,13 @@ def _should_admit_thin_liquidity(reason: Optional[str], market_state: Optional[M
         return False
     if not (market_state and market_state.is_regular_hours):
         return False
-    return market_state.now.strftime("%H:%M") < EOD_CLOSE_TIME
+    # EOD cutoff: 2026-08-17. Guard against a bare/mocked market_state that
+    # carries is_regular_hours but no .now (unit tests / defensive callers) --
+    # treat "time unknown" as inside the window rather than raising.
+    now = getattr(market_state, "now", None)
+    if now is None:
+        return True
+    return now.strftime("%H:%M") < EOD_CLOSE_TIME
 
 
 def _passes_guardrails(
@@ -428,8 +378,8 @@ def _passes_guardrails(
     """
     # return_reason is now an explicit argument
     try:
-        # ── Fast path: use batch-prefetched snapshot (no per-symbol HTTP call) ─
-        # Only trusted if latest_trade itself is recent — an unbounded-age snapshot
+        # -- Fast path: use batch-prefetched snapshot (no per-symbol HTTP call) -
+        # Only trusted if latest_trade itself is recent -- an unbounded-age snapshot
         # (thin after-hours book, dead feed for this symbol) previously fed straight
         # into every guardrail with no check at all.
         _snap = _snapshot_cache.get(symbol)
@@ -448,14 +398,14 @@ def _passes_guardrails(
         ):
             _trade_ts = getattr(latest_trade, "timestamp", None)
             if _trade_ts is None:
-                _snap_fresh = True  # no timestamp to check — trust it, same as before
+                _snap_fresh = True  # no timestamp to check -- trust it, same as before
             else:
                 if _trade_ts.tzinfo is None:
                     _trade_ts = _trade_ts.replace(tzinfo=datetime.timezone.utc)
                 _snap_age = (datetime.datetime.now(datetime.timezone.utc) - _trade_ts).total_seconds()
                 _snap_fresh = _snap_age <= _SNAPSHOT_STALE_SECONDS
                 if not _snap_fresh:
-                    _log.debug(f"[GUARDRAIL] {symbol}: snapshot stale ({_snap_age:.0f}s) — falling back to fresh intraday bars")
+                    _log.debug(f"[GUARDRAIL] {symbol}: snapshot stale ({_snap_age:.0f}s) -- falling back to fresh intraday bars")
 
         if _snap_fresh and latest_trade is not None and daily_bar is not None:
             price   = float(latest_trade.price)
@@ -464,7 +414,7 @@ def _passes_guardrails(
             prev_close = float(previous_daily_bar.close) if previous_daily_bar is not None else 0.0
             intraday = None
         else:
-            # ── Fallback: fetch 1-min intraday bars ───────────────────────────
+            # -- Fallback: fetch 1-min intraday bars ---------------------------
             intraday = get_bars(symbol, "1d", "1m")
             if intraday.empty or len(intraday) < 5:
                 if return_reason:
@@ -475,11 +425,11 @@ def _passes_guardrails(
             open_px = float(intraday["open"].iloc[0])
             prev_close = 0.0  # not available without an extra daily-bars call
 
-        # true_day_vol: day_vol above is Alpaca/IEX-sourced — typically just a
+        # true_day_vol: day_vol above is Alpaca/IEX-sourced -- typically just a
         # few percent of real market volume (confirmed 2026-08-05, see
         # get_daily_volume_bars). avg_daily_vol below comes from yfinance's
-        # full consolidated volume, so comparing raw day_vol against it — as
-        # both RVOL gates below used to — compares apples to oranges and
+        # full consolidated volume, so comparing raw day_vol against it -- as
+        # both RVOL gates below used to -- compares apples to oranges and
         # crushes RVOL toward ~0 for everything (confirmed 2026-08-06: AAPL/
         # MSFT/NVDA all showing 0.01-0.07 RVOL mid-afternoon, blocking nearly
         # every candidate all day). Use yfinance's own running total for
@@ -563,7 +513,7 @@ def _passes_guardrails(
                 return False, 'dollar_vol'
             return False
 
-        # Liquidity / quality floor — skip thin, low-float, micro-cap names prone to
+        # Liquidity / quality floor -- skip thin, low-float, micro-cap names prone to
         # violent, illiquid moves. 2026-08-23, user request: combined the old
         # two-layer system (an absolute hard floor plus a separate, session-
         # gated regular/pre-after-hours floor) into one flat set, applied the
@@ -618,7 +568,7 @@ def _passes_guardrails(
 
         # Gap-chase guard: skip if up >adaptive_gap% without a tight consolidation base.
         # Checked against BOTH today's tracked open (intraday chase) and the prior
-        # close (overnight/pre-market gap) — a stock that already gapped huge before
+        # close (overnight/pre-market gap) -- a stock that already gapped huge before
         # its first tracked bar of the day would show ~0% day_gain and slip through
         # the open_px check alone, since that check resets its baseline to the
         # already-elevated open.
@@ -645,7 +595,7 @@ def _passes_guardrails(
             return True, None
         return True
     except Exception as e:
-        _log.warning(f"Guardrail check failed for {symbol}: {e} — skipping symbol")
+        _log.warning(f"Guardrail check failed for {symbol}: {e} -- skipping symbol")
         if return_reason:
             return False, 'other'
         return False  # fail-safe: block on error, never bypass guardrails
@@ -691,7 +641,16 @@ def _is_thinly_traded(symbol: str) -> bool:
     return is_thin
 
 
+_UNIVERSE_HEALTH_LAST_LOG = 0.0  # monotonic ts of last universe-health notice (rate limiter)
+
+
 def get_scan_targets(excluded: Optional[Set[str]] = None, market_state: Optional[MarketState] = None) -> List[str]:
+    # 2026-09-02: rate-limit the universe-health notices (module-level state):
+    # with TI_PRIMARY_TTL_MINUTES=125 the overnight TTL expiry made the
+    # "ti_primary.json is empty" error fire on EVERY 5s scan cycle for hours
+    # (10k+ identical log lines/day observed). Same deficiency logged at most
+    # once per 5 minutes; the timer re-arms as soon as the universe recovers.
+    global _UNIVERSE_HEALTH_LAST_LOG
     """Equity scan universe = Alpaca-movers queue + top TI_PRIMARY_SCAN_BATCH_LIMIT
     tickers from the latest Trade Ideas capture (data/ti_primary.json), TI in
     its own rank order.
@@ -718,25 +677,26 @@ def get_scan_targets(excluded: Optional[Set[str]] = None, market_state: Optional
     trade ideas scrapping"): replaced the old multi-source assembly (EDGAR/
     sympathy/Alpaca-movers/watchlist priority queue, an inverse-ETF/
     BEAR_SHORT_UNIVERSE bear-regime seed, and an ~80-symbol rotating fallback
-    universe — routinely 90-150+ symbols/cycle, confirmed live) with just TI
+    universe -- routinely 90-150+ symbols/cycle, confirmed live) with just TI
     top-N. ti_primary.json is refreshed in place by the ApexTraderTICapture
     scheduled task (3 min 8:25-9:30 ET, 10 min 9:30-14:50 ET), so this
-    naturally tracks TI's latest read all day — no separate freeze/snapshot
+    naturally tracks TI's latest read all day -- no separate freeze/snapshot
     needed; whatever's newest in the file each cycle IS the universe.
 
     Same day, follow-up request ("remove edgar and sympathy but keep alpaca
     movers along with trade ideas.com"): Alpaca-movers added back in via its
     own dedicated queue (_alpaca_movers_queue / get_alpaca_movers_queue(),
-    engine/equity/discovery.py) — separate from the EDGAR/sympathy/watchlist
-    queue, which stays excluded from equity scan (still feeds the options
-    scan). Backtest evidence for keeping movers: 2026-08-26 fills showed
+    engine/equity/discovery.py) -- separate from the EDGAR/sympathy/watchlist
+    queue, which stays excluded from equity scan entirely (the priority
+    queue that once fed the options scan was removed 2026-09-01 with options
+    trading). Backtest evidence for keeping movers: 2026-08-26 fills showed
     Alpaca-movers-sourced trades at 58.8% win rate / +$15.10 net vs.
     TI/other's 34.7% / -$17.82 (small sample, one outlier trade drove most of
-    the movers P&L — not a confident signal, just the reason this wasn't
+    the movers P&L -- not a confident signal, just the reason this wasn't
     reverted with EDGAR/sympathy).
 
     Falls back to the static config lists (get_dynamic_universe) only when
-    ti_primary.json is critically thin/empty (_MIN_TI) — a TI-outage safety
+    ti_primary.json is critically thin/empty (_MIN_TI) -- a TI-outage safety
     net, not a routine noise source. is_dead_ticker() (engine/utils/bars.py)
     still strips out names with persistent stale/empty data.
     """
@@ -753,15 +713,19 @@ def get_scan_targets(excluded: Optional[Set[str]] = None, market_state: Optional
     # Universe health check
     _MIN_TI = 5
     if len(ti_primary) < _MIN_TI:
-        if len(ti_primary) == 0:
-            _log.error("[UNIVERSE HEALTH] ti_primary.json is empty! No tickers to scan. Check data pipeline.")
-        else:
-            _log.warning(f"[UNIVERSE HEALTH] ti_primary.json too small ({len(ti_primary)}). Falling back to static config lists.")
+        now_mono = time.monotonic()
+        if now_mono - _UNIVERSE_HEALTH_LAST_LOG > 300.0:
+            _UNIVERSE_HEALTH_LAST_LOG = now_mono
+            if len(ti_primary) == 0:
+                _log.error("[UNIVERSE HEALTH] ti_primary.json is empty! No tickers to scan. Check data pipeline.")
+            else:
+                _log.warning(f"[UNIVERSE HEALTH] ti_primary.json too small ({len(ti_primary)}). Falling back to static config lists.")
         p1, p2, _ = _cfg.get_dynamic_universe()
         ti_pool = list(dict.fromkeys(p2 + p1))
         if len(ti_pool) == 0:
             _log.error("[UNIVERSE HEALTH] Static universe lists are empty! No tickers to scan. Check config/universe sources.")
     else:
+        _UNIVERSE_HEALTH_LAST_LOG = 0.0  # healthy again -> next deficiency logs immediately
         ti_pool = list(dict.fromkeys(ti_primary))
 
     movers = [s for s in _get_alpaca_movers_queue() if s not in delisted]
@@ -794,11 +758,35 @@ def get_scan_targets(excluded: Optional[Set[str]] = None, market_state: Optional
 
         # Guardrail reads are independent network/data lookups. Run them in
         # parallel so a long raw TI list cannot delay the active snapshot
-        # write past the scan timeout; map() preserves source ranking order.
-        with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as pool:
-            movers = [s for s, ok in zip(movers, pool.map(_quality_ok, movers)) if ok]
-        with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as pool:
-            ti_pool = [s for s, ok in zip(ti_pool, pool.map(_quality_ok, ti_pool)) if ok]
+        # write past the scan timeout; source order is preserved below.
+        # 2026-09-02: explicit executor + per-item and total budgets instead of
+        # `with ... pool.map(...)` -- map() has no per-item timeout and the
+        # context manager's shutdown(wait=True) froze the whole main loop
+        # when a guardrail worker hung on a provider lock (seen live: log
+        # silent, CPU 0, no rescue possible). A wedged symbol now costs at
+        # most its own timeout; a wedged pool costs at most the total budget.
+        def _filter_quality(items: List[str]) -> List[str]:
+            index = {s: i for i, s in enumerate(items)}
+            keep: Dict[int, str] = {}
+            pool = ThreadPoolExecutor(max_workers=SCAN_WORKERS)
+            try:
+                futs = {pool.submit(_quality_ok, s): s for s in items}
+                try:
+                    for fut in as_completed(futs, timeout=_SCAN_TOTAL_BUDGET_SEC):
+                        s = futs[fut]
+                        try:
+                            if fut.result(timeout=SCAN_SYMBOL_TIMEOUT):
+                                keep[index[s]] = s
+                        except Exception as e:
+                            _log.warning(f"{s}: guardrail pre-filter failed, excluding from top-{_cfg.TI_PRIMARY_SCAN_BATCH_LIMIT}: {e}")
+                except TimeoutError:
+                    _log.warning("[SCAN] guardrail pre-filter exceeded total budget -- proceeding with completed checks")
+            finally:
+                pool.shutdown(wait=False, cancel_futures=True)
+            return [s for _, s in sorted(keep.items())]
+
+        movers = _filter_quality(movers)
+        ti_pool = _filter_quality(ti_pool)
 
     ti_slice = ti_pool[:_cfg.TI_PRIMARY_SCAN_BATCH_LIMIT]
 
@@ -825,7 +813,7 @@ def scan_universe(scan_targets: List[str], sentiment: str, market_state: MarketS
 
     # Batch-prefetch stock snapshots for all scan targets in one API call.
     # Populates _snapshot_cache so _passes_guardrails() avoids per-symbol
-    # get_bars("1d","1m") requests — the dominant I/O cost of each scan cycle.
+    # get_bars("1d","1m") requests -- the dominant I/O cost of each scan cycle.
     _prefetch_snapshots(scan_targets)
 
     # Direction is determined by each stock's own strategy conditions.
@@ -849,7 +837,7 @@ def scan_universe(scan_targets: List[str], sentiment: str, market_state: MarketS
     thin_liquidity_stats = {'admitted': 0}  # rejected-list symbols scanned anyway; see TRADE_THIN_LIQUIDITY_REJECTS
 
     def _scan_one(symbol: str):
-        # Dead-ticker check already done in get_scan_targets() — skip here.
+        # Dead-ticker check already done in get_scan_targets() -- skip here.
         # Pass pre-computed regime into guardrails to avoid re-calling _is_bull_regime()
         # Custom: get rejection reason from _passes_guardrails
         guardrail_result = _passes_guardrails(symbol, market_state=market_state, return_reason=True)
@@ -864,7 +852,7 @@ def scan_universe(scan_targets: List[str], sentiment: str, market_state: MarketS
                 guardrail_rejections[reason] += 1
             else:
                 guardrail_rejections['other'] += 1
-            # Rejection itself is unchanged and still counted above — this is a
+            # Rejection itself is unchanged and still counted above -- this is a
             # separate, toggleable path on top of it: a symbol rejected for ONLY
             # thin float/volume still gets scanned, just flagged so _execute_entry
             # sizes it at THIN_LIQUIDITY_POSITION_SIZE_PCT instead of skipping it
@@ -892,8 +880,14 @@ def scan_universe(scan_targets: List[str], sentiment: str, market_state: MarketS
                 _log.debug(f"[SCAN] {symbol} {type(s).__name__}: {_ex}")
 
         if not candidates:
-            return None
-        best = max(candidates, key=lambda s: s.confidence)
+            best = _top_list_signal(symbol)
+            if best is None:
+                return None
+        else:
+            # User-requested order: GapBreakout/ORB first, then every other
+            # real strategy. Confidence remains the tie-breaker within a tier.
+            # TopList stays fallback-only in the branch above.
+            best = max(candidates, key=_strategy_selection_rank)
         if thin_liquidity:
             # 2026-08-15: the guardrail-admit decision above happens before we
             # know which strategy will actually fire (it's a symbol-level gate,
@@ -918,19 +912,34 @@ def scan_universe(scan_targets: List[str], sentiment: str, market_state: MarketS
         return best
 
 
-
-    with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as pool:
+    # 2026-09-02: explicit executor instead of `with` -- the context manager's
+    # shutdown(wait=True) freezes the whole main loop if a worker hangs (seen
+    # live: log silent, CPU 0, heartbeat not written, worker stuck on a
+    # provider lock). futures already time out individually below; when the
+    # loop ends, abandon any still-running worker and move on -- the watchdog's
+    # stall-restart handles a genuinely wedged scan, but a slow symbol must
+    # never hold the market-cycle hostage.
+    pool = ThreadPoolExecutor(max_workers=SCAN_WORKERS)
+    try:
         future_map = {pool.submit(_scan_one, sym): sym for sym in scan_targets}
-        for future in as_completed(future_map):
-            sym = future_map[future]
-            try:
-                sig = future.result(timeout=SCAN_SYMBOL_TIMEOUT)
-                if sig:
-                    signals.append(sig)
-                    hit_counts[sig.strategy] = hit_counts.get(sig.strategy, 0) + 1
-            except Exception as e:
-                scan_errors += 1
-                _log.error(f"[SCAN ERROR] {sym}: {e}")
+        # Total-cycle budget: as_completed() alone blocks until the FIRST
+        # future completes, so an all-workers-hung scan would never reach the
+        # finally below. Bound the whole collection loop instead.
+        try:
+            for future in as_completed(future_map, timeout=_SCAN_TOTAL_BUDGET_SEC):
+                sym = future_map[future]
+                try:
+                    sig = future.result(timeout=SCAN_SYMBOL_TIMEOUT)
+                    if sig:
+                        signals.append(sig)
+                        hit_counts[sig.strategy] = hit_counts.get(sig.strategy, 0) + 1
+                except Exception as e:
+                    scan_errors += 1
+                    _log.error(f"[SCAN ERROR] {sym}: {e}")
+        except TimeoutError:
+            _log.warning("[SCAN] total scan budget exceeded -- abandoning slow workers and proceeding")
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
 
     # Log guardrail rejection summary
     total_rejected = sum(guardrail_rejections.values())
@@ -993,17 +1002,6 @@ def scan_universe(scan_targets: List[str], sentiment: str, market_state: MarketS
     return signals, hit_counts, scan_errors
 
 
-def filter_signals(signals, long_only: bool = False, min_conf: float = 0.0, cap: Optional[int] = None):
-    if long_only:
-        signals = [s for s in signals if s.action == "buy"]
-
-    signals = [s for s in signals if s.confidence >= min_conf]
-
-    if cap is not None:
-        signals = signals[:cap]
-    return signals
-
-
 def _demo() -> None:
     """Self-check for get_scan_targets()'s market_state-gated guardrail
     pre-filter (2026-08-27, user request: "the top 30 list should only keep
@@ -1045,7 +1043,6 @@ def _demo() -> None:
                     weekday=True,
                     is_market_open=True,
                     is_regular_hours=True,
-                    is_options_lull_hours=False,
                     is_open_window=False,
                 )
 

@@ -1,216 +1,66 @@
-﻿"""
+"""
 ApexTrader - Configuration
 Professional Automated Trading System
 Modular architecture with multiple strategies and PDT compliance
 """
 
 
+import datetime
 import os
+import re
 # .env is loaded once by main.py at process start.
-# config.py reads env vars directly via os.getenv — no dotenv call here.
+# config.py reads env vars directly via os.getenv -- no dotenv call here.
 
-# ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+# ------------------------------------------------------------------------------------------
 # Broker Selection
-# ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
-STOCKS_BROKER = os.getenv("STOCKS_BROKER", "alpaca")   # 'alpaca' or 'etrade'
-OPTIONS_BROKER = "alpaca"                               # Only Alpaca supports options
+# ------------------------------------------------------------------------------------------
+STOCKS_BROKER = os.getenv("STOCKS_BROKER", "alpaca")   # alpaca only (E*TRADE removed 2026-09-01)
 
-# ─────────────────────────────────────────────────────────────────
-# Options Trading Configuration (Level 3 account)
-#
-# MASTER KILL-SWITCH: set OPTIONS_ENABLED=false in .env to disable
-# all options trading system-wide (scanner, executor, main loop).
-# Default: true (enabled). Safe to flip live without restart via env.
-#
-# Allocation: 15% of portfolio. Strategies: momentum calls, bear puts,
-# covered calls on held positions. Expiry: 7–21 DTE (near-term).
-# ─────────────────────────────────────────────────────────────────
-OPTIONS_ENABLED             = os.getenv("OPTIONS_ENABLED", "true").lower() in ("1", "true", "yes")
-OPTIONS_ALLOCATION_PCT      = float(os.getenv("OPTIONS_ALLOCATION_PCT", "15.0"))  # % of equity for all options (override via .env)
-OPTIONS_MAX_POSITIONS       = int(os.getenv("OPTIONS_MAX_POSITIONS", "3"))        # max open options contracts
-OPTIONS_DTE_MIN             = int(os.getenv("OPTIONS_DTE_MIN", "14"))             # min days-to-expiry at entry (14 avoids forced same-day close = PDT hit)
-OPTIONS_DTE_MAX             = int(os.getenv("OPTIONS_DTE_MAX", "40"))             # max days-to-expiry at entry
-OPTIONS_DELTA_TARGET        = float(os.getenv("OPTIONS_DELTA_TARGET", "0.55"))    # target delta — 0.55 = ATM/slight ITM (higher profit/point)
-OPTIONS_MIN_OPEN_INTEREST   = int(os.getenv("OPTIONS_MIN_OPEN_INTEREST", "300"))   # per-strike OI floor — weeds out illiquid strikes
-OPTIONS_MAX_SPREAD_PCT      = float(os.getenv("OPTIONS_MAX_SPREAD_PCT", "10.0"))  # max bid/ask spread % of mid
-OPTIONS_MAX_IV_PCT          = float(os.getenv("OPTIONS_MAX_IV_PCT", "150.0"))     # skip when IV is extreme
-OPTIONS_MIN_IV_PCT          = float(os.getenv("OPTIONS_MIN_IV_PCT", "15.0"))      # skip when IV is too flat
-OPTIONS_PROFIT_TARGET_PCT   = float(os.getenv("OPTIONS_PROFIT_TARGET_PCT", "45.0"))  # close at +45% gain (aggressive momentum capture)
-OPTIONS_STOP_LOSS_PCT       = float(os.getenv("OPTIONS_STOP_LOSS_PCT", "30.0"))      # close at -30% loss
-OPTIONS_THETA_EXIT_DTE      = int(os.getenv("OPTIONS_THETA_EXIT_DTE", "2"))           # exit within N DTE to avoid theta decay spike
-OPTIONS_COVERED_CALL_DELTA  = float(os.getenv("OPTIONS_COVERED_CALL_DELTA", "0.25")) # sell OTM calls ~0.25 delta
-OPTIONS_MIN_SIGNAL_CONFIDENCE = float(os.getenv("OPTIONS_MIN_SIGNAL_CONFIDENCE", "0.82"))  # sniper threshold — only highest-probability setups
-# 2026-08-24, user request: options scan moved off the equity scan_and_trade()
-# cycle onto its own thread (_start_options_scan_thread) so it stops blocking
-# equity re-entries. This is that thread's own cadence -- doesn't need to be
-# 1 min like equity, options positions are held far longer than a swing.
-OPTIONS_SCAN_INTERVAL_MIN   = int(os.getenv("OPTIONS_SCAN_INTERVAL_MIN", "3"))
-OPTIONS_MIN_STOCK_PRICE     = float(os.getenv("OPTIONS_MIN_STOCK_PRICE", "8.0"))   # sub-$8 stocks have wide spreads and thin option chains
-OPTIONS_MIN_MOVE_PCT        = float(os.getenv("OPTIONS_MIN_MOVE_PCT", "1.5"))      # min % daily move to qualify
-OPTIONS_MIN_RVOL            = float(os.getenv("OPTIONS_MIN_RVOL", "1.5"))          # min relative volume — need genuine conviction surge
-OPTIONS_MIN_ADV             = float(os.getenv("OPTIONS_MIN_ADV", "500_000"))     # min avg dollar volume — avoid thinly-traded names
-OPTIONS_UNIVERSE_OVERRIDE   = os.getenv("OPTIONS_UNIVERSE_OVERRIDE", "").strip()  # comma-separated tickers to force a smaller options universe
-OPTIONS_EARNINGS_AVOID_DAYS = int(os.getenv("OPTIONS_EARNINGS_AVOID_DAYS", "15")) # skip entries if earnings within N calendar days
-OPTIONS_TRAIL_ACTIVATE_PCT  = float(os.getenv("OPTIONS_TRAIL_ACTIVATE_PCT", "20.0"))  # trailing stop arms once P&L exceeds this %
-OPTIONS_TRAIL_DRAWDOWN_PCT  = float(os.getenv("OPTIONS_TRAIL_DRAWDOWN_PCT", "15.0"))  # close if pnl drops this many pp from peak
-# Tickers that actively trade liquid options.
-# Loaded dynamically from data/ti_unusual_options.json (written by capture_tradeideas.py
-# every time the TI unusualoptionsvolume scan is scraped).  Falls back to the
-# hardcoded list below if the file doesn't exist or is empty.
-_OPTIONS_FALLBACK_UNIVERSE = [
-    # SPX/NDX liquid proxies — tightest spreads, deepest chains
-    "SPY", "QQQ", "IWM", "DIA",
-    "SPXL", "SPXS", "TQQQ", "SQQQ", "SPXU", "UVXY", "VXX",
-    # Sector ETFs with liquid options
-    "XLF", "XLE", "XLK", "XLV", "XLU", "XLP", "SMH", "ARKK",
-    # Mega-cap tech — always liquid options
-    "AAPL", "MSFT", "NVDA", "AMD", "GOOGL", "GOOG", "META", "TSLA", "AMZN", "NFLX",
-    "ORCL", "CRM", "ADBE", "INTC", "QCOM",
-    # High-beta momentum / high-OI
-    "MARA", "COIN", "PLTR", "SMCI", "CRWD", "NET", "SNOW", "MSTR",
-    "SOFI", "RIVN", "LCID", "NIO", "BABA", "JD",
-    # Financials with deep chains
-    "JPM", "BAC", "GS", "MS", "C",
-    # Energy
-    "XOM", "CVX", "OXY",
-    # Biotech / speculative with options
-    "MRNA", "BNTX", "BCRX",
-    # Short squeeze candidates — high short float + improving fundamentals
-    "LITE", "AAOI",
-]
-
-def _load_options_universe() -> list:
-    """Load live TI unusual-options-volume tickers.
-
-    Returns the scraped unusual options universe, falling back to a hardcoded list
-    only when the TI file is unavailable or empty.
-    """
-    import json as _json
-    import re as _re
-    _VALID_TICKER = _re.compile(r'^[A-Z]{1,5}$')
-    _ti_file = os.path.join(os.path.dirname(__file__), "..", "data", "ti_unusual_options.json")
-    try:
-        with open(_ti_file, encoding="utf-8") as _f:
-            _d = _json.load(_f)
-        _tickers = [
-            str(t).upper().strip()
-            for t in _d.get("tickers", [])
-            if t and _VALID_TICKER.match(str(t).upper().strip())
-        ]
-        if _tickers:
-            return _tickers
-    except Exception:
-        pass
-    return _OPTIONS_FALLBACK_UNIVERSE
-
-
-def get_options_universe(require_ti_file: bool = False) -> list:
-    """Return the live options universe, applying override rules.
-
-    Core liquid names (SPY, QQQ, mega-caps, sector ETFs) are ALWAYS prepended so
-    the options scanner always evaluates names with deep chains, regardless of what
-    the TI equity universe contains (which is often micro-cap momentum names that
-    have thin or no options chains).
-
-    Primary TI source appended after the core set: latest ti_primary.json.
-    Fallback: universe.json tier 1+2, then static _OPTIONS_FALLBACK_UNIVERSE.
-    """
-    if OPTIONS_UNIVERSE_OVERRIDE:
-        import re as _re
-        _VALID_TICKER_OVERRIDE = _re.compile(r'^[A-Z]{1,5}$')
-        _override_symbols = [
-            t.strip().upper()
-            for t in OPTIONS_UNIVERSE_OVERRIDE.split(",")
-            if t and _VALID_TICKER_OVERRIDE.match(t.strip().upper())
-        ]
-        if _override_symbols:
-            return list(dict.fromkeys(_override_symbols))
-
-    # Core liquid options names — always included first regardless of TI data.
-    # These have the tightest spreads, deepest chains, and highest OI.
-
-    # Always include index tickers in paper trading mode
-    _index_tickers = ["SPX", "NDX", "RUT", "VIX"]
-    _core = list(dict.fromkeys(_OPTIONS_FALLBACK_UNIVERSE))
-    try:
-        if PAPER:
-            # Prepend index tickers if not already present
-            for idx in reversed(_index_tickers):
-                if idx not in _core:
-                    _core.insert(0, idx)
-    except Exception:
-        pass
-
-    ti_universe = []
-    try:
-        from engine.equity.universe import get_ti_primary as _get_ti_primary
-        ti_universe = list(dict.fromkeys(_get_ti_primary()))
-    except Exception:
-        pass
-
-    if not ti_universe:
-        try:
-            from engine.equity.universe import get_tier as _get_tier
-            ti_universe = list(dict.fromkeys(_get_tier(1) + _get_tier(2)))
-        except Exception:
-            pass
-
-    if not ti_universe and require_ti_file:
-        raise FileNotFoundError("Primary TI universe (data/ti_primary.json or data/universe.json tiers 1+2) is missing or empty")
-
-    # Merge: core first, then TI names not already in core
-    core_set = set(_core)
-    combined = _core + [s for s in ti_universe if s not in core_set]
-    return combined
-
-
-OPTIONS_ELIGIBLE_UNIVERSE = get_options_universe()
-
-# ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+# -----------------------------------------------------------------
+# (2026-09-01: options trading removed -- the whole Options Trading
+# Configuration + options universe sections were deleted. See git history.)
+# -----------------------------------------------------------------
 # Alpaca API Configuration
-# ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+# ------------------------------------------------------------------------------------------
+# Alpaca API Configuration
+# ------------------------------------------------------------------------------------------
 # PAPER mode is strongly recommended for development/testing.
 # Set environment variable TRADE_MODE=paper or TRADE_MODE=live.
-TRADE_MODE = os.getenv("TRADE_MODE", "paper").lower()
+TRADE_MODE = os.getenv("TRADE_MODE", "paper").strip().lower()
+if TRADE_MODE not in ("paper", "live"):
+    raise ValueError(f"Invalid TRADE_MODE={TRADE_MODE!r}; expected 'paper' or 'live'")
 PAPER      = TRADE_MODE == "paper"
 LIVE       = not PAPER
 _MODE      = "PAPER" if PAPER else "LIVE"
 
 API_KEY    = os.getenv(f"{_MODE}_ALPACA_API_KEY", "")
 API_SECRET = os.getenv(f"{_MODE}_ALPACA_API_SECRET", "")
-# SDK picks the correct endpoint automatically via paper=True/False — no URL override needed
+# SDK picks the correct endpoint automatically via paper=True/False -- no URL override needed
 ALPACA_BASE_URL = "https://paper-api.alpaca.markets" if PAPER else "https://api.alpaca.markets"
 
-# ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
-# E*TRADE API Configuration
-# ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
-ETRADE_CONSUMER_KEY    = os.getenv("ETRADE_CONSUMER_KEY", "")
-ETRADE_CONSUMER_SECRET = os.getenv("ETRADE_CONSUMER_SECRET", "")
-ETRADE_ACCOUNT_ID      = os.getenv("ETRADE_ACCOUNT_ID", "")
-ETRADE_SANDBOX         = os.getenv("ETRADE_SANDBOX", "false").lower() == "true"
 
-# ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+# ------------------------------------------------------------------------------------------
 # Stock Universe
 # Priority 1: Momentum stocks (scanned FIRST, highest allocation)
 # Priority 2: Established tech and high short-float stocks
 # Priority 3: Market ETFs for context
-# ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+# ------------------------------------------------------------------------------------------
 PRIORITY_1_MOMENTUM = [
-    # ── Permanent core (never expire, always scanned) ──────────────
+    # -- Permanent core (never expire, always scanned) --------------
     # Crypto-leveraged / popular momentum plays
     "MARA", "WULF", "CORZ", "HUT", "IREN",
     # Biotech / speculative momentum
     "MRNA", "BCRX", "SNDX", "IMVT",
     # Energy / commodities momentum
     "RIG", "NOG", "CNX", "BTU", "DK",
-    # ── Bear-market long plays (inverse ETFs — go UP when market falls) ──
+    # -- Bear-market long plays (inverse ETFs -- go UP when market falls) --
     # Valid LONG buys in bear regime as LONG_ONLY_MODE=True
     "SQQQ", "SPXU", "UVXY", "TZA", "FAZ", "SOXS", "LABD", "DUST",
 ]
 
 PRIORITY_2_ESTABLISHED = [
-    # ── Permanent core (never expire) ─────────────────────────────
-    # Tech giants — liquid at all times
+    # -- Permanent core (never expire) -----------------------------
+    # Tech giants -- liquid at all times
     "AAPL", "MSFT", "NVDA", "AMD", "GOOGL", "META", "TSLA", "AMZN",
     # High short-float perennials
     "LCID", "MVIS", "WKHS", "SNDX", "FUBO", "INDO", "SOXS", "UCO",
@@ -218,7 +68,7 @@ PRIORITY_2_ESTABLISHED = [
 
 PRIORITY_3_MARKET = ["SPY", "QQQ", "IWM", "^VIX"]
 
-# Delisted or broken tickers — filtered out at runtime
+# Delisted or broken tickers -- filtered out at runtime
 DELISTED_STOCKS = [
     # Truly delisted
     "IMV", "EKV", "AMTK", "SUNE",
@@ -233,7 +83,7 @@ DELISTED_STOCKS = [
 PRIORITY_1_MOMENTUM = [s for s in PRIORITY_1_MOMENTUM if s not in DELISTED_STOCKS]
 PRIORITY_2_ESTABLISHED = [s for s in PRIORITY_2_ESTABLISHED if s not in DELISTED_STOCKS]
 
-# ─── Dynamic universe: load TTL-managed tickers from data/universe.json ───────
+# --- Dynamic universe: load TTL-managed tickers from data/universe.json -------
 # Trade Ideas updates and prediction picks live there, NOT in this file.
 # Universe TTL values are configurable via env vars:
 #   UNIVERSE_TTL_TIER1, UNIVERSE_TTL_TIER2, UNIVERSE_TTL_TIER3
@@ -269,10 +119,10 @@ STOCKS = {
     "following":  PRIORITY_FOLLOWING,
 }
 
-# ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
-# Trading Parameters ΓÇö Swing Trading Optimized
-# ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
-MAX_POSITIONS        = 12     # 7.5% × 12 = 90% of usable equity (within 10% BP reserve) — reverted 2026-08-11 (was briefly 9 @ 10%)
+# ------------------------------------------------------------------------------------------
+# Trading Parameters -- Swing Trading Optimized
+# ------------------------------------------------------------------------------------------
+MAX_POSITIONS        = 12     # 7.5% -- 12 = 90% of usable equity (within 10% BP reserve) -- reverted 2026-08-11 (was briefly 9 @ 10%)
 # 2026-08-22, user request ("top 15 will be picked"): how many ranked
 # candidates the scan cycle logs/tracks per cycle (TOP5_RAW/TOP5_ELIGIBLE
 # log lines, day_picks.json, the scan-results notification) -- was a
@@ -281,7 +131,7 @@ MAX_POSITIONS        = 12     # 7.5% × 12 = 90% of usable equity (within 10% BP
 # the top 5/15, until MAX_POSITIONS-driven capacity fills.
 TOP_N_SIGNALS        = 60
 # When full, close the weakest position to make room if new signal conf > this threshold
-SWAP_ON_FULL         = True   # enabled — close weakest position for a better signal when full
+SWAP_ON_FULL         = True   # enabled -- close weakest position for a better signal when full
 SWAP_MIN_CONFIDENCE  = 0.75   # Swap out weakest when new signal >= this confidence (was 0.85)
 
 # 2026-08-17, user request: "change this to 10% base instead of 7.5% and
@@ -319,15 +169,15 @@ POSITION_CAP_ABSOLUTE_MAX_PCT   = 46.7  # ceiling the growing cap can never exce
 
 # Correlated-exposure cap: several DIFFERENT symbols that move together (e.g. the
 # leveraged inverse-market ETF basket) can each stay under MAX_POSITION_CONCENTRATION_PCT
-# individually while still adding up to one oversized directional bet combined —
+# individually while still adding up to one oversized directional bet combined --
 # confirmed in production: SQQQ+SOXS+TZA+LABD held simultaneously on 2026-07-30.
-# Symbol list mirrors engine.utils.market.INVERSE_ETFS (duplicated intentionally —
+# Symbol list mirrors engine.utils.market.INVERSE_ETFS (duplicated intentionally --
 # config.py stays dependency-free; engine.equity.strategies._INVERSE_ETFS already
 # duplicates the same list for the same reason).
 CORRELATION_GROUPS = {
     "leveraged_inverse": {
         "symbols": {"SQQQ", "SPXU", "UVXY", "TZA", "FAZ", "SOXS", "LABD", "DUST"},
-        "max_pct": 33.3,   # combined cap — above the single-symbol cap, since it's a basket (scaled 25.0 -> 33.3 2026-08-17)
+        "max_pct": 33.3,   # combined cap -- above the single-symbol cap, since it's a basket (scaled 25.0 -> 33.3 2026-08-17)
     },
 }
 
@@ -341,7 +191,7 @@ CORRELATION_GROUPS = {
 # runs regardless of those gates.
 CONCENTRATION_CHECK_INTERVAL_MIN = 10
 
-# ─────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
 # Portfolio-Wide Leverage Cap
 # 2026-08-17, user request: "restrict portfolio value to 1.5x the actual
 # account [equity], [not] the margin account" -- Alpaca's own buying_power
@@ -352,15 +202,15 @@ CONCENTRATION_CHECK_INTERVAL_MIN = 10
 # one symbol; CORRELATION_GROUPS (25%) caps one correlated basket; this
 # caps the WHOLE book at once. It is enforced after fills by
 # enforce_portfolio_leverage (same fixed clock-grid schedule as the other
-# concentration checks — see _concentration_check_job in orchestrator.py).
+# concentration checks -- see _concentration_check_job in orchestrator.py).
 # Entry sizing uses broker buying power and the per-symbol cap; it does not
 # pre-throttle orders against this total-exposure limit.
-# ─────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
 MAX_PORTFOLIO_LEVERAGE = 1.5   # total open-position market value <= this x equity (2026-08-28, user request: 1.5x actual-position cap, independent of Alpaca's 4x order-placement margin)
 
 # Same-underlying leveraged-ETF pairs (bull+bear on one commodity/index, e.g.
-# BOIL/KOLD both on nat gas — arbitrary product names, no ticker pattern to
-# exploit, must be hand-maintained) — confirmed in production 2026-08-10:
+# BOIL/KOLD both on nat gas -- arbitrary product names, no ticker pattern to
+# exploit, must be hand-maintained) -- confirmed in production 2026-08-10:
 # BOIL+KOLD and UCO+SCO both held simultaneously via the TI-scraped universe.
 # Unlike CORRELATION_GROUPS (a %-of-equity trim), this is a same-cycle/
 # same-symbol entry block: _filter_eligible() skips a signal whose underlying
@@ -391,12 +241,12 @@ LEVERAGED_UNDERLYING = {
 # pattern-matches any candidate against this whitelist of tickers popular
 # enough to attract 3rd-party leveraged products. Whitelisted (not applied to
 # the whole universe) so two unrelated small-caps sharing a prefix are never
-# coincidentally blocked — e.g. "AAP" (Advance Auto Parts) and "METC" (Ramaco
+# coincidentally blocked -- e.g. "AAP" (Advance Auto Parts) and "METC" (Ramaco
 # Resources) are real, unrelated tickers that must NOT collide with AAPL/META.
 SINGLE_STOCK_LEVERAGE_TARGETS = {
     "AAPL", "MSFT", "NVDA", "GOOGL", "GOOG", "META", "TSLA", "AMZN",
     "AVGO", "NFLX", "ORCL", "MSTR", "COIN", "SMCI", "PLTR", "IONQ", "RKLB", "MARA",
-    "SPCX",  # SpaceX — confirmed live in scan universe alongside SPCF (2026-07-06 log)
+    "SPCX",  # SpaceX -- confirmed live in scan universe alongside SPCF (2026-07-06 log)
 }
 _LEVERAGE_SUFFIXES = set("LSUDXZQBTF")  # F added for SPCF (SpaceX leveraged sibling)
 
@@ -423,7 +273,7 @@ RISK_PER_TRADE_PCT   = 0.8    # Risk 0.8% of account per trade (unused with fixe
 
 # Confidence-based position scaling: low-confidence signals get smaller allocations.
 # Multiplier scales linearly from CONF_SCALE_MIN_MULT at MIN_SIGNAL_CONFIDENCE
-# up to 1.0× at CONF_SCALE_FULL_CONF. Above that threshold: always full size.
+# up to 1.0-- at CONF_SCALE_FULL_CONF. Above that threshold: always full size.
 CONF_SCALE_MIN_MULT  = 0.50   # 50% of normal size at the confidence floor (0.72)
 CONF_SCALE_FULL_CONF = 0.85   # 100% of normal size at this confidence and above
 
@@ -470,17 +320,17 @@ STRATEGY_KELLY_MULT = {
 STRATEGY_KELLY_MULT_DEFAULT = 1.0
 
 # Small account reduction caps (sub-$5k equity)
-SMALL_ACCOUNT_POSITION_SIZE_PCT = 10.0  # same allocation as POSITION_SIZE_PCT for small accounts — reverted 2026-08-11, scaled 2026-08-17
+SMALL_ACCOUNT_POSITION_SIZE_PCT = 10.0  # same allocation as POSITION_SIZE_PCT for small accounts -- reverted 2026-08-11, scaled 2026-08-17
 SMALL_ACCOUNT_RISK_PER_TRADE_PCT = 0.5 # lower risk per trade for small accounts
 SMALL_ACCOUNT_MIN_POSITION_DOLLARS = 5.0  # lowered to allow ~$5 entry for cheap tickers
 
-# Tiered Profit Targets — aggressive: book profits faster
+# Tiered Profit Targets -- aggressive: book profits faster
 TAKE_PROFIT_EXTREME  = 50.0   # was 35 (+15pp, 2026-08-06)
 TAKE_PROFIT_HIGH     = 40.0   # was 25 (+15pp, 2026-08-06)
 TAKE_PROFIT_MEDIUM   = 33.0   # was 18 (+15pp, 2026-08-06)
 TAKE_PROFIT_NORMAL   = 27.0   # was 12 (+15pp, 2026-08-06)
 
-# Tiered Trailing Stops — tighter: lock in gains quickly
+# Tiered Trailing Stops -- tighter: lock in gains quickly
 # 2026-08-22, user request: replaced by a single flat TRAIL_STOP_PCT below
 # (tiers + THIN_LIQUIDITY_TRAILING_STOP_MULT halving were the "variable trail
 # stop protections" removed). Constants kept, now unused by _trail_pct_for(),
@@ -523,14 +373,28 @@ TRAIL_STOP_PCT = 1.5
 # TRAIL_STOP_PCT; a small or negative gain still uses the flat floor.
 PROFIT_TRAIL_GIVEBACK_PCT = 20.0
 
+# 2026-09-01, user request ("change the trail stop exit to atr based values"):
+# the trailing-stop floor is now widened per-symbol by ATR when ATR is
+# meaningfully wider than the floor -- a volatile name gets a volatility-scaled
+# stop instead of the same fixed leash as a quiet one. ATR is computed from the
+# intraday 1-min bars (the same data every other entry/exit gate uses), then
+# scaled by ATR_TRAIL_MULTIPLIER. TRAIL_STOP_PCT stays the floor and
+# ATR_TRAIL_MAX_PCT is the ceiling, so no single wild ATR reading can blow the
+# stop out to double digits; profit giveback (above) still widens past both on
+# a winner. ATR data unavailable/insufficient -> fail open to the flat floor.
+ATR_TRAIL_ENABLED    = os.getenv("ATR_TRAIL_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+ATR_TRAIL_PERIOD     = int(os.getenv("ATR_TRAIL_PERIOD", "14"))
+ATR_TRAIL_MULTIPLIER = float(os.getenv("ATR_TRAIL_MULTIPLIER", "1.5"))
+ATR_TRAIL_MAX_PCT    = float(os.getenv("ATR_TRAIL_MAX_PCT", "4.0"))
+
 # Confidence ratchet: once a position is up CONF_RATCHET_TRIGGER_GAIN_PCT or
-# more, tighten its trailing stop to lock in the gain sooner — scaled by how
+# more, tighten its trailing stop to lock in the gain sooner -- scaled by how
 # confident the original entry signal was, so a trade we were more sure about
 # protects its profit faster. Never tightens a position still underwater, and
-# never applies below SWAP_MIN_CONFIDENCE (0.75) — same "high confidence" bar
+# never applies below SWAP_MIN_CONFIDENCE (0.75) -- same "high confidence" bar
 # used for swaps elsewhere. Full scale (2x tighter) at confidence 1.0.
 # Positions restored after a bot restart carry no real recorded confidence
-# (placeholder 0.0) and are naturally excluded — the formula only kicks in
+# (placeholder 0.0) and are naturally excluded -- the formula only kicks in
 # above 0.75, so an unknown/restored entry is correctly never ratcheted.
 CONF_RATCHET_ENABLED          = True
 CONF_RATCHET_TRIGGER_GAIN_PCT = 4.0   # unrealized gain % required before tightening kicks in
@@ -540,10 +404,10 @@ CONF_RATCHET_MAX_TIGHTEN      = 0.5   # at confidence=1.0, tightened stop = tier
 STOP_LOSS_PCT   = 3.0
 TAKE_PROFIT_PCT = 18.0
 
-# ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+# ------------------------------------------------------------------------------------------
 # Dynamic ATR-Based Tier Assignment
 # Lower thresholds = more stocks classified as high-volatility = tighter TP/SL
-# ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+# ------------------------------------------------------------------------------------------
 USE_DYNAMIC_TIERS  = True
 ATR_TIER_EXTREME   = 5.0   # was 7.0
 ATR_TIER_HIGH      = 3.0   # was 5.0
@@ -553,9 +417,9 @@ ATR_TIER_MEDIUM    = 1.5   # was 3.0
 EXTREME_MOMENTUM_STOCKS = ["UGRO", "VCX", "PTLE", "BIAF", "SATL", "ELAB"]
 HIGH_MOMENTUM_STOCKS    = ["QNTM", "MRLN", "DMRA", "RCAX", "ALDX", "NAMM", "PAYP", "SER", "NAUT", "CGV"]
 
-# ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+# ------------------------------------------------------------------------------------------
 # Adaptive Scan Intervals (VIX-Based)
-# ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+# ------------------------------------------------------------------------------------------
 ADAPTIVE_INTERVALS          = True
 SCAN_INTERVAL_EXTREME_VOL   = 3    # VIX > 30
 SCAN_INTERVAL_HIGH_VOL      = 5    # VIX 26-30
@@ -565,10 +429,10 @@ SCAN_INTERVAL_CALM_VOL      = 20   # VIX 15-18
 SCAN_INTERVAL_LOW_VOL       = 30   # VIX < 15
 SCAN_INTERVAL_MIN            = 10  # Default fallback
 
-# ─────────────────────────────────────────────────────────────────
-# Kill Mode — Emergency Capital Protection
+# -----------------------------------------------------------------
+# Kill Mode -- Emergency Capital Protection
 # Triggers a full portfolio close when extreme bear conditions hit.
-# ─────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
 KILL_MODE_VIX_LEVEL    = 40.0   # Absolute VIX level that triggers kill mode (2008/2020: 80+, crash: 40+)
 KILL_MODE_SPY_DROP_PCT =  3.0   # SPY intraday drop from open (%) triggers kill mode
 KILL_MODE_VIX_ROC_PCT  = 50.0   # VIX spike: up >50% in last 5 hours triggers kill mode
@@ -577,6 +441,19 @@ KILL_MODE_TRAIL_PCT    =  0.5   # PDT-safe hairpin trailing stop % placed on tod
 # Market Hours Tuning
 USE_MARKET_HOURS_TUNING    = True
 PREMARKET_SCAN_INTERVAL    = 10
+# 2026-09-01: entry window opens at 09:14 ET now (ENTRY_WINDOW_START_ET) --
+# prep scans (EMA/strategy warm-up, orders still blocked) run 09:05-09:14 so
+# the first executable cycle at 09:14 isn't trading blind.
+PREP_SCAN_START_ET         = "09:05"
+# 2026-09-02, user request ("check all the polling loops start at 9.25AM ET
+# to avoid delays"): once-per-day morning-readiness trigger at 09:25 ET. The
+# main loop forces a fresh scan cycle and kicks the ActiveListRefresher
+# (ti_capture + Alpaca movers + prewarm_entry_ema run immediately) so every
+# polling loop has freshly ticked before the 09:30 open -- EMA signals ready
+# by 09:29, first orders at 09:30. Sits between ENTRY_WINDOW_START_ET (09:14,
+# first executable scan) and MARKET_OPEN (09:30), and is scoped to the morning
+# segment only (the afternoon segment has its own 14:45 reopen trigger).
+MORNING_READINESS_ET = "09:25"
 # 2026-08-24, user request: regular-hours discovery scan every 1 min (was 3) --
 # so a position that exits gets a re-entry shot within the same minute
 # instead of waiting up to 3-5 min, to actually catch a swing back in.
@@ -589,24 +466,24 @@ HIGH_POSITION_INTERVAL   = 1    # was 5 (2026-08-24, user request: every-minute 
 NORMAL_POSITION_INTERVAL = 1    # was 3
 LOW_POSITION_INTERVAL    = 1    # was 2
 
-# ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+# ------------------------------------------------------------------------------------------
 # VIX Rate-of-Change Filter
-# ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+# ------------------------------------------------------------------------------------------
 USE_VIX_ROC_FILTER  = True
 VIX_ROC_THRESHOLD   = 20.0   # Block entries if VIX up >20% in last hour
 VIX_ROC_PERIOD      = 5
 
-# ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+# ------------------------------------------------------------------------------------------
 # Live Trending Discovery
-# ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+# ------------------------------------------------------------------------------------------
 USE_LIVE_TRENDING       = False
 TRENDING_SCAN_INTERVAL  = 60
 TRENDING_MAX_RESULTS    = 20
 TRENDING_MIN_MOMENTUM   = 3.0
 
-# ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+# ------------------------------------------------------------------------------------------
 # Finnhub Integration
-# ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+# ------------------------------------------------------------------------------------------
 USE_FINNHUB_DISCOVERY      = False
 FINNHUB_API_KEY            = os.getenv("FINNHUB_API_KEY", "")
 PRICE_DATA_SOURCE          = os.getenv("PRICE_DATA_SOURCE", "alpaca").strip().lower()
@@ -614,41 +491,18 @@ USE_FINNHUB_HISTORICAL     = PRICE_DATA_SOURCE == "finnhub" or os.getenv("USE_FI
 USE_SENTIMENT_GATE         = False
 SENTIMENT_BULLISH_THRESHOLD = 0.6
 
-# Trade Ideas Discovery
-# Scrapes TIPro highshortfloat + marketscope360 with Selenium.
-# Requires a logged-in Chrome profile (TRADEIDEAS_CHROME_PROFILE) to get real data.
-# Disabled by default — without a profile the scraper only hits the TI login page.
-# To enable: set USE_TRADEIDEAS_DISCOVERY=true and TRADEIDEAS_CHROME_PROFILE=<profile>
-# TRADEIDEAS_BROWSER: "edge" (pre-installed on Windows) or "chrome"
-USE_TRADEIDEAS_DISCOVERY                          = __import__('os').getenv('USE_TRADEIDEAS_DISCOVERY', 'false').lower() == 'true'
-USE_TRADEIDEAS_UNUSUAL_OPTIONS_DISCOVERY         = __import__('os').getenv('USE_TRADEIDEAS_UNUSUAL_OPTIONS_DISCOVERY', 'true').lower() == 'true'
-USE_TRADEIDEAS_TOPLISTS_DISCOVERY                = __import__('os').getenv('USE_TRADEIDEAS_TOPLISTS_DISCOVERY', 'false').lower() == 'true'
-TRADEIDEAS_SCAN_INTERVAL_MIN                     = 10   # regular market hours (9:30-16:00 ET)
-TRADEIDEAS_SCAN_INTERVAL_MIN_AFTER_HOURS         = 60   # pre/post-market, weekends
-TRADEIDEAS_UNUSUAL_OPTIONS_SCAN_INTERVAL_MIN     = 30
-TRADEIDEAS_TOPLISTS_SCAN_INTERVAL_MIN            = 180
-TRADEIDEAS_HEADLESS                              = __import__('os').getenv('TRADEIDEAS_HEADLESS', 'false').lower() == 'true'
-TRADEIDEAS_CHROME_PROFILE                        = __import__('os').getenv('TRADEIDEAS_CHROME_PROFILE', '')
-TRADEIDEAS_BROWSER                                = __import__('os').getenv('TRADEIDEAS_BROWSER', 'edge')
-TRADEIDEAS_UPDATE_CONFIG_FILE                     = True
-# Wait this many seconds for the startup Trade Ideas capture before the first scan.
-# Default 90s preserves fresh TI tickers for the initial universe. Set to 0 only
-# for advanced starts where background TI loading is acceptable.
-STARTUP_TI_CAPTURE_TIMEOUT_S                     = int(__import__('os').getenv('STARTUP_TI_CAPTURE_TIMEOUT_S', '90'))
 # 2026-08-26, user request ("top 20... universe should limit to the latest
 # trade ideas scrapping", then same-day follow-up "keep alpaca movers... top
 # 30 signals together"): this is now the COMBINED cap on (Alpaca-movers queue
-# + TI primary), not TI alone — see get_scan_targets() in equity/scan.py.
-# Movers get priority; TI fills whatever's left, up to this shared ceiling.
-# Keep the active long/short universe broad enough to avoid idle capital.
+# + Yahoo primary), not the scraper alone -- see get_scan_targets() in
+# equity/scan.py. Movers get priority; the Yahoo pool fills whatever is left,
+# up to this shared ceiling. Keep the active long/short universe broad enough
 TI_PRIMARY_SCAN_BATCH_LIMIT                       = int(__import__('os').getenv('TI_PRIMARY_SCAN_BATCH_LIMIT', '30'))
 ACTIVE_SCAN_SNAPSHOT_INTERVAL_MIN                 = int(__import__('os').getenv('ACTIVE_SCAN_SNAPSHOT_INTERVAL_MIN', '10'))
 
-# Sector sympathy scanner — injects peer tickers when a leader stock fires
-USE_SECTOR_SYMPATHY          = False  # disabled — EDGAR 8-K is the primary discovery signal
-SECTOR_SYMPATHY_INTERVAL_MIN = int(os.getenv("SECTOR_SYMPATHY_INTERVAL_MIN", "15"))
+# Sector sympathy scanner -- injects peer tickers when a leader stock fires
 
-# EDGAR 8-K feed scanner — injects tickers from material event filings (free, no auth)
+# EDGAR 8-K feed scanner -- injects tickers from material event filings (free, no auth)
 USE_EDGAR_SCANNER            = os.getenv("USE_EDGAR_SCANNER",    "true").lower() in ("1", "true", "yes")
 EDGAR_SCANNER_INTERVAL_MIN   = int(os.getenv("EDGAR_SCANNER_INTERVAL_MIN",   "10"))
 USE_PREOPEN_INTELLIGENCE     = os.getenv("USE_PREOPEN_INTELLIGENCE", "true").lower() in ("1", "true", "yes")
@@ -657,9 +511,9 @@ PREOPEN_INTELLIGENCE_MAX_TICKERS = int(os.getenv("PREOPEN_INTELLIGENCE_MAX_TICKE
 PREOPEN_USE_REGIME_GATING    = os.getenv("PREOPEN_USE_REGIME_GATING", "true").lower() in ("1", "true", "yes")
 PREOPEN_USE_SENTIMENT_GATING = os.getenv("PREOPEN_USE_SENTIMENT_GATING", "true").lower() in ("1", "true", "yes")
 
-# ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+# ------------------------------------------------------------------------------------------
 # Daily Limits
-# ─────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
 POSITION_CHECK_MIN       = 5
 # 2026-08-28, user request ("don't stop the trading today I want to fix all
 # the issues today"): env-overridable so today's debugging session can raise
@@ -678,23 +532,27 @@ DAILY_PROFIT_TARGET       = 3500.0
 # regardless of this window, same as they already ignore is_market_open.
 # Deliberately a separate, narrower gate from MarketState.is_market_open
 # (07:00-20:00) rather than tightening that shared flag in place --
-# is_market_open also drives allocation-split and options-lull-hours logic
-# that isn't part of this ask.
+# is_market_open also drives allocation-split logic that isn't part of this
+# ask (options-lull-hours logic was removed 2026-09-01 with options trading).
 # 2026-08-22, user request ("Trading hours 9.25am ET to 3.50PM ET"): was
-# "09:30" -- moved 5 min earlier to line up with the TI-scraper's own 09:25
-# ET kickstart run (windows_schedule_ti_capture.ps1), so fresh universe data
-# is already available the moment the entry window opens instead of trading
-# blind for the scraper's first 5 min.
+# "09:30" -- moved 5 min earlier so fresh universe data (now the in-process
+# Yahoo refresh, see DISCOVERY_WINDOW_START_ET below) is already available
+# the moment the entry window opens instead of trading blind at first.
 # 2026-08-27, user request ("fix the stock universe check from ti web
-# scrapping or alpaca movers starting 9:09 ET and perform the 3 min check
-# till 10:30 ET, but don't trade until 9:30 ET"): reverted to actual market
-# open (09:30). The "trade blind" problem this used to dodge is solved
-# properly now instead -- universe discovery (TI capture + Alpaca movers,
-# see DISCOVERY_WINDOW_START_ET / _run_discovery's gating in
-# scan_and_trade()) starts even earlier, at 09:09, giving 7 refresh cycles
-# of warm-up before the entry window opens, rather than shaving the entry
-# window itself 5 minutes into pre-market to make up the difference.
-ENTRY_WINDOW_START_ET = "09:30"
+# scrapping or alpaca movers starting 8:55 ET and perform the 3 min check
+# till 10:30 ET, but don't trade until 9:25 ET"): keep the requested 09:25
+# entry start while allowing discovery to warm up earlier. Universe discovery
+# (Yahoo/TI-primary capture + Alpaca movers, see DISCOVERY_WINDOW_START_ET /
+# _run_discovery's gating in scan_and_trade()) starts at 08:55, giving at
+# least 30 minutes of warm-up before entries are allowed at 09:25.
+# 2026-09-01, user request ("time for entry 9:14AM to 11:00AM and 2:45 PM to
+# 3:50PM ET"): the entry window is now TWO disjoint segments -- 09:14-11:00
+# and 14:45-15:50 -- separated by a midday break (ENTRY_WINDOW_BREAK_START_ET
+# / ENTRY_WINDOW_BREAK_END_ET below) during which the book is hard-flatted
+# (LUNCH_FLAT_TIME_ET) and no entry/re-entry orders are allowed. This is the
+# morning segment's start; PREP_SCAN_START_ET above shifted to 09:05 so the
+# first executable cycle at 09:14 isn't trading blind.
+ENTRY_WINDOW_START_ET = "09:14"
 
 # 2026-08-27, user request (see ENTRY_WINDOW_START_ET above): universe
 # discovery (TI-capture trigger + scan_alpaca_movers, both inside
@@ -702,7 +560,21 @@ ENTRY_WINDOW_START_ET = "09:30"
 # ENTRY_WINDOW_START_ET -- so the scan universe is already warm the moment
 # trading opens. Nothing gated by ENTRY_WINDOW_START_ET (order submission)
 # is affected; see scan_and_trade()'s two-stage gate.
-DISCOVERY_WINDOW_START_ET = "09:09"
+DISCOVERY_WINDOW_START_ET = "08:55"
+# 2026-09-01, user request ("time for entry 9:14AM to 11:00AM and 2:45 PM to
+# 3:50PM ET"): the entry window is now TWO disjoint segments. These two
+# literals are the midday break between them -- the morning segment runs
+# [ENTRY_WINDOW_START_ET, ENTRY_WINDOW_BREAK_START_ET] (09:14-11:00) and the
+# afternoon segment runs [ENTRY_WINDOW_BREAK_END_ET, ENTRY_WINDOW_END_ET]
+# (14:45-15:50). During the break (11:00-14:45) order submission is fully
+# blocked AND the book is hard-flatted (LUNCH_FLAT_TIME_ET below): every
+# position closed and every open order cancelled, per the user's "at 11AM
+# close all positions and open orders, and reenter only at 2:45PM" request.
+# Universe discovery (_within_discovery_window) deliberately keeps running
+# through the break so the afternoon segment trades on a warm universe.
+# Ordering is enforced at import time (see the asserts near EOD_CLOSE_TIME).
+ENTRY_WINDOW_BREAK_START_ET = "11:00"   # morning entry segment ends / lunch flat begins
+ENTRY_WINDOW_BREAK_END_ET   = "14:45"   # afternoon entry segment opens
 # 2026-08-18, user request ("no new buys after 2:45" -- 2:45 PM CDT = 15:45
 # ET -- then same day, refined to "change the eod close time and no trades
 # time to 3:50pm ET... after this no new entry positions only keep the
@@ -715,6 +587,9 @@ DISCOVERY_WINDOW_START_ET = "09:09"
 # be later than EOD_CLOSE_TIME again -- see the assert next to
 # EOD_CLOSE_TIME below, which enforces this at import time instead of
 # trusting the two literals to stay in sync by hand.
+# 2026-09-01: this is now the AFTERNOON entry segment's end (14:45-15:50),
+# still the absolute last cutoff for any entry/re-entry order placement --
+# the enhanced.py re-arm and blocked-entry-expiry gates key on it unchanged.
 ENTRY_WINDOW_END_ET   = "15:50"
 
 # Quarterly Profit Target
@@ -734,9 +609,9 @@ QUARTERLY_PROFIT_TARGET_PCT = 50.0   # Halt new entries once +50% equity this qu
 MARGIN_SAFEGUARD_ENABLED   = True
 MARGIN_CUSHION_MIN_RATIO   = 1.5
 
-# ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+# ------------------------------------------------------------------------------------------
 # Extended Hours Trading
-# ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+# ------------------------------------------------------------------------------------------
 EXTENDED_HOURS   = True
 PREMARKET_START  = "07:00"
 MARKET_OPEN      = "09:30"
@@ -747,21 +622,128 @@ AFTERHOURS_END   = "20:00"
 # market-hours gate when a high-confidence opportunity is spotted.
 FORCE_SCAN = os.getenv("FORCE_SCAN", "false").lower() in ("1", "true", "yes")
 
-# ─────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
+# Midday Lunch Flat
+# -----------------------------------------------------------------
+# 2026-09-01, user request ("at 11AM close all positions and open orders,
+# and reenter only at 2:45PM and again exist all at 3:50"): with the entry
+# window now two disjoint segments (09:14-11:00 + 14:45-15:50, see
+# ENTRY_WINDOW_BREAK_START_ET / ENTRY_WINDOW_BREAK_END_ET above), the book
+# must be FULLY flat through the midday break -- every equity position
+# closed, every open order cancelled, and no re-entry until the afternoon
+# segment opens. Runs from the orchestrator's schedule.every(1).minutes
+# job (_lunch_flat_job); the sweep's own time-of-day gate does the real
+# work. LUNCH_FLAT_TIME_ET is bound to ENTRY_WINDOW_BREAK_START_ET so the
+# flat can never fire before entries stop (assert below).
+LUNCH_FLAT_ENABLED   = True
+LUNCH_FLAT_TIME_ET   = ENTRY_WINDOW_BREAK_START_ET
+
+# -----------------------------------------------------------------
 # EOD (End-of-Day) Position Close
-# Intraday strategies should never be held overnight — close by EOD_CLOSE_TIME
-# ─────────────────────────────────────────────────────────────────
+# Intraday strategies should never be held overnight -- close by EOD_CLOSE_TIME
+# -----------------------------------------------------------------
 EOD_CLOSE_ENABLED    = True
 # 2026-08-18, user request: "change the eod close time and no trades time to
 # 3:50pm ET" -- was 15:45 (10 min/15:50 before that, widened 2026-08-12,
 # tightened back same day as this ask). Only 10 min before the 16:00 close now.
 EOD_CLOSE_TIME       = "15:50"
+# 2026-09-01: the lunch flat must fire exactly when the morning entry segment
+# ends (otherwise the book could stay open into the break) and the two entry
+# segments must not overlap and must both stay inside the final 15:50 cutoff.
+assert LUNCH_FLAT_TIME_ET == ENTRY_WINDOW_BREAK_START_ET, (
+    f"LUNCH_FLAT_TIME_ET ({LUNCH_FLAT_TIME_ET}) must equal ENTRY_WINDOW_BREAK_START_ET ({ENTRY_WINDOW_BREAK_START_ET})"
+)
+assert (
+    ENTRY_WINDOW_START_ET < ENTRY_WINDOW_BREAK_START_ET
+    and ENTRY_WINDOW_BREAK_START_ET <= ENTRY_WINDOW_BREAK_END_ET
+    and ENTRY_WINDOW_BREAK_END_ET <= ENTRY_WINDOW_END_ET
+), (
+    f"entry segments must order START < BREAK_START <= BREAK_END <= END, got "
+    f"START={ENTRY_WINDOW_START_ET} BREAK_START={ENTRY_WINDOW_BREAK_START_ET} "
+    f"BREAK_END={ENTRY_WINDOW_BREAK_END_ET} END={ENTRY_WINDOW_END_ET}"
+)
+# 2026-09-02: the morning-readiness trigger must land inside the morning
+# segment and before the open -- after the first executable scan (09:14),
+# before MARKET_OPEN (09:30), so the forced refresh produces signals that are
+# still fresh at the bell. Fails loudly at import time instead of silently
+# drifting out of the readiness band.
+assert (
+    PREP_SCAN_START_ET < ENTRY_WINDOW_START_ET < MORNING_READINESS_ET < MARKET_OPEN
+), (
+    f"morning readiness must order PREP < ENTRY_START < READINESS < MARKET_OPEN, got "
+    f"PREP={PREP_SCAN_START_ET} ENTRY_START={ENTRY_WINDOW_START_ET} "
+    f"READINESS={MORNING_READINESS_ET} MARKET_OPEN={MARKET_OPEN}"
+)
+# 2026-09-02 red-team pass: every "HH:MM" constant below is strptime'd inside
+# the hot run loop (and _within_discovery_window compares some as raw strings).
+# A single malformed value (typo, OneDrive merge artifact) would NOT crash the
+# process -- the main loop's broad except logs "Main loop error" every tick and
+# starves heartbeats until the watchdog stall-restarts into the same error,
+# i.e. a config-typo restart storm. Validate the format once here, at import
+# time, where a bad value fails loudly with the offending constant's name.
+def _require_hhmm(name: str, value: str) -> None:
+    # Zero-padding is REQUIRED, not stylistic: _within_discovery_window compares
+    # these constants as raw strings, where "9:5" > "10:00" lexicographically
+    # would silently break every window. strptime alone is NOT strict enough
+    # here (it happily parses "9:5").
+    if not isinstance(value, str) or not re.fullmatch(r"\d{2}:\d{2}", value):
+        raise AssertionError(
+            f"{name}={value!r} must be a zero-padded 24-hour 'HH:MM' time string "
+            f"(zero-padding matters: these are also compared as raw strings)"
+        )
+    try:
+        datetime.datetime.strptime(value, "%H:%M")
+    except ValueError:
+        raise AssertionError(f"{name}={value!r} is not a valid 24-hour time (e.g. '25:00')")
+
+for _time_const_name in (
+    "PREP_SCAN_START_ET", "MORNING_READINESS_ET", "DISCOVERY_WINDOW_START_ET",
+    "ENTRY_WINDOW_START_ET", "ENTRY_WINDOW_BREAK_START_ET", "ENTRY_WINDOW_BREAK_END_ET",
+    "ENTRY_WINDOW_END_ET", "PREMARKET_START", "MARKET_OPEN", "MARKET_CLOSE",
+    "AFTERHOURS_END", "EOD_CLOSE_TIME", "LUNCH_FLAT_TIME_ET",
+):
+    _require_hhmm(_time_const_name, globals()[_time_const_name])
 # 2026-08-18: entries must never still be allowed once the EOD close sweep has
 # started -- see ENTRY_WINDOW_END_ET above (the AXTI-at-15:55-ET incident this
 # guards against). Fails loudly at import time instead of silently drifting.
 assert ENTRY_WINDOW_END_ET <= EOD_CLOSE_TIME, (
     f"ENTRY_WINDOW_END_ET ({ENTRY_WINDOW_END_ET}) must be <= EOD_CLOSE_TIME ({EOD_CLOSE_TIME})"
 )
+_market_close_h, _market_close_m = map(int, MARKET_CLOSE.split(":"))
+_eod_close_h, _eod_close_m = map(int, EOD_CLOSE_TIME.split(":"))
+assert ((_market_close_h * 60 + _market_close_m) - (_eod_close_h * 60 + _eod_close_m)) == 10, (
+    f"EOD_CLOSE_TIME ({EOD_CLOSE_TIME}) must be exactly 10 minutes before MARKET_CLOSE ({MARKET_CLOSE})"
+)
+
+# -----------------------------------------------------------------
+# Local coordination state + Loss Guardian + Auto-Deploy (2026-09-02)
+# -----------------------------------------------------------------
+# All cross-process coordination files live OUTSIDE the OneDrive-synced repo,
+# under %LOCALAPPDATA%\ApexTrader\state, so the watchdog (elevated), the bot,
+# the loss guardian, and the agent can hand each other flags without OneDrive
+# sync races between processes at different integrity levels (the
+# .mainbot.lock double-runner incident, 2026-09-02, was exactly that).
+#
+#   flat_request.flag   guardian -> bot: hard daily-loss halt (flatten + block)
+#   deploy_requested.flag  agent/user -> watchdog: restart main.py on new code
+_local_base = os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Local")
+STATE_DIR       = os.path.join(_local_base, "ApexTrader", "state")
+GUARDIAN_FLAT_FILE = os.path.join(STATE_DIR, "flat_request.flag")
+DEPLOY_FLAG_FILE   = os.path.join(STATE_DIR, "deploy_requested.flag")
+
+# Loss Guardian (scripts/guardian.py) -- an independent, always-on backstop on
+# top of the in-bot DAILY_LOSS_LIMIT_* halt. Deliberately NOT tied to the .env
+# DAILY_LOSS_LIMIT_BULL/BEAR_PCT values (which are loose today -- 5%/8% in
+# .env vs the 1%/2% code defaults). ALERT = email + state file; HALT = write
+# flat_request.flag (bot flattens) + guardian flat-sells directly if the bot's
+# heartbeat is stale. Defaults: alert at -0.75%, hard halt at -1.5%.
+GUARDIAN_ALERT_PCT = float(os.getenv("GUARDIAN_ALERT_PCT", "0.75"))
+GUARDIAN_HALT_PCT  = float(os.getenv("GUARDIAN_HALT_PCT", "1.5"))
+GUARDIAN_STALE_HEARTBEAT_SEC = int(os.getenv("GUARDIAN_STALE_HEARTBEAT_SEC", "300"))
+# Guardian only takes flatten action inside this ET band (the bot has reset its
+# daily baseline by 09:35 ET and the day is over after 15:50).
+GUARDIAN_POLL_START_ET = os.getenv("GUARDIAN_POLL_START_ET", "09:35")
+GUARDIAN_POLL_END_ET   = os.getenv("GUARDIAN_POLL_END_ET",   "15:50")
 EOD_CLOSE_STRATEGIES = {         # Strategy names that must be closed same day
     "FloatRotation",
     "GapBreakout",
@@ -773,21 +755,21 @@ EOD_CLOSE_STRATEGIES = {         # Strategy names that must be closed same day
     "EarlySqueeze",
 }
 
-# ─────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
 # Guardrail-Fail Overnight Exit
 # 2026-08-12, user request: force-close ANY open position (any strategy, not
 # just EOD_CLOSE_STRATEGIES) that currently fails the standard liquidity/
-# quality guardrails — avg daily volume, float shares, market cap (same
+# quality guardrails -- avg daily volume, float shares, market cap (same
 # thresholds the live scanner uses: MIN_AVG_DAILY_VOLUME_REGULAR_HOURS,
 # MIN_FLOAT_SHARES, MIN_MARKET_CAP). Only names that still pass those
 # guardrails get held after-hours/overnight. Originally 15:55 (5 min before
 # close); aligned to EOD_CLOSE_TIME same day at the user's request so both
 # EOD closes fire together.
-# ─────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
 GUARDRAIL_EOD_CLOSE_ENABLED = False  # 2026-08-23, user request: disabled, no longer relevant
 GUARDRAIL_EOD_CLOSE_TIME    = EOD_CLOSE_TIME   # fires alongside close_eod_positions
 
-# ─────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
 # Price Drift Stop (30-min check, same-day entries only)
 # 2026-08-13, user request: this morning's losses shared a common pattern --
 # bought right after the open on a gap/momentum signal, then faded back as
@@ -825,13 +807,13 @@ GUARDRAIL_EOD_CLOSE_TIME    = EOD_CLOSE_TIME   # fires alongside close_eod_posit
 # is expected to tolerate more than 1% noise on the way to a bigger target,
 # and scoping by entry date, not strategy, survives the strategy-name loss a
 # process restart causes (see _rebuild_entry_log_from_orders).
-# ─────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
 PRICE_DRIFT_STOP_ENABLED       = False  # 2026-08-22, user request: disabled -- replaced by the flat/profit-scaled trailing stop (TRAIL_STOP_PCT) and a separate 1-min "isn't moving" check
 PRICE_DRIFT_STOP_PCT           = 1.0    # % adverse move vs. EITHER entry OR the price PRICE_DRIFT_LOOKBACK_MIN ago that triggers an exit
 PRICE_DRIFT_CHECK_INTERVAL_MIN = 10     # how often the check runs, in step with the TI screener run
 PRICE_DRIFT_LOOKBACK_MIN       = 30     # how far back the comparison price is from ("price from 30 min ago")
 
-# ─────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
 # Stagnant Position Stop -- independent fast-loop exit check, polled every
 # STAGNANT_STOP_CHECK_INTERVAL_MIN (1 min). 2026-08-22 through 2026-08-25
 # this ran an EMA15 close-cross rule (check_ema15_exit, entry-anchored
@@ -859,10 +841,10 @@ STAGNANT_STOP_CHECK_INTERVAL_MIN  = 1
 # check_blocked_entries_ema stay on the original 1-min cadence, since
 # neither has this same "resting broker order could fill any second" risk
 # profile (see engine/orchestrator.py's _start_software_stop_thread).
-PENDING_ENTRY_RECHECK_SEC = 10
+PENDING_ENTRY_RECHECK_SEC = int(os.getenv("PENDING_ENTRY_RECHECK_SEC", "5"))
 PROTECTION_LIMIT_REPLACE_AFTER_SEC = 10
 
-# ─────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
 # EMA Trend Alignment Filter -- 2026-08-22, user request: "ensure the trend
 # is in the way trade is intended" before entering, checked alongside the
 # trail-buy entry. Simplified to an EMA's own slope on 1-min bars: this
@@ -881,8 +863,13 @@ PROTECTION_LIMIT_REPLACE_AFTER_SEC = 10
 # _check_ema_trend_alignment's own docstring for both current conditions.
 EMA_TREND_FILTER_ENABLED = True
 EMA_TREND_MIN_BARS       = 10  # need at least this many 1-min bars before trusting EMA7's slope
-EMA_ENTRY_CONFIRM_SEC    = 10  # minimum time between the two required EMA passes
+EMA_ENTRY_CONFIRM_SEC    = 60  # legacy; entry confirmation now uses closed 1-min candles, not 10s polling
 EMA_ENTRY_CONFIRM_CHECKS = 2
+EMA_ENTRY_MIN_SPREAD_PCT = float(os.getenv("EMA_ENTRY_MIN_SPREAD_PCT", "0.10"))
+EMA_ENTRY_MIN_TRAILING_30M_RETURN_PCT = float(os.getenv("EMA_ENTRY_MIN_TRAILING_30M_RETURN_PCT", "0.20"))
+REENTRY_SIZE_REDUCTION_PCT = float(os.getenv("REENTRY_SIZE_REDUCTION_PCT", "30.0"))
+LOSS_BLOCK_MORNING_END_ET = os.getenv("LOSS_BLOCK_MORNING_END_ET", "10:30")
+SYMBOL_DAILY_LOSS_BLOCK_COUNT = int(os.getenv("SYMBOL_DAILY_LOSS_BLOCK_COUNT", "2"))
 
 # check_blocked_entries_ema -- 2026-08-25, user request: "each blocked
 # trade should wait for next minute recheck not to completely discard the
@@ -915,7 +902,7 @@ EMA_ENTRY_CONFIRM_CHECKS = 2
 # itself, on top of the peak-tracking already giving the trade room to run.
 EMA9_TRAIL_PCT = 0.5
 
-# ─────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
 # Swing/Multi-Day Drift Stop -- wider sibling of the price drift stop above,
 # for positions NOT covered by it. check_price_drift_stop() only watches
 # same-day entries (entry_log[sym]['date'] == today); anything older is
@@ -933,23 +920,23 @@ EMA9_TRAIL_PCT = 0.5
 # pattern as the price drift stop (see _schedule_on_clock_grid in
 # orchestrator.py) -- 30 min is plenty for a multi-day thesis, no need for
 # 10-min granularity here.
-# ─────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
 SWING_DRIFT_STOP_ENABLED             = True
 SWING_DRIFT_STOP_PCT                 = 3.0   # % adverse move vs. entry price alone that trims a MULTI-DAY position
 SWING_DRIFT_STOP_CHECK_INTERVAL_MIN  = 30
 
-# ─────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
 # Swing Position Staleness Exit
 # Positions held by strategies NOT in EOD_CLOSE_STRATEGIES (Momentum,
 # Technical, etc.) are meant to ride a trend via the GTC trailing stop rather
 # than close same-day. But a position that just grinds sideways/down for days
-# without reaching SWING_STALE_MIN_GAIN_PCT% is dead capital — close it out.
-# ─────────────────────────────────────────────────────────────────
+# without reaching SWING_STALE_MIN_GAIN_PCT% is dead capital -- close it out.
+# -----------------------------------------------------------------
 SWING_STALE_EXIT_ENABLED  = True
 SWING_STALE_DAYS          = 5     # calendar days held before the check applies
 SWING_STALE_MIN_GAIN_PCT  = 3.0   # required unrealized gain % by SWING_STALE_DAYS
 
-# ─────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
 # No-Gain 24h Exit
 # If a position hasn't decided which way it's going within N hours of entry,
 # stop waiting: exit on ANY positive gain (don't hold out for more once it's
@@ -958,22 +945,22 @@ SWING_STALE_MIN_GAIN_PCT  = 3.0   # required unrealized gain % by SWING_STALE_DA
 # every scan cycle (not once/day) since the N-hour mark can fall mid-session.
 # Was 24h / no downside cutoff (positive-only exit) until 2026-08-11, tightened
 # to 8h with a -1.5% loss cutoff at the user's request.
-# ─────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
 NO_GAIN_EXIT_ENABLED     = True
 NO_GAIN_EXIT_HOURS       = 8      # hours held before the check applies (was 24)
 NO_GAIN_EXIT_MIN_PCT     = 0.0    # gain above this exits (must be <= this, and > max-loss, to survive)
-NO_GAIN_EXIT_MAX_LOSS_PCT = -1.5  # loss at or below this also exits (new — was no downside cutoff)
+NO_GAIN_EXIT_MAX_LOSS_PCT = -1.5  # loss at or below this also exits (new -- was no downside cutoff)
 
-# ─────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
 # After-Hours Software Stop-Loss
 # Alpaca's broker-side GTC trailing stop is only evaluated during regular
-# hours (09:30-16:00 ET) — a position can free-fall pre-market/after-hours
+# hours (09:30-16:00 ET) -- a position can free-fall pre-market/after-hours
 # with the resting stop order sitting inert. This actively checks every open
 # position's loss against its stop % (same tier as the trailing stop) while
 # the market isn't in regular hours, and force-closes via an extended-hours
 # marketable limit order (plain market orders are rejected outside regular
 # hours too).
-# ─────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
 AFTERHOURS_STOP_CHECK_ENABLED = True
 AFTERHOURS_CHASE_STALE_SECONDS = 45  # re-chase (cancel + resubmit at fresh price) if the close sits unfilled this long
 # 2026-08-24, user request: no post-loss re-entry cooldown anymore (was 1440min /
@@ -982,26 +969,25 @@ AFTERHOURS_CHASE_STALE_SECONDS = 45  # re-chase (cancel + resubmit at fresh pric
 
 # Stale order upgrade: unfilled orders older than this get re-submitted as market/limit
 STALE_ORDER_MINUTES          = 360  # minutes before an unfilled order is considered stale
-STALE_ORDER_MINUTES_INTRADAY =  30  # intraday strategies (ORB, surge, etc.) — cancel if unfilled after 30 min
+STALE_ORDER_MINUTES_INTRADAY =  30  # intraday strategies (ORB, surge, etc.) -- cancel if unfilled after 30 min
 
-# ─────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
 # PDT Rules
-# ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+# ------------------------------------------------------------------------------------------
 PDT_ACCOUNT_MIN = 25000.0
 PDT_MAX_TRADES  = 3
-PDT_OPTIONS_DAY_TRADE_RESERVE = int(os.getenv("PDT_OPTIONS_DAY_TRADE_RESERVE", "1"))  # keep at least N day trades free for stock exits
 
-# Alpaca (Reg T) hard minimum equity to short at all — confirmed 2026-08-07:
+# Alpaca (Reg T) hard minimum equity to short at all -- confirmed 2026-08-07:
 # every short order was rejected with "account is not allowed to short"
 # (code 40310000) regardless of symbol, despite the account's Shorting
 # Enabled toggle being on; the account's equity (~$1,000, per the quarterly
-# baseline) is simply under this floor. Not configurable per-account by us —
+# baseline) is simply under this floor. Not configurable per-account by us --
 # it's the broker's own regulatory minimum.
 MIN_EQUITY_FOR_SHORT = 2000.0
 
-# ─────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
 # Email Notifications
-# ─────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
 USE_EMAIL_NOTIFICATIONS = os.getenv("USE_EMAIL_NOTIFICATIONS", "false").lower() in ("1", "true", "yes")
 EMAIL_SMTP_SERVER       = os.getenv("EMAIL_SMTP_SERVER", "smtp.gmail.com")
 EMAIL_SMTP_PORT         = int(os.getenv("EMAIL_SMTP_PORT", "587"))
@@ -1015,7 +1001,7 @@ EMAIL_SCAN_SEND_ON_CHANGE   = os.getenv("EMAIL_SCAN_SEND_ON_CHANGE", "true").low
 
 # Enterprise Risk Controls (environment-overridable)
 MIN_BUYING_POWER_PCT  = float(os.getenv("MIN_BUYING_POWER_PCT", "5.0"))   # Reserve this % of equity as free buffer (never spend it)
-MIN_POSITION_DOLLARS  = float(os.getenv("MIN_POSITION_DOLLARS", "5"))   # Minimum trade size in $ — skip if downsized below this
+MIN_POSITION_DOLLARS  = float(os.getenv("MIN_POSITION_DOLLARS", "5"))   # Minimum trade size in $ -- skip if downsized below this
 PDT_WARN_AT_REMAINING = int(os.getenv("PDT_WARN_AT_REMAINING", "1"))      # Warn log when PDT trades remaining falls to this level
 
 # Small account smart sizing (for ~$1k buying power)
@@ -1043,11 +1029,11 @@ HMM_REGIME_CONFIDENCE_BOOST     = 0.03  # added to confidence when aligned
 
 # Parallel Scanning
 SCAN_WORKERS        = 16   # Threads scanning symbols concurrently. Was capped at 8 to stay below
-                            # alpaca-py's default urllib3 pool_maxsize=10 — obsolete now that
+                            # alpaca-py's default urllib3 pool_maxsize=10 -- obsolete now that
                             # mount_wide_pool() (engine/utils/bars.py) raises the pool to 20 on
                             # both the stock and option data clients (2026-08-11). Faster full-
                             # universe scan completion = less time between a mover appearing and
-                            # us actually checking it — pure throughput, doesn't change what gets
+                            # us actually checking it -- pure throughput, doesn't change what gets
                             # traded, so it's not another variable in reading tomorrow's results.
 SCAN_SYMBOL_TIMEOUT = 15   # Max seconds per symbol before it is skipped
 
@@ -1068,35 +1054,35 @@ POLLER_CHECK_WORKERS = 8
 # SCAN_MAX_SYMBOLS: unused as of 2026-08-26. Used to cap a much larger
 # multi-source combined universe (EDGAR/sympathy/movers/watchlist + an
 # ~80-symbol rotating fallback list on top of the TI batch) that
-# get_scan_targets() (engine/equity/scan.py) no longer assembles — the scan
+# get_scan_targets() (engine/equity/scan.py) no longer assembles -- the scan
 # universe is just the top TI_PRIMARY_SCAN_BATCH_LIMIT tickers from
 # ti_primary.json now, so every cycle scans all of them, no rotation/cap
 # needed. Left defined (not deleted) in case that assembly comes back.
 SCAN_MAX_SYMBOLS    = 150
 BEAR_SHORT_TARGET_RESERVE = 30  # In bear regime, reserve more scan slots for short universe backups
 
-# ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+# ------------------------------------------------------------------------------------------
 # Strategy Parameters
-# ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
-# ─────────────────────────────────────────────────────────────────
-# Strategy enable/disable toggles — 2026-08-14, at the user's request:
+# ------------------------------------------------------------------------------------------
+# -----------------------------------------------------------------
+# Strategy enable/disable toggles -- 2026-08-14, at the user's request:
 # backtested every strategy's matched entry/exit trades since each went
 # live, bucketed by confidence (same methodology as VWAP_FADE_ENABLED
 # below). User's rule: disable anything with an overall win rate below
-# VWAPFade's own 37% (already disabled) — EXCEPT don't judge a strategy
+# VWAPFade's own 37% (already disabled) -- EXCEPT don't judge a strategy
 # on fewer than 10 completed trades, too early to call. Confidence
-# gating doesn't rescue either of the two that clear that bar — same
+# gating doesn't rescue either of the two that clear that bar -- same
 # finding as VWAPFade, no winning bucket even at their own ceiling:
 #   Momentum           n=25  20% win  -1.73% avg  (worst bucket, 90%+: -2.19%)
 #   PreMarketMomentum  n=25  32% win  -1.60% avg  (90%+: -1.47%)
-# Below the n=10 floor — win rate not trustworthy yet, left enabled:
+# Below the n=10 floor -- win rate not trustworthy yet, left enabled:
 #   Sentiment          n=9   22% win  +0.54% avg
 #   LiquiditySweep     n=4   25% win  -0.80% avg
 #   PMHighBreakout     n=3   33% win  -2.82% avg
 #   Technical          n=3    0% win  -3.33% avg
 #
 # 2026-08-15 update: a fuller loss-attribution pass (371 matched trades,
-# all strategies, since inception) put FloatRotation at n=41, 39% win —
+# all strategies, since inception) put FloatRotation at n=41, 39% win --
 # clear of the 37% line on win rate alone, but still net -$33.31, the
 # second-worst dollar loser after VWAPFade, and its worst trades (DFSC
 # -27%, BNRG -8.6%) were the clearest examples of the "chasing an
@@ -1105,7 +1091,7 @@ BEAR_SHORT_TARGET_RESERVE = 30  # In bear regime, reserve more scan slots for sh
 # Strategy code and tuning params below are untouched for all of these;
 # flip a flag to True to re-enable / False to disable. See
 # scripts/test_strategy_toggles.py.
-# ─────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
 MOMENTUM_ENABLED            = False
 SENTIMENT_ENABLED           = True
 LIQUIDITY_SWEEP_ENABLED     = True
@@ -1117,12 +1103,12 @@ FLOAT_ROTATION_ENABLED      = False
 TECHNICAL = {
     "rsi_oversold":   30,
     "rsi_overbought": 70,
-    "volume_surge":   2.0,   # was 1.5 — stronger volume required
+    "volume_surge":   2.0,   # was 1.5 -- stronger volume required
 }
 
 MOMENTUM = {
-    "min_momentum": 4.0,   # 4%+ move required (was 5 — too tight)
-    "volume_surge": 2.5,   # 2.5x volume confirmation (was 3 — too tight)
+    "min_momentum": 4.0,   # 4%+ move required (was 5 -- too tight)
+    "volume_surge": 2.5,   # 2.5x volume confirmation (was 3 -- too tight)
 }
 
 SENTIMENT_STRATEGY = {
@@ -1132,18 +1118,18 @@ SENTIMENT_STRATEGY = {
     "volume_surge": 2.0,
 }
 
-# ─────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
 # Gap Breakout Strategy
-# ─────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
 GAP_BREAKOUT = {
     "min_gap_pct":       5.0,   # Minimum gap-up % from prior close
-    "volume_multiplier": 2.5,   # Recent vol must be > X * session avg (raised from 1.5 — x1.5 was noise-level)
+    "volume_multiplier": 2.5,   # Recent vol must be > X * session avg (raised from 1.5 -- x1.5 was noise-level)
     "entry_window_min":  90,    # Only enter within first 90 min of open
 }
 
-# ─────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
 # Opening Range Breakout (ORB) Strategy
-# ─────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
 ORB = {
     "range_minutes":       15,   # ORB formed in first 15 min (9:30-9:45)
     "entry_start_min":     15,   # Start looking for breakouts after ORB forms
@@ -1152,16 +1138,16 @@ ORB = {
     "volume_surge":        2.0,  # Post-ORB vol must be > 2.0x ORB avg (raised from 1.5)
 }
 
-# ─────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
 # VWAP Reclaim Strategy
-# ─────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
 VWAP_RECLAIM = {
     "volume_surge": 2.0,   # Volume in last 3 bars vs session avg
     "rsi_max":      72,    # Don't enter if already overbought
 }
 
-# ─────────────────────────────────────────────────────────────────
-# VWAP Fade Strategy (mean reversion — counter-play to VWAP Reclaim's
+# -----------------------------------------------------------------
+# VWAP Fade Strategy (mean reversion -- counter-play to VWAP Reclaim's
 # continuation bet, for range/chop days where continuation entries just
 # grind into stops)
 #
@@ -1174,7 +1160,7 @@ VWAP_RECLAIM = {
 # value for this strategy's outcomes, so gating it higher (the user's
 # original ask was ">=95%, and it's never logged above 90% anyway) can't
 # fix it. See scripts/test_vwap_fade_disabled.py.
-# ─────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
 VWAP_FADE_ENABLED = False
 VWAP_FADE = {
     "zscore_threshold": 1.5,   # price must be this many session std-devs from VWAP
@@ -1182,34 +1168,34 @@ VWAP_FADE = {
     "reversal_bars":    5,     # bars looked back for a "already turning" tick
 }
 
-# ─────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
 # Liquidity Sweep Continuation Strategy ("stop hunt" reversal)
 # A recent swing high/low gets briefly violated (the stops resting there get
 # taken out), price closes back on the original side, then confirms with a
 # Break of Structure back in the original trend direction. Distinct from
-# ORB/TrendBreaker (which trade the breakout itself) — this trades the
+# ORB/TrendBreaker (which trade the breakout itself) -- this trades the
 # fakeout-then-reversal.
-# ─────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
 LIQUIDITY_SWEEP = {
     "swing_lookback_bars": 30,    # bars used to establish the prior swing high/low ("liquidity pool")
     "swing_exclude_bars":  5,     # most-recent bars excluded from swing calc, then searched for the sweep + BOS
     "sweep_buffer_pct":    0.05,  # min % beyond the swing level to count as a genuine sweep, not noise
     "bos_buffer_pct":      0.05,  # min % beyond the confirming level to count as a genuine break of structure
-    "volume_surge":        1.5,  # the BOS move needs above-average volume — real participation, not drift
+    "volume_surge":        1.5,  # the BOS move needs above-average volume -- real participation, not drift
 }
 
-# ─────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
 # Float Rotation Strategy
-# ─────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
 FLOAT_ROTATION = {
     "max_float_shares":   15_000_000,  # Only stocks with float < 15M shares
     "volume_float_ratio": 0.25,        # Today's volume already > 25% of float
     "min_price_up_pct":   5.0,         # Price must be up >5% on the day
 }
 
-# ─────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
 # Early Momentum / Opening Strategies
-# ─────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
 PRE_MARKET_MOMENTUM = {
     "min_gap_pct":       3.0,   # Gap from prior close must be >= 3%
     "pm_vol_pct_of_avg": 15.0,  # Pre-market volume must be >= 15% of avg daily vol
@@ -1238,33 +1224,33 @@ EARLY_SQUEEZE = {
     "rsi_max":           75,           # Not yet overbought
 }
 
-# ─────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
 # Bear Breakdown Strategy (short-selling)
 # Fires only in bear regime (SPY < 200SMA). Inverse of TrendBreaker.
-# ─────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
 BEAR_BREAKDOWN = {
-    "volume_multiplier":  1.5,   # Volume today vs 20-day avg (raised from 1.2 — filters x1.3/x1.4 noise)
+    "volume_multiplier":  1.5,   # Volume today vs 20-day avg (raised from 1.2 -- filters x1.3/x1.4 noise)
     "rsi_max":           65,    # Allow earlier distribution entries before full trend extension
-    "rsi_min":           30,    # Raised from 20 — avoid shorting deeply oversold stocks (bounce risk)
+    "rsi_min":           30,    # Raised from 20 -- avoid shorting deeply oversold stocks (bounce risk)
     "above_sma_min_days": 1,    # Loosen freshness requirement in fast bear tapes
     "breakdown_buffer_pct": 0.30,  # Allow entry if within 0.30% above 10-day low
 }
 
-# ─────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
 # Golden Ratio Scanner Guardrails
-# ─────────────────────────────────────────────────────────────────
-RVOL_MIN                 = 1.5         # Require relative volume ≥ 1.5x before entering
+# -----------------------------------------------------------------
+RVOL_MIN                 = 1.5         # Require relative volume >= 1.5x before entering
 MIN_STOCK_PRICE          = 2.0         # Skip penny stocks below $2 (poor fill quality, high spread)
 ALPACA_MOVER_SCAN_INTERVAL_MIN = 10   # Re-poll Alpaca screener every 10 min (resets at market open)
-MIN_DOLLAR_VOLUME        = 1_000_000   # Skip illiquid setups: price × day_vol < $1M
+MIN_DOLLAR_VOLUME        = 1_300_000   # 30% tighter 2026-08-31: skip price * day_vol < $1.3M
 # Low-float / thin-volume floors for scan-time entry eligibility.
 # 2026-08-23, user request: collapsed the old two-layer system (a separate
 # absolute "hard floor" plus a session-gated regular/pre-after-hours floor,
 # with a first-hour delay on top) into one flat rule applied the same
-# regardless of time of day: float > 10M, avg daily volume >= 700K. See
+# regardless of time of day: float > 13M, avg daily volume >= 910K. See
 # _passes_guardrails in scan.py.
-MIN_FLOAT_SHARES_REGULAR_HOURS = 10_000_000  # single flat float floor now, no session/time gating
-MIN_AVG_DAILY_VOLUME_REGULAR_HOURS = 700_000  # single flat volume floor now, no session/time gating
+MIN_FLOAT_SHARES_REGULAR_HOURS = 13_000_000  # 30% tighter 2026-08-31: single flat float floor, no session/time gating
+MIN_AVG_DAILY_VOLUME_REGULAR_HOURS = 910_000  # 30% tighter 2026-08-31: single flat volume floor, no session/time gating
 
 # 2026-08-18, user request: 200M (the BIOA-driven pre-open/after-hours floor)
 # was inconsistent with the two OTHER floors already gating the same names --
@@ -1304,7 +1290,7 @@ MIN_FLOAT_SHARES         = 50_000_000  # close_guardrail_fail_positions' overnig
 # already built. This just stops the entry-side gate from being stricter
 # than the exit-side one when the position is getting flattened by the
 # close regardless of how it got in.
-TRADE_THIN_LIQUIDITY_REJECTS     = True   # master switch for this path — enabled 2026-08-12 at the user's request
+TRADE_THIN_LIQUIDITY_REJECTS     = True   # master switch for this path -- enabled 2026-08-12 at the user's request
 THIN_LIQUIDITY_POSITION_SIZE_PCT = 4.0    # scaled 3.0 -> 4.0 2026-08-17 with the 7.5->10% base
 
 # 2026-08-15, user request: idea #2 of six suggested improvements. Measured
@@ -1345,6 +1331,28 @@ THIN_LIQUIDITY_EXCLUDED_STRATEGIES = {"ORB", "GapBreakout"}
 # conditions apply together, not as alternatives: EMA slope gates entry
 # eligibility at signal time, this trail % gates the actual fill price.
 REENTRY_TRAIL_PCT = 0.25
+
+# 2026-08-31: hard duplicate-entry debounce. Live RBLX submitted twice within
+# ~9 seconds, which means broker/order-cache state can lag the fast poller.
+# Block same-symbol entry submits briefly after Alpaca accepts one.
+DUPLICATE_ENTRY_BLOCK_SECONDS = 60
+
+# -----------------------------------------------------------------
+# Staged allocation (25% x 4), never adding while losing.
+# 2026-08-31, user request: instead of one full-size entry order, scale in
+# over STAGED_ALLOCATION_TRANCHES equal tranches (default 4 x 25%). The first
+# tranche is submitted at signal time; each subsequent tranche is added by the
+# periodic poller (PENDING_ENTRY_RECHECK_SEC cadence) ONLY while the position
+# is not losing (unrealized gain
+# strictly above STAGED_ALLOCATION_MIN_GAIN_PCT) and the same fresh EMA entry
+# gate still aligns -- "never adding while losing" is enforced by the gain
+# requirement, and the fresh-EMA-check-immediately-before-each-tranche rule is
+# enforced by re-running _check_ema_trend_alignment right before each add.
+# -----------------------------------------------------------------
+STAGED_ALLOCATION_ENABLED      = os.getenv("STAGED_ALLOCATION_ENABLED", "true").lower() in ("1", "true", "yes")
+STAGED_ALLOCATION_TRANCHES     = int(os.getenv("STAGED_ALLOCATION_TRANCHES", "4"))
+STAGED_ALLOCATION_MIN_GAIN_PCT = float(os.getenv("STAGED_ALLOCATION_MIN_GAIN_PCT", "0.0"))  # never add while losing: require gain > this
+STAGED_ALLOCATION_MAX_ADD_PCT  = float(os.getenv("STAGED_ALLOCATION_MAX_ADD_PCT", "25.0"))  # each add is this % of the ORIGINAL full size
 
 # 2026-08-14, user request: "I told ones which fail guard will be traded too
 # but with lower portfolio limit" -- extending the same trade-anyway-at-
@@ -1436,19 +1444,19 @@ GAP_CHASE_CONSOL_BARS    = 5          # Number of 1-min bars to check for tight 
 # to reactivate if the no-guard month looks worse.
 GAP_CHASE_GUARD_ENABLED  = False
 
-# Momentum entry freshness — reject a gap/momentum signal if price has already
+# Momentum entry freshness -- reject a gap/momentum signal if price has already
 # faded off its recent high by the time the order is about to be submitted.
 # Different axis from GAP_CHASE (which gates on gap SIZE, still disabled
 # above): the 2026-08-11 case studies (ACHR, PLUG, CLSK, SOUN) all faded
-# before or shortly after fill despite gaps ranging 5.5%-27.9% — magnitude
+# before or shortly after fill despite gaps ranging 5.5%-27.9% -- magnitude
 # didn't predict it, timing did. Scan cadence (3-5min) plus limit-order fill
 # lag means the move can already be rolling over by the time execution
 # happens, seconds to minutes after the signal fired.
 # ponytail: MOMENTUM_FRESHNESS_MAX_PULLBACK_PCT and _LOOKBACK_MIN below are a
-# first-pass estimate sized against those 4 case studies, not a backtest —
+# first-pass estimate sized against those 4 case studies, not a backtest --
 # PLUG's costlier 2nd entry (-$8.49, 6.1% off its 30-min high at fill) would
 # have been caught at these settings; CLSK's slow multi-hour bleed (which
-# never showed a sharp pullback right at entry) would not — this targets a
+# never showed a sharp pullback right at entry) would not -- this targets a
 # sharp reversal, not a gradual one. Revisit with real win/loss data once
 # it's run for a while, same experiment shape as GAP_CHASE_GUARD_ENABLED.
 MOMENTUM_FRESHNESS_ENABLED          = True
@@ -1477,7 +1485,7 @@ MOMENTUM_FRESHNESS_STRATEGIES       = {
 MOMENTUM_FRESHNESS_LOOKBACK_MIN     = 30   # minutes of recent bars to find the high against
 MOMENTUM_FRESHNESS_MAX_PULLBACK_PCT = 5.0  # reject if price has faded more than this % off that high
 
-USE_MARKET_REGIME_FILTER = True       # SPY below 200-day MA → cut signals to 1
+USE_MARKET_REGIME_FILTER = True       # SPY below 200-day MA -> cut signals to 1
 MAX_LONG_ENTRIES_PER_CYCLE  = 12      # Maximum successful long entries attempted per scan cycle
 MAX_SHORT_ENTRIES_PER_CYCLE = 12      # Maximum successful short entries attempted per scan cycle
 MARKET_REGIME_SIGNALS_CAP   = MAX_LONG_ENTRIES_PER_CYCLE  # Bear-regime long cap (swap-only)
@@ -1486,18 +1494,18 @@ LOW_PRIORITY_SCAN_SYMBOLS   = {
     "QLD", "META", "AAPL", "AMZN", "NFLX", "GOOGL", "NVDA", "AMD",
     "AVGO", "PLTR", "ORCL", "MSFT", "ARM", "SMCI", "MU", "TSM", "MRVL", "AI", "SPCX",
 }
-ATR_STOP_MULTIPLIER      = 1.5        # Stop loss = entry − ATR × 1.5
-ATR_TP_RATIO             = 2.0        # Take-profit at 2:1 R:R (risk × 2)
+ATR_STOP_MULTIPLIER      = 1.5        # Stop loss = entry - ATR -- 1.5
+ATR_TP_RATIO             = 2.0        # Take-profit at 2:1 R:R (risk -- 2)
 MAX_SHORT_FLOAT_PCT      = 20.0       # Never exceed this % of equity per squeeze ticker
 
-# Bear short scan supplement — liquid large/mid caps with clean SMA structure that
+# Bear short scan supplement -- liquid large/mid caps with clean SMA structure that
 # BearBreakdownStrategy and TechnicalStrategy can fire on during a bear regime.
 # These stocks have stable 20/50 SMA patterns and meaningful distribution moves.
 BEAR_SHORT_UNIVERSE = [
     "NVDA", "AMD", "TSLA", "META", "AMZN", "AAPL", "MSFT", "NFLX",
     "PLTR", "MSTR", "COIN", "SMCI", "SNOW", "CRM", "CRWD", "NET",
     "ARKK", "SOXS", "LABD",   # sector ETFs (can be shorted directly)
-    "MARA", "WULF", "CLSK",   # crypto miners — high-beta bear breakdowns
+    "MARA", "WULF", "CLSK",   # crypto miners -- high-beta bear breakdowns
     "IONQ", "RGTI", "QUBT",   # quantum/AI overhyped names
 ]
 HIGH_SHORT_FLOAT_STOCKS  = {
@@ -1579,10 +1587,10 @@ HIGH_SHORT_FLOAT_STOCKS  = {
 # Remove any DELISTED_STOCKS entries that crept into HIGH_SHORT_FLOAT_STOCKS
 HIGH_SHORT_FLOAT_STOCKS = {s for s in HIGH_SHORT_FLOAT_STOCKS if s not in DELISTED_STOCKS}
 
-# Live HSF lookup — merges the static set above with tier-2 universe.json entries
+# Live HSF lookup -- merges the static set above with tier-2 universe.json entries
 # so newly TI-scraped tickers are recognised as HSF without restarting the bot.
 _hsf_tier2_cache: dict = {"ts": 0.0, "symbols": frozenset()}
-_HSF_CACHE_TTL = 300  # 5 minutes — re-read universe.json at most every 5 min
+_HSF_CACHE_TTL = 300  # 5 minutes -- re-read universe.json at most every 5 min
 
 def is_high_short_float(symbol: str) -> bool:
     """Return True if symbol is in the static HSF set OR in the live tier-2 universe."""
@@ -1600,7 +1608,6 @@ def is_high_short_float(symbol: str) -> bool:
     return symbol in _hsf_tier2_cache["symbols"]
 
 # OOM and cache management
-OPTIONS_CHAIN_CACHE_MAX = int(os.getenv("OPTIONS_CHAIN_CACHE_MAX", "300"))  # max symbols in options chain cache
 
 # Global memory warning threshold (in MB)
 MEMORY_WARN_MB = int(os.getenv("MEMORY_WARN_MB", "1500"))

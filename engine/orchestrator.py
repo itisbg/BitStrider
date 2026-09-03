@@ -1,19 +1,18 @@
 """
-ApexTrader orchestrator — Stage 3 refactor.
+ApexTrader orchestrator -- Stage 3 refactor.
 
 scan_and_trade() decomposed into focused private functions:
-  _run_options_cycle()     — options monitor + new entries
-  _run_discovery()         — all universe refresh sources
-  _resolve_market_regime() — regime detection with safe fallback
-  _build_scan_targets()    — universe assembly + position filtering
-  _filter_eligible()       — confidence gate + long-only enforcement
-  _log_skipped()           — skip diagnostics for top-10 non-qualifiers
-  _execute_bear_plan()     — bear regime: 1 swap-long + N shorts with cooldown
-  _execute_bull_plan()     — bull regime: top-N by confidence
-  _build_short_queue()     — pre-screen shorts (tradability + cooldown)
+  _run_discovery()         -- all universe refresh sources
+  _resolve_market_regime() -- regime detection with safe fallback
+  _build_scan_targets()    -- universe assembly + position filtering
+  _filter_eligible()       -- confidence gate + long-only enforcement
+  _log_skipped()           -- skip diagnostics for top-10 non-qualifiers
+  _execute_bear_plan()     -- bear regime: 1 swap-long + N shorts with cooldown
+  _execute_bull_plan()     -- bull regime: top-N by confidence
+  _build_short_queue()     -- pre-screen shorts (tradability + cooldown)
 
 AppContext dataclass holds all runtime singletons so they are never
-instantiated at import time — importing this module no longer opens a
+instantiated at import time -- importing this module no longer opens a
 broker connection.
 """
 
@@ -22,6 +21,8 @@ from __future__ import annotations
 import concurrent.futures
 import datetime
 import logging
+import os
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -39,6 +40,7 @@ from . import config as cfg
 from .utils import (
     setup_logging,
     MarketState,
+    within_entry_window,
     get_finnhub_trending_tickers,
     get_market_hours_interval,
     get_position_tuning_interval,
@@ -77,8 +79,6 @@ from .predictions import save_day_picks
 from .session import session as _session
 from engine.broker.broker_factory import BrokerFactory
 from engine.execution.enhanced import EnhancedExecutor
-from engine.options.executor import OptionsExecutor
-from engine.options.strategies import scan_options_universe
 from engine.risk import kill_mode as _kill_mode
 
 log = setup_logging()
@@ -102,7 +102,7 @@ _last_poller_tick: float = 0.0
 _poller_stale_alerted: bool = False
 
 
-# ── AppContext ────────────────────────────────────────────────────────────────
+# -- AppContext ----------------------------------------------------------------
 # Holds all runtime singletons. Instantiated once inside start()/run() so
 # importing this module never opens a broker connection.
 
@@ -110,10 +110,16 @@ _poller_stale_alerted: bool = False
 class AppContext:
     client:           object
     executor:         EnhancedExecutor
-    options_executor: Optional[OptionsExecutor]
     # Per-session state
     last_market_regime:   str  = "bull"
     market_state:         Optional[MarketState] = None
+    # 2026-09-02: date (ET) for which the guardian flat flag has already been
+    # acted on (guardian_halt_flatten already ran) so the 5s poll tick only
+    # flattens once per guardian trip. Date-scoped rather than a bool: the
+    # watchdog keeps main.py alive across midnight (EOD flat -> 09:05 prep),
+    # so a process-lifetime bool would silently block the NEXT day's
+    # legitimate guardian flatten until a manual restart.
+    guardian_halt_acted_date: Optional[datetime.date] = None
     # Latest ranked signals eligible for five-second capital-utilization retries.
     top_entry_signals:    List[Signal] = field(default_factory=list)
     # Short-fail cooldown: {symbol: monotonic_ts_until_retry}
@@ -126,20 +132,14 @@ def _build_context() -> AppContext:
     """Create and wire all runtime singletons. Called once at startup."""
     client   = BrokerFactory.create_stock_client(cfg.STOCKS_BROKER)
     executor = EnhancedExecutor(client, use_bracket_orders=True)
-    opts     = OptionsExecutor(client) if cfg.OPTIONS_ENABLED else None
-    if opts:
-        log.info(
-            f"Options trading ENABLED ({int(cfg.OPTIONS_ALLOCATION_PCT)}% allocation, "
-            f"{cfg.OPTIONS_DTE_MIN}-{cfg.OPTIONS_DTE_MAX} DTE)"
-        )
     log.info(f"Trade mode: {cfg.TRADE_MODE} (PAPER={cfg.PAPER}, LIVE={cfg.LIVE})")
     if not cfg.LONG_ONLY_MODE:
         log.info("Shorting enabled (LONG_ONLY_MODE=False)")
-    return AppContext(client=client, executor=executor, options_executor=opts)
+    return AppContext(client=client, executor=executor)
 
 
-# ── Discovery wrappers ────────────────────────────────────────────────────────
-# Thin wrappers that forward config into discovery — keeps scan_and_trade lean.
+# -- Discovery wrappers --------------------------------------------------------
+# Thin wrappers that forward config into discovery -- keeps scan_and_trade lean.
 
 def _timed(label: str, fn, *args, **kwargs) -> None:
     """Call fn(*args, **kwargs) and log its wall time under [TIMING] <label>."""
@@ -152,6 +152,7 @@ def _timed(label: str, fn, *args, **kwargs) -> None:
 
 def _run_discovery(ctx: AppContext, market_state: MarketState) -> None:
     """Fire all configured universe refresh sources (each throttled internally)."""
+    _timed("yahoo_universe", _ti_capture_job, market_state.now)
     _timed("trending_stocks", _discovery.scan_trending_stocks,
         use_live_trending=cfg.USE_LIVE_TRENDING,
         use_finnhub=cfg.USE_FINNHUB_DISCOVERY,
@@ -161,46 +162,8 @@ def _run_discovery(ctx: AppContext, market_state: MarketState) -> None:
         trending_min_momentum=cfg.TRENDING_MIN_MOMENTUM,
         priority_1=cfg.PRIORITY_1_MOMENTUM,
     )
-    _timed("tradeideas_universe", _discovery.scan_tradeideas_universe,
-        enabled=cfg.USE_TRADEIDEAS_DISCOVERY,
-        scan_interval_min=(
-            cfg.TRADEIDEAS_SCAN_INTERVAL_MIN if market_state.is_regular_hours
-            else cfg.TRADEIDEAS_SCAN_INTERVAL_MIN_AFTER_HOURS
-        ),
-        headless=cfg.TRADEIDEAS_HEADLESS,
-        chrome_profile=cfg.TRADEIDEAS_CHROME_PROFILE,
-        update_config=cfg.TRADEIDEAS_UPDATE_CONFIG_FILE,
-        priority_1=cfg.PRIORITY_1_MOMENTUM,
-        priority_2=cfg.PRIORITY_2_ESTABLISHED,
-        browser=cfg.TRADEIDEAS_BROWSER,
-        remote_debug_port=9222,
-    )
-    _timed("tradeideas_unusual_options", _discovery.scan_tradeideas_unusual_options,
-        enabled=cfg.USE_TRADEIDEAS_UNUSUAL_OPTIONS_DISCOVERY,
-        scan_interval_min=cfg.TRADEIDEAS_UNUSUAL_OPTIONS_SCAN_INTERVAL_MIN,
-        headless=cfg.TRADEIDEAS_HEADLESS,
-        chrome_profile=cfg.TRADEIDEAS_CHROME_PROFILE,
-        update_config=cfg.TRADEIDEAS_UPDATE_CONFIG_FILE,
-        priority_1=cfg.PRIORITY_1_MOMENTUM,
-        priority_2=cfg.PRIORITY_2_ESTABLISHED,
-        browser=cfg.TRADEIDEAS_BROWSER,
-        remote_debug_port=9222,
-    )
-    _timed("tradeideas_toplists", _discovery.scan_tradeideas_toplists,
-        enabled=cfg.USE_TRADEIDEAS_TOPLISTS_DISCOVERY,
-        scan_interval_min=cfg.TRADEIDEAS_TOPLISTS_SCAN_INTERVAL_MIN,
-        headless=cfg.TRADEIDEAS_HEADLESS,
-        chrome_profile=cfg.TRADEIDEAS_CHROME_PROFILE,
-        update_config=cfg.TRADEIDEAS_UPDATE_CONFIG_FILE,
-        priority_1=cfg.PRIORITY_1_MOMENTUM,
-        priority_2=cfg.PRIORITY_2_ESTABLISHED,
-        browser=cfg.TRADEIDEAS_BROWSER,
-        remote_debug_port=9222,
-    )
-    _timed("sympathy_and_edgar", _discovery.scan_sympathy_and_edgar,
-        sympathy_enabled=cfg.USE_SECTOR_SYMPATHY,
+    _timed("edgar", _discovery.scan_edgar,
         edgar_enabled=cfg.USE_EDGAR_SCANNER,
-        sympathy_interval_min=cfg.SECTOR_SYMPATHY_INTERVAL_MIN,
         edgar_interval_min=cfg.EDGAR_SCANNER_INTERVAL_MIN,
         priority_1=cfg.PRIORITY_1_MOMENTUM,
         priority_2=cfg.PRIORITY_2_ESTABLISHED,
@@ -221,64 +184,14 @@ def _run_discovery(ctx: AppContext, market_state: MarketState) -> None:
     )
 
 
-# ── Options cycle ─────────────────────────────────────────────────────────────
-
-def _run_options_cycle(ctx: AppContext, market_state: MarketState) -> None:
-    """Monitor existing options positions and attempt one new entry per cycle."""
-    if ctx.options_executor is None:
-        return
-
-    if not market_state.is_regular_hours:
-        return
-
-    try:
-        ctx.options_executor.monitor_positions()
-        if market_state.is_options_lull_hours:
-            log.info("[OPTIONS] Lull period — monitoring only, no new entries")
-            return
-        # 2026-08-24, user request: "don't trade or do anything after 3:50pm
-        # ET" -- this function's own is_regular_hours gate only stops it at
-        # 16:00 ET, a 10-min window past the equities side's entry cutoff
-        # (ENTRY_WINDOW_END_ET) where options could still open a brand new
-        # position. Monitoring/closing stays active past the cutoff (same
-        # as equities); only new entries stop.
-        if not _within_entry_window(market_state.now):
-            log.info(f"[OPTIONS] Outside entry window (ends {cfg.ENTRY_WINDOW_END_ET} ET) — monitoring only, no new entries")
-            return
-        all_positions = ctx.client.get_all_positions()
-        held_map      = {p.symbol: int(float(p.qty)) for p in all_positions if float(p.qty) > 0}
-        existing_syms = {pos.occ_symbol for pos in ctx.options_executor._positions.values()}
-        opt_signals   = scan_options_universe(held_map, existing_syms, ctx.market_state)
-        if opt_signals:
-            top = opt_signals[:10]
-            log.info(
-                f"[OPTIONS] {len(opt_signals)} candidates | open={len(ctx.options_executor._positions)} "
-                f"| top: {top[0].symbol} {top[0].option_type} conf={top[0].confidence:.0%}"
-            )
-            executed = False
-            for sig in top:
-                if ctx.options_executor.place_option_order(sig, market_state):
-                    executed = True
-                    break
-            if not executed:
-                log.info(f"[OPTIONS] No option order executed this cycle | open={len(ctx.options_executor._positions)}")
-        else:
-            log.info(
-                f"[OPTIONS] No qualifying signals this cycle | open={len(ctx.options_executor._positions)}"
-            )
-        log.info(f"[OPTIONS] {ctx.options_executor.status_summary()}")
-    except Exception as e:
-        log.error(f"[OPTIONS] Cycle error: {e}", exc_info=True)
-
-
-# ── Market regime ─────────────────────────────────────────────────────────────
+# -- Market regime -------------------------------------------------------------
 
 def _resolve_market_regime(ctx: AppContext, market_state: MarketState) -> Tuple[str, int]:
     """Return the stock-only execution capacity; broad-market regime is ignored."""
     return "stock", cfg.MAX_LONG_ENTRIES_PER_CYCLE + cfg.MAX_SHORT_ENTRIES_PER_CYCLE
 
 
-# ── Universe assembly ─────────────────────────────────────────────────────────
+# -- Universe assembly ---------------------------------------------------------
 
 def _build_scan_targets(ctx: AppContext) -> Tuple[List[str], set]:
     """Return (scan_targets, excluded) after universe assembly and position filtering."""
@@ -297,7 +210,7 @@ def _build_scan_targets(ctx: AppContext) -> Tuple[List[str], set]:
     return targets, excluded
 
 
-# ── Signal filtering ──────────────────────────────────────────────────────────
+# -- Signal filtering ----------------------------------------------------------
 
 def _filter_eligible(
     ctx: AppContext,
@@ -313,11 +226,11 @@ def _filter_eligible(
     long_only      = cfg.LONG_ONLY_MODE or ctx.executor.shorting_blocked
 
     if ctx.executor.shorting_blocked and not cfg.LONG_ONLY_MODE:
-        log.warning("Shorting blocked by broker (40310000) — effective long-only this session")
+        log.warning("Shorting blocked by broker (40310000) -- effective long-only this session")
 
     # Same-underlying guard: don't buy two leveraged siblings of the same
     # commodity/index/stock in one cycle (e.g. BOIL+KOLD, or AAPU alongside
-    # held AAPL) — see leveraged_underlying() in config.py.
+    # held AAPL) -- see leveraged_underlying() in config.py.
     picked_underlyings = {cfg.leveraged_underlying(sym) for sym in fresh_held}
 
     eligible = []
@@ -392,10 +305,10 @@ def _log_skipped(signals: list, eligible: list, fresh_held: set, regime: str, ex
             reason = "long-only mode"
         else:
             reason = "filtered"
-        log.info(f"[SCAN] SKIP {s.symbol} {s.action.upper()} ${s.price:.2f} conf={s.confidence:.0%} [{s.strategy}] — {reason}")
+        log.info(f"[SCAN] SKIP {s.symbol} {s.action.upper()} ${s.price:.2f} conf={s.confidence:.0%} [{s.strategy}] -- {reason}")
 
 
-# ── Short pre-screening ───────────────────────────────────────────────────────
+# -- Short pre-screening -------------------------------------------------------
 
 def _build_short_queue(ctx: AppContext, short_candidates: list) -> list:
     """Pre-screen short candidates: remove cooldown hits and non-shortable assets.
@@ -424,65 +337,12 @@ def _build_short_queue(ctx: AppContext, short_candidates: list) -> list:
                 ctx.short_fail_cooldown[s.symbol] = now_ts + cfg.SHORT_FAIL_COOLDOWN_MIN * 60
                 continue
         except Exception as e:
-            log.warning(f"Pre-check asset failed {s.symbol}: {e} — keeping candidate")
+            log.warning(f"Pre-check asset failed {s.symbol}: {e} -- keeping candidate")
         queue.append(s)
     return queue
 
 
-# ── Execution plans ───────────────────────────────────────────────────────────
-
-def _execute_bear_plan(
-    ctx: AppContext,
-    eligible: list,
-    daily_loss_limit: float,
-    loss_pct: float,
-) -> None:
-    """Bear regime: attempt 1 swap-long then up to BEAR_SHORT_SIGNALS_CAP shorts."""
-    long_sigs         = sorted(
-        [s for s in eligible if s.action == "buy"], key=_execution_rank,
-    )[:cfg.MAX_LONG_ENTRIES_PER_CYCLE]
-    short_candidates  = [] if (cfg.LONG_ONLY_MODE or ctx.executor.shorting_blocked) else \
-                        [s for s in eligible if s.action in ("sell", "short")]
-    if cfg.LONG_ONLY_MODE and any(s.action in ("sell", "short") for s in eligible):
-        log.warning(f"LONG_ONLY_MODE — dropping {len([s for s in eligible if s.action in ('sell','short')])} short(s)")
-    if ctx.executor.shorting_blocked and short_candidates:
-        log.warning(f"Shorting blocked — dropping {len(short_candidates)} short(s)")
-
-    short_queue  = _build_short_queue(ctx, short_candidates)
-    short_target = 0 if (cfg.LONG_ONLY_MODE or ctx.executor.shorting_blocked) else cfg.MAX_SHORT_ENTRIES_PER_CYCLE
-    log.info(f"[TRADE] BEAR plan: {len(long_sigs)} long(s) swap-only, target {short_target} short(s) from {len(short_queue)} queued")
-
-    # One swap-long per bear cycle
-    for sig in long_sigs:
-        _session.refresh_daily_pnl(ctx.client)
-        if _session.daily_pnl <= daily_loss_limit:
-            log.warning(f"Daily loss limit mid-cycle ({loss_pct:.0f}%): ${_session.daily_pnl:.2f} — halting")
-            return
-        log.info(f"[TRADE] EXECUTE: {sig.action.upper()} {sig.symbol} @ ${sig.price:.2f} | {sig.strategy} | {sig.reason}")
-        if ctx.executor.execute(sig, swap_only=True):
-            _session.trades += 1
-            break
-        time.sleep(1)
-
-    # Short queue
-    short_success = 0
-    for sig in short_queue:
-        if short_target <= 0 or short_success >= short_target:
-            break
-        _session.refresh_daily_pnl(ctx.client)
-        if _session.daily_pnl <= daily_loss_limit:
-            log.warning(f"Daily loss limit mid-cycle ({loss_pct:.0f}%): ${_session.daily_pnl:.2f} — halting")
-            break
-        log.info(f"[TRADE] EXECUTE: {sig.action.upper()} {sig.symbol} @ ${sig.price:.2f} | {sig.strategy} | {sig.reason}")
-        if ctx.executor.execute(sig, swap_only=False):
-            _session.trades += 1
-            short_success += 1
-            ctx.short_fail_cooldown.pop(sig.symbol, None)
-        else:
-            ctx.short_fail_cooldown[sig.symbol] = time.monotonic() + cfg.SHORT_FAIL_COOLDOWN_MIN * 60
-            log.info(f"SHORT failed {sig.symbol} — cooldown {cfg.SHORT_FAIL_COOLDOWN_MIN}m")
-        time.sleep(1)
-
+# -- Execution plans -----------------------------------------------------------
 
 def _execute_bull_plan(
     ctx: AppContext,
@@ -523,7 +383,7 @@ def _execute_bull_plan(
         swap_only = (regime == "bear") and sig.action not in ("sell", "short")
         _session.refresh_daily_pnl(ctx.client)
         if _session.daily_pnl <= daily_loss_limit:
-            log.warning(f"Daily loss limit mid-cycle ({loss_pct:.0f}%): ${_session.daily_pnl:.2f} — halting")
+            log.warning(f"Daily loss limit mid-cycle ({loss_pct:.0f}%): ${_session.daily_pnl:.2f} -- halting")
             break
         log.info(f"EXECUTE: {sig.action.upper()} {sig.symbol} @ ${sig.price:.2f} | {sig.strategy} | {sig.reason}")
         if ctx.executor.execute(sig, swap_only=swap_only):
@@ -568,23 +428,121 @@ def _retry_top_entries(ctx: AppContext) -> None:
             log.warning(f"[5S RETRY] {signal.symbol} failed: {e}")
 
 
-# ── Core scan cycle ───────────────────────────────────────────────────────────
+# -- Core scan cycle -----------------------------------------------------------
 
 def _check_kill_mode(ctx: AppContext) -> bool:
     return _kill_mode.check(
-        ctx.client, ctx.executor, ctx.options_executor,
+        ctx.client, ctx.executor,
         vix_level=cfg.KILL_MODE_VIX_LEVEL,
         spy_drop_pct=cfg.KILL_MODE_SPY_DROP_PCT,
         vix_roc_pct=cfg.KILL_MODE_VIX_ROC_PCT,
     )
 
 
+def _guardian_flat_requested() -> Optional[dict]:
+    """Read the loss guardian's flat_request.flag (written by scripts/
+    guardian.py when the hard daily-loss backstop trips).
+
+    Returns the payload ONLY when it is dated TODAY (ET). A stale flag from a
+    prior day must never flatten the current day -- the guardian rewrites the
+    file fresh (dated today) if it trips again.
+    """
+    try:
+        import json as _json
+        f = Path(cfg.GUARDIAN_FLAT_FILE)
+        if not f.exists():
+            return None
+        payload = _json.loads(f.read_text(encoding="utf-8"))
+        today_et = datetime.datetime.now(pytz.timezone("America/New_York")).date()
+        if str(payload.get("date")) != today_et.isoformat():
+            return None
+        return payload
+    except Exception as e:
+        log.warning(f"guardian flat flag read failed: {e}")
+        return None
+
+
+_last_hb_touch = 0.0
+
+
+def _touch_heartbeat(force: bool = False) -> None:
+    """Keep heartbeat.txt meaning MAIN-LOOP LIVENESS, not cycle completion.
+
+    2026-09-02 red-team fix for the watchdog stall-restart loop (19:23-21:30
+    ET): heartbeat was written only after each scan cycle, and off-hours the
+    adaptive interval stretches to 20 min (SCAN_INTERVAL_CALM_VOL) -- longer
+    than the watchdog's 900s STALL_RESTART_SECONDS -- so a perfectly healthy
+    sleeping bot was killed as "hung" every ~15 min, all night. The main loop
+    now touches the heartbeat on every tick (rate-limited to one write per
+    60s; force=True bypasses the limiter after a completed scan cycle), so:
+      - a genuine hang (e.g. a black-holed bar fetch) still stops the writes
+        and is caught by the watchdog within <= 15 min;
+      - legitimate long adaptive sleeps no longer trip it.
+    Content stays a plain UTC ISO timestamp (watchdog + guardian read it).
+    """
+    global _last_hb_touch
+    now_mono = time.monotonic()
+    if not force and (now_mono - _last_hb_touch) < 60.0:
+        return
+    try:
+        (REPO_ROOT / "heartbeat.txt").write_text(
+            datetime.datetime.now(datetime.timezone.utc).isoformat(), encoding="utf-8"
+        )
+        _last_hb_touch = now_mono
+    except Exception as e:
+        log.warning(f"heartbeat.txt write failed: {e}")
+
+
+def _maybe_guardian_halt(ctx) -> Optional[str]:
+    """Act on the guardian flat flag at most once per flag date (ET).
+
+    Called first on every _tick (the 5s software-stop poll thread) so a halt
+    flattens the book even while scan_and_trade is mid-cycle. Dedupe is
+    DATE-scoped on the flag payload's own "date" (which _guardian_flat_requested
+    already guarantees is today ET): repeated same-day polls are a no-op, while
+    a fresh next-day flag flattens again without a process restart -- a
+    process-lifetime bool would stay stuck across the overnight session.
+    If the payload date is missing/unparsable, fall back to today's ET date so
+    dedupe still holds. Module-level (not inlined in _tick) so it is directly
+    testable with a mock ctx. Returns the flatten reason when a flatten was
+    just triggered, else None.
+    """
+    try:
+        _gf = _guardian_flat_requested()
+        if not _gf:
+            return None
+        try:
+            flag_date = datetime.date.fromisoformat(str(_gf.get("date", "")))
+        except Exception:
+            flag_date = datetime.datetime.now(pytz.timezone("America/New_York")).date()
+        if getattr(ctx, "guardian_halt_acted_date", None) == flag_date:
+            return None  # already flattened for this guardian trip
+        ctx.guardian_halt_acted_date = flag_date
+        log.warning(
+            f"[GUARDIAN-HALT] flat flag fired (pnl ${_gf.get('pnl')}, "
+            f"{_gf.get('pct')}%, reason={_gf.get('reason')}) -- flattening"
+        )
+        ctx.executor.guardian_halt_flatten(
+            f"guardian flat @ {_gf.get('pct')}% (${_gf.get('pnl')}) {_gf.get('reason')}"
+        )
+        return str(_gf.get("reason") or "guardian")
+    except Exception as e:
+        log.error(f"[STOP-THREAD] guardian-halt check error: {e}", exc_info=True)
+        return None
+
+
 def _within_entry_window(now_et: datetime.datetime) -> bool:
-    """True if now_et (ET, tz-aware) falls within [ENTRY_WINDOW_START_ET,
-    ENTRY_WINDOW_END_ET]. Pure string-time comparison, same pattern
-    MarketState.from_now() already uses for is_market_open/is_regular_hours."""
-    t = now_et.strftime("%H:%M")
-    return cfg.ENTRY_WINDOW_START_ET <= t <= cfg.ENTRY_WINDOW_END_ET
+    """True if now_et (ET, tz-aware) falls within either entry segment:
+    [ENTRY_WINDOW_START_ET, ENTRY_WINDOW_BREAK_START_ET] (09:14-11:00) or
+    [ENTRY_WINDOW_BREAK_END_ET, ENTRY_WINDOW_END_ET] (14:45-15:50) -- the
+    two-segment window added 2026-09-01 (user request: "time for entry 9:14AM
+    to 11:00AM and 2:45 PM to 3:50PM ET"), separated by a midday break when
+    the book is hard-flatted. Pure string-time comparison, same pattern
+    MarketState.from_now() already uses for is_market_open/is_regular_hours.
+    Delegates to engine.utils.market.within_entry_window (single source of
+    truth -- enhanced.py's re-entry guards use the same helper); this thin
+    wrapper keeps the historical name for existing callers/tests."""
+    return within_entry_window(now_et)
 
 
 def _within_discovery_window(now_et: datetime.datetime) -> bool:
@@ -595,8 +553,11 @@ def _within_discovery_window(now_et: datetime.datetime) -> bool:
     (DISCOVERY_WINDOW_START_ET < ENTRY_WINDOW_START_ET): discovery gets a
     pre-market head start so the scan universe is already warm by the time
     ENTRY_WINDOW_START_ET opens order submission, per scan_and_trade()'s
-    two-stage gate. Never wider on the late side -- discovery has no reason
-    to outlive the entry window itself."""
+    two-stage gate. Since 2026-09-01 it is ALSO wider through the midday
+    break (11:00-14:45) -- discovery keeps refreshing through the lunch flat
+    so the afternoon entry segment (14:45-15:50) trades on a warm universe.
+    Never wider on the late side -- discovery has no reason to outlive the
+    entry window itself."""
     t = now_et.strftime("%H:%M")
     return cfg.DISCOVERY_WINDOW_START_ET <= t <= cfg.ENTRY_WINDOW_END_ET
 
@@ -615,13 +576,12 @@ def scan_and_trade(ctx: AppContext) -> None:
 
     Sequence:
       1. Session reset / daily guards
-      2. Options cycle
-      3. Market-hours + kill-mode gates
-      4. Session P&L guards
-      5. Discovery refresh
-      6. Universe assembly + scan
-      7. Signal filtering
-      8. Execution (bear or bull plan)
+      2. Market-hours + kill-mode gates
+      3. Session P&L guards
+      4. Discovery refresh
+      5. Universe assembly + scan
+      6. Signal filtering
+      7. Execution (bear or bull plan)
     """
     _cycle_start = time.monotonic()
     ctx.top_entry_signals = []
@@ -630,35 +590,39 @@ def scan_and_trade(ctx: AppContext) -> None:
     ctx.market_state = MarketState.from_now()
     ctx.market_state.resolve_regime()
     ctx.executor.update_market_state(ctx.market_state)
-    # 2026-08-24, user request: _run_options_cycle no longer runs here --
-    # moved to its own thread (_start_options_scan_thread). It used to be
-    # step 2 of this function, BEFORE equity discovery/scan/execute below,
-    # so every equity cycle wasn't free to run until a full options scan
-    # (160 tickers, sequential per-symbol fetches, minutes long) finished
-    # first -- confirmed live, that alone blew past a minute most cycles,
-    # so equity re-entries (the actual swing-capture mechanism) never got
-    # close to REGULAR_HOURS_SCAN_INTERVAL. See _start_options_scan_thread.
+    # 2026-09-01: the options scan cycle was removed entirely (see git history
+    # for _run_options_cycle / _start_options_scan_thread) -- once step 2 of
+    # this function, later a dedicated thread, and before that a minutes-long
+    # sequential options scan (160 tickers) that routinely blew past a minute
+    # and starved equity re-entries.
 
     market_state = ctx.market_state
     if not market_state.is_market_open:
         if not cfg.FORCE_SCAN:
-            log.info("[SYSTEM] Market closed — skipping scan")
+            log.info("[SYSTEM] Market closed -- skipping scan")
             return
-        log.warning("[SYSTEM] FORCE_SCAN active — bypassing market-hours gate")
+        log.warning("[SYSTEM] FORCE_SCAN active -- bypassing market-hours gate")
 
     # Kill mode has real protective side effects (emergency close on an
     # extreme-bear trigger) beyond just gating entries, so it must run
     # unconditionally here -- the entry-window check below only ever blocks
     # new entries and must not stand in front of it.
     if _check_kill_mode(ctx):
-        log.info("[SYSTEM] Kill mode active — aborting cycle")
+        log.info("[SYSTEM] Kill mode active -- aborting cycle")
+        return
+
+    # 2026-09-02: guardian hard daily-loss halt (flat_request.flag). Read every
+    # cycle -- cheap local file stat -- so entries stop the moment the guardian
+    # trips, even if the 5s poll thread's flatten is still mid-sweep.
+    if _guardian_flat_requested():
+        log.warning("[SYSTEM] Guardian daily-loss halt active -- skipping discovery/scan/entries this cycle")
         return
 
     if not _within_discovery_window(market_state.now):
         log.info(
             f"[SYSTEM] Outside discovery window ({cfg.DISCOVERY_WINDOW_START_ET}-{cfg.ENTRY_WINDOW_END_ET} ET) "
-            f"— skipping discovery/scan this cycle (concentration/correlation checks run on their own "
-            f"schedule now, unaffected by this gate — see _concentration_check_job)"
+            f"-- skipping discovery/scan this cycle (concentration/correlation checks run on their own "
+            f"schedule now, unaffected by this gate -- see _concentration_check_job)"
         )
         return
 
@@ -667,7 +631,7 @@ def scan_and_trade(ctx: AppContext) -> None:
     daily_loss_limit  = -(_session.daily_start_equity * loss_pct / 100) if _session.daily_start_equity > 0 else -999_999
 
     if _session.daily_pnl <= daily_loss_limit:
-        log.warning(f"[SYSTEM] Daily loss limit ({loss_pct:.0f}% {ctx.last_market_regime}): ${_session.daily_pnl:.2f} — halting")
+        log.warning(f"[SYSTEM] Daily loss limit ({loss_pct:.0f}% {ctx.last_market_regime}): ${_session.daily_pnl:.2f} -- halting")
         return
     if _session.daily_pnl >= cfg.DAILY_PROFIT_TARGET:
         log.info(f"[SYSTEM] Daily profit target reached: ${_session.daily_pnl:.2f}")
@@ -689,7 +653,7 @@ def scan_and_trade(ctx: AppContext) -> None:
     if acct.buying_power < min_needed:
         log.info(
             f"[SYSTEM] Buying power ${acct.buying_power:,.0f} < minimum position ${min_needed:,.0f} "
-            f"— skipping discovery/scan this cycle (existing stops/TP/concentration checks still ran above)"
+            f"-- skipping discovery/scan this cycle (existing stops/TP/concentration checks still ran above)"
         )
         return
 
@@ -698,7 +662,7 @@ def scan_and_trade(ctx: AppContext) -> None:
         log.warning(
             f"[SYSTEM] Margin cushion {cushion_ratio:.2f}x < {cfg.MARGIN_CUSHION_MIN_RATIO}x minimum "
             f"(equity ${acct.equity:,.0f} vs maintenance ${acct.maintenance_margin:,.0f}) "
-            f"— skipping discovery/scan this cycle (existing stops/TP/concentration checks still ran above)"
+            f"-- skipping discovery/scan this cycle (existing stops/TP/concentration checks still ran above)"
         )
         return
 
@@ -706,16 +670,25 @@ def scan_and_trade(ctx: AppContext) -> None:
     _run_discovery(ctx, market_state)
     log.info(f"[TIMING] discovery: {time.monotonic() - _t_discovery:.1f}s")
 
-    if not _within_entry_window(market_state.now):
+    prep_start = datetime.datetime.strptime(cfg.PREP_SCAN_START_ET, "%H:%M").time()
+    in_prep_window = prep_start <= market_state.now.time() < datetime.datetime.strptime(cfg.ENTRY_WINDOW_START_ET, "%H:%M").time()
+    if not _within_entry_window(market_state.now) and not in_prep_window:
         log.info(
             f"[SYSTEM] Pre-market discovery only (entry window opens {cfg.ENTRY_WINDOW_START_ET} ET) "
-            f"— universe refreshed, no scan/execute this cycle"
+            f"-- universe refreshed, no scan/execute this cycle"
         )
         return
 
     scan_targets, excluded = _build_scan_targets(ctx)
     if not scan_targets:
-        log.info("[SCAN] No targets after filtering — skipping scan")
+        log.info("[SCAN] No targets after filtering -- skipping scan")
+        return
+
+    # A full strategy/EMA preparation scan is intentionally performed once per
+    # day. Repeating a ~100-second scan every minute would overlap the 09:30
+    # entry boundary and delay the first executable cycle.
+    if in_prep_window and getattr(ctx, "_prep_scan_date", None) == market_state.now.date():
+        log.info("[SYSTEM] Preparation already complete; waiting for entry window")
         return
 
     ctx.executor._swap_cycle_closed.clear()
@@ -729,18 +702,18 @@ def scan_and_trade(ctx: AppContext) -> None:
     if cfg.LONG_ONLY_MODE:
         pre = len(signals)
         signals = [s for s in signals if s.action == "buy"]
-        log.warning(f"LONG_ONLY_MODE: filtered {pre} → {len(signals)} (buy-only)")
+        log.warning(f"LONG_ONLY_MODE: filtered {pre} -> {len(signals)} (buy-only)")
 
     breakdown = ", ".join(f"{k}: {v}" for k, v in sorted(hit_counts.items()))
-    log.info(f"[SCAN] Breakdown — {breakdown or 'none'} | Errors: {scan_errors} | Total: {len(signals)}")
+    log.info(f"[SCAN] Breakdown -- {breakdown or 'none'} | Errors: {scan_errors} | Total: {len(signals)}")
     if not hit_counts:
         if not market_state.is_market_open:
-            log.info("[SCAN] No signals — after hours (stale daily bars, intraday gates not met)")
+            log.info("[SCAN] No signals -- after hours (stale daily bars, intraday gates not met)")
         else:
-            log.info("[SCAN] No signals — market likely in downtrend or momentum gates not met")
+            log.info("[SCAN] No signals -- market likely in downtrend or momentum gates not met")
 
     for idx, s in enumerate(sorted(signals, key=lambda s: s.confidence, reverse=True)[:cfg.TOP_N_SIGNALS], 1):
-        log.info(f"[SCAN] TOP{cfg.TOP_N_SIGNALS}_RAW #{idx}: {s.symbol} {s.action.upper()} ${s.price:.2f} conf={s.confidence:.0%} [{s.strategy}] — {s.reason}")
+        log.info(f"[SCAN] TOP{cfg.TOP_N_SIGNALS}_RAW #{idx}: {s.symbol} {s.action.upper()} ${s.price:.2f} conf={s.confidence:.0%} [{s.strategy}] -- {s.reason}")
 
     if not signals:
         log.info("[SCAN] No signals this cycle")
@@ -754,7 +727,7 @@ def scan_and_trade(ctx: AppContext) -> None:
     _log_skipped(signals, eligible, fresh_held, regime, ctx.executor)
 
     for idx, s in enumerate(eligible[:cfg.TOP_N_SIGNALS], 1):
-        log.info(f"[TRADE] TOP{cfg.TOP_N_SIGNALS}_ELIGIBLE #{idx}: {s.symbol} {s.action.upper()} ${s.price:.2f} conf={s.confidence:.0%} [{s.strategy}] — {s.reason}")
+        log.info(f"[TRADE] TOP{cfg.TOP_N_SIGNALS}_ELIGIBLE #{idx}: {s.symbol} {s.action.upper()} ${s.price:.2f} conf={s.confidence:.0%} [{s.strategy}] -- {s.reason}")
 
     save_day_picks(eligible[:cfg.TOP_N_SIGNALS], regime)
     notify_scan_results(eligible[:cfg.TOP_N_SIGNALS], datetime.date.today(), sentiment, regime)
@@ -766,14 +739,18 @@ def scan_and_trade(ctx: AppContext) -> None:
     ctx.top_entry_signals = list(eligible[:cfg.TOP_N_SIGNALS])
 
     _t_exec = time.monotonic()
+    if in_prep_window:
+        ctx._prep_scan_date = market_state.now.date()
+        log.info(f"[SYSTEM] Preparation scan complete ({len(eligible)} eligible); orders remain blocked until {cfg.ENTRY_WINDOW_START_ET} ET")
+        return
     _execute_bull_plan(ctx, eligible, signals_cap, regime, daily_loss_limit, loss_pct)
     log.info(
-        f"[TIMING] signal→order: {time.monotonic() - _t_exec:.1f}s | "
+        f"[TIMING] signal->order: {time.monotonic() - _t_exec:.1f}s | "
         f"total cycle: {time.monotonic() - _cycle_start:.1f}s"
     )
 
 
-# ── Status + interval helpers ─────────────────────────────────────────────────
+# -- Status + interval helpers -------------------------------------------------
 
 def _fetch_account_and_positions(ctx: AppContext, timeout_seconds: int = 30):
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
@@ -828,6 +805,20 @@ def get_adaptive_interval(ctx: AppContext) -> int:
         if mkt_interval is not None:
             interval = mkt_interval
 
+    # Tighten cadence for the pre-open preparation window so EMA and strategy
+    # signals are refreshed every minute before/at the morning entry segment.
+    # 2026-09-01: the entry window now opens at ENTRY_WINDOW_START_ET (09:14),
+    # but get_market_hours_interval() still labels everything before 09:30 as
+    # PRE-MARKET (10 min) -- without this override, the first 16 minutes of the
+    # morning segment would scan on a 10-min cadence (same failure mode the
+    # main-loop phase comment documents: a stale premarket interval rode up to
+    # 15 min past the open before recomputing).
+    now_et = market_state.now
+    prep_start = datetime.datetime.strptime(cfg.PREP_SCAN_START_ET, "%H:%M").time()
+    market_open = datetime.datetime.strptime(cfg.MARKET_OPEN, "%H:%M").time()
+    if prep_start <= now_et.time() < market_open:
+        interval = 1
+
     pos_status = "DISABLED"
     if cfg.USE_POSITION_TUNING:
         try:
@@ -866,6 +857,26 @@ def _eod_close_job(ctx: AppContext) -> None:
             notify_eod(eod_summary, account, positions, _session.daily_pnl, _session.trades, _discovery.trending_stocks)
         except Exception as e:
             log.error(f"EOD notify error: {e}", exc_info=True)
+
+
+def _lunch_flat_job(ctx: AppContext) -> None:
+    """schedule-driven wrapper for lunch_flat_positions -- 2026-09-01, user
+    request ("at 11AM close all positions and open orders, and reenter only
+    at 2:45PM and again exist all at 3:50"): hard-flat the whole equity book
+    the moment the morning entry segment ends. Same decoupling reasoning as
+    _eod_close_job/_guardrail_close_job: this must land inside the 11:00-14:45
+    window no matter what the adaptive scan cadence is doing. The function's
+    own time-of-day gate + per-day per-symbol done set do the real work, so
+    calling it every minute is safe."""
+    try:
+        summary = ctx.executor.lunch_flat_positions()
+        if summary and (summary.get("closed_count") or summary.get("cancelled_orders")):
+            log.warning(
+                f"[LUNCH-FLAT] {summary.get('closed_count')} position(s) closed, "
+                f"{summary.get('cancelled_orders')} open order(s) cancelled at the midday break"
+            )
+    except Exception as e:
+        log.error(f"lunch_flat_positions error: {e}", exc_info=True)
 
 
 def _guardrail_close_job(ctx: AppContext) -> None:
@@ -952,9 +963,23 @@ def _schedule_on_clock_grid(interval_min: int, job, *args) -> None:
     every restart now re-aligns to the same clock marks instead of resetting
     its own independent countdown.
 
-    interval_min must evenly divide 60 (10, 12, 15, 20, 30 ... — 10 is what
+    interval_min must evenly divide 60 (10, 12, 15, 20, 30 ... -- 10 is what
     every caller here actually uses)."""
     assert 60 % interval_min == 0, f"{interval_min} must evenly divide 60 to land on a fixed grid"
+    # 2026-09-02, user request ("check all the polling loops start at 9.25AM
+    # ET to avoid delays"): the grid alignment below only guarantees the first
+    # fire at the NEXT clock mark -- up to interval_min (10-30) minutes after
+    # boot, which on a late-morning restart left the drift-stop/concentration
+    # checks blind straight across the 09:30 open. Fire once immediately at
+    # registration so every schedule-driven loop has ticked at least once
+    # before the open regardless of boot time. The wrappers have their own
+    # try/excepts; this one keeps an unexpected boot-time failure from
+    # killing registration of the recurring grid jobs.
+    try:
+        job(*args)
+        log.info(f"[SCHEDULE] {getattr(job, '__name__', job)} first tick fired at registration (pre-grid warm-up)")
+    except Exception as e:
+        log.error(f"[SCHEDULE] {getattr(job, '__name__', job)} registration-time first tick failed: {e}", exc_info=True)
     for minute in range(0, 60, interval_min):
         schedule.every().hour.at(f":{minute:02d}").do(job, *args)
 
@@ -964,14 +989,14 @@ def _prune_universe_job() -> None:
         from .equity.universe import prune as _prune
         removed = _prune()
         if removed:
-            log.info(f"Universe pruned: {len(removed)} expired ticker(s): {removed[:10]}{'…' if len(removed) > 10 else ''}")
+            log.info(f"Universe pruned: {len(removed)} expired ticker(s): {removed[:10]}{'...' if len(removed) > 10 else ''}")
         else:
             log.info("Universe pruned: no expired tickers")
     except Exception as e:
         log.warning(f"Universe prune failed: {e}")
 
 
-# ── Top3-only (dry-run) mode ──────────────────────────────────────────────────
+# -- Top3-only (dry-run) mode --------------------------------------------------
 
 def scan_top3_only(ctx: AppContext) -> None:
     market_state = ctx.market_state or MarketState.from_now()
@@ -995,13 +1020,13 @@ def scan_top3_only(ctx: AppContext) -> None:
         return
     log.info("TOP 5 SCAN PICKS:")
     for idx, s in enumerate(top5, 1):
-        log.info(f"#{idx}: {s.symbol} {s.action.upper()} ${s.price:.2f} conf={s.confidence:.0%} [{s.strategy}] — {s.reason}")
+        log.info(f"#{idx}: {s.symbol} {s.action.upper()} ${s.price:.2f} conf={s.confidence:.0%} [{s.strategy}] -- {s.reason}")
     notify_scan_results(top5, datetime.date.today(), sentiment, ctx.last_market_regime)
 
 
-# ── Main loop ─────────────────────────────────────────────────────────────────
+# -- Main loop -----------------------------------------------------------------
 
-# ── Software-stop fast-poll thread ───────────────────────────────────────────
+# -- Software-stop fast-poll thread -------------------------------------------
 # PDT-blocked stops need frequent polling regardless of the adaptive scan
 # interval (which can stretch to 20 min in calm markets).
 # This thread runs independently at a fixed 10-second cadence and only
@@ -1027,11 +1052,24 @@ def _tick(ctx: AppContext, last_ema15: float, last_pending: float) -> Tuple[floa
     dicts check_ema9_exit and check_blocked_entries_ema touch; keeping
     all of it single-threaded avoids introducing a new cross-thread race
     on that shared state for the sake of speed."""
+    # 2026-09-02: guardian hard daily-loss backstop. Runs FIRST on this tick so
+    # a halt flattens the book even while scan_and_trade is mid-cycle (this
+    # thread is genuine concurrency, independent of the single-threaded main
+    # loop -- same reasoning as the 2026-08-24 comment above). Idempotent:
+    # per-day dedupe HERE (ctx.guardian_halt_acted_date, date-scoped so a
+    # next-day flag re-arms without a restart) AND inside
+    # executor.guardian_halt_flatten (_guardian_halt_closed).
+    _maybe_guardian_halt(ctx)
+
     if time.time() - last_pending >= cfg.PENDING_ENTRY_RECHECK_SEC:
         try:
             ctx.executor.check_pending_entries_ema()
         except Exception as e:
             log.error(f"[STOP-THREAD] check_pending_entries_ema error: {e}", exc_info=True)
+        try:
+            ctx.executor.maybe_add_staged_tranches()
+        except Exception as e:
+            log.error(f"[STOP-THREAD] maybe_add_staged_tranches error: {e}", exc_info=True)
         last_pending = time.time()
 
     try:
@@ -1081,7 +1119,7 @@ def _start_software_stop_thread(ctx: AppContext) -> None:
     check_software_stops(), check_afterhours_stops(), _sweep_force_closes(),
     _sweep_pending_entries(), detect_stopped_out_positions(),
     check_pending_entries_ema(), check_ema9_exit(), and
-    check_blocked_entries_ema() every ten seconds.
+    check_blocked_entries_ema() every PENDING_ENTRY_RECHECK_SEC seconds.
 
     2026-08-24, user request ("why do you say the cycle time increase" --
     it wasn't supposed to touch the EMA check at all): the per-minute EMA
@@ -1135,7 +1173,7 @@ def _start_software_stop_thread(ctx: AppContext) -> None:
     t = threading.Thread(target=_loop, name="SoftwareStopPoller", daemon=True)
     t.start()
     log.info(
-        f"[STOP-THREAD] Software-stop poll thread started (10s interval, "
+        f"[STOP-THREAD] Software-stop poll thread started ({cfg.PENDING_ENTRY_RECHECK_SEC}s interval, "
         f"pending-entry/EMA exit/blocked-entry checks every {cfg.PENDING_ENTRY_RECHECK_SEC}s)"
     )
 
@@ -1175,13 +1213,12 @@ def _poller_staleness_job() -> None:
 # (start_ET, end_ET, interval_minutes) as (hour, minute) pairs: fast 3-min
 # refreshes in the morning and before the close, 10-min refreshes otherwise.
 # 2026-08-27, user request ("fix the stock universe check from ti web
-# scrapping ... starting 9:09 ET and perform the 3 min check till 10:30
-# ET, but don't trade until 9:30 ET"): tier 1 start moved 9:25 -> 9:09,
-# matching DISCOVERY_WINDOW_START_ET in config.py -- 7 extra 3-min
-# refreshes before the entry window (now 9:30, see ENTRY_WINDOW_START_ET)
+# scrapping ... starting 8:55 ET and perform the 3 min check till 10:30
+# ET, but don't trade until 9:25 ET"): tier 1 starts 30 min before
+# entries, matching DISCOVERY_WINDOW_START_ET in config.py
 # opens, so the universe is warm well before trading is allowed to start.
 _TI_CAPTURE_TIERS = [
-    ((9, 9),   (10, 30), 3),
+    ((8, 55),  (10, 30), 3),
     ((10, 30), (14, 50), 10),
     ((14, 50), (15, 50), 3),
 ]
@@ -1202,19 +1239,14 @@ def _ti_capture_job(now_et: Optional[datetime.datetime] = None) -> None:
 
     2026-08-28, user request ("stop the webscrapping from Trade ideas. instead
     use yahoo finance trending now, top gainer and top looser list"): TI's
-    "Free Use Has Expired" interstitial was firing on every single page load
-    that day plus a real Edge-crash/profile-lock failure -- replaced the whole
-    Selenium/Edge subprocess (capture_tradeideas.py via
-    scripts/run_ti_capture_task.ps1) with a direct, in-process call to
+    Selenium/Edge subprocess was replaced with a direct, in-process call to
     engine/ti/yahoo_universe.py: plain HTTP GETs (yfinance's day_gainers/
     day_losers screeners + Yahoo's trending endpoint), no browser, no login,
     no session to expire. That also means no more crash-prone child process
     to wedge-detect/taskkill -- this job is now just the interval gate; a
     fetch failure logs and retries next tick like any other best-effort job
-    in this loop. Windows Task Scheduler's ApexTraderTICapture task (the
-    older, since-superseded trigger path) was disabled the same day this
-    landed -- see git history for the one-off `schtasks` command; nothing in
-    this file depends on it either way.
+    in this loop. The TI scraper itself (capture_tradeideas.py) and its
+    Task-Scheduler launcher were deleted 2026-09-01.
     """
     global _last_ti_capture_ts
 
@@ -1231,68 +1263,54 @@ def _ti_capture_job(now_et: Optional[datetime.datetime] = None) -> None:
     try:
         from engine.ti.yahoo_universe import write_ti_primary
         n = write_ti_primary()
-        log.info(f"[TI-CAPTURE] Yahoo universe refreshed (tier interval={interval_min}min): {n} tickers")
+        log.info(f"[YAHOO-UNIVERSE] refreshed (tier interval={interval_min}min): {n} tickers")
     except Exception as e:
-        log.error(f"[TI-CAPTURE] Yahoo universe refresh failed: {e}")
+        log.error(f"[YAHOO-UNIVERSE] refresh failed: {e}")
 
 
-def _start_options_scan_thread(ctx: AppContext) -> None:
-    """Spawn a daemon thread that runs the options monitor + new-entry cycle
-    (_run_options_cycle) on its own OPTIONS_SCAN_INTERVAL_MIN timer,
-    independent of the equity scan_and_trade() loop.
-
-    2026-08-24, user request ("every one minute there should be new order
-    attempts if the conditions met"): this used to run INSIDE
-    scan_and_trade(), as step 2 of 8 -- BEFORE the equity discovery/scan/
-    execute steps that follow it. Every equity cycle waited on a full
-    options scan (160 tickers, sequential per-symbol bar fetches) to finish
-    first. Confirmed live: that alone routinely ran past a minute by itself,
-    so equity re-entries never got close to REGULAR_HOURS_SCAN_INTERVAL no
-    matter how low that config was set. Same fix as the per-minute EMA exit
-    check (_start_software_stop_thread) and the same reason it has to be a
-    real thread, not schedule.every() -- that's just as blocked whenever
-    scan_and_trade() itself is running, see that function's docstring.
-
-    Computes its own local MarketState each cycle rather than reading
-    ctx.market_state (written concurrently by the main loop) -- only
-    assigns it to ctx.market_state right before calling _run_options_cycle,
-    since that function's scan_options_universe() call still reads it from
-    there. Same level of shared-ctx looseness the SoftwareStopPoller thread
-    already runs with elsewhere in this file."""
-    import threading
-
-    def _loop() -> None:
-        while True:
-            try:
-                market_state = MarketState.from_now()
-                market_state.resolve_regime()
-                ctx.market_state = market_state
-                _run_options_cycle(ctx, market_state)
-            except Exception as e:
-                log.error(f"[OPTIONS-THREAD] cycle error: {e}", exc_info=True)
-            time.sleep(cfg.OPTIONS_SCAN_INTERVAL_MIN * 60)
-
-    t = threading.Thread(target=_loop, name="OptionsScanner", daemon=True)
-    t.start()
-    log.info(f"[OPTIONS-THREAD] Options scan thread started ({cfg.OPTIONS_SCAN_INTERVAL_MIN} min interval)")
+# 2026-09-02: set by the main loop's once-per-day 09:25 ET morning-readiness
+# trigger (see the run-loop readiness_due block). Wakes the ActiveListRefresher
+# below instantly instead of letting it sleep up to
+# ACTIVE_SCAN_SNAPSHOT_INTERVAL_MIN (10) minutes past the trigger -- confirmed
+# live 2026-09-02: a boot at 08:48 spaced the prewarm runs at 08:48/58, 09:08,
+# 09:18, 09:28, i.e. the last EMA warm-up landed AFTER the 09:30 open.
+_readiness_kick = threading.Event()
 
 
-def _start_active_list_thread() -> None:
+def _start_active_list_thread(ctx: AppContext) -> None:
     """Refresh the filtered active stock lists independently of scan duration."""
-    import threading
-
     def _loop() -> None:
         next_run = time.monotonic()
         while True:
             now_et = datetime.datetime.now(pytz.timezone("America/New_York"))
             if _within_discovery_window(now_et):
                 try:
-                    get_scan_targets(market_state=MarketState.from_now(now_et))
-                    log.info("[ACTIVE-LISTS] refreshed filtered combined/long/short snapshots")
+                    market_state = MarketState.from_now(now_et)
+                    _ti_capture_job(now_et)
+                    _discovery.scan_alpaca_movers(
+                        interval_min=cfg.ALPACA_MOVER_SCAN_INTERVAL_MIN,
+                        market_state=market_state,
+                    )
+                    warm_symbols = get_scan_targets(market_state=market_state)
+                    ctx.executor.prewarm_entry_ema(warm_symbols)
+                    log.info("[ACTIVE-LISTS] refreshed Yahoo+Alpaca filtered combined/long/short snapshots")
                 except Exception as e:
                     log.error(f"[ACTIVE-LISTS] refresh failed: {e}", exc_info=True)
-            next_run += cfg.ACTIVE_SCAN_SNAPSHOT_INTERVAL_MIN * 60
-            time.sleep(max(1.0, next_run - time.monotonic()))
+                next_run += cfg.ACTIVE_SCAN_SNAPSHOT_INTERVAL_MIN * 60
+            else:
+                # If the bot is already running before 08:55 ET, don't sleep
+                # through the discovery-window open on the full snapshot interval.
+                next_run += 60
+            # 2026-09-02: wait on the readiness kick instead of sleeping
+            # straight through, so the main loop's 09:25 ET morning-readiness
+            # trigger can force ti_capture + Alpaca movers + prewarm_entry_ema
+            # to run NOW. The work itself runs unconditionally at the top of
+            # this loop, so resetting next_run to "now" after a kick simply
+            # gives the kicked run a full fresh snapshot interval before the
+            # next scheduled one.
+            if _readiness_kick.wait(timeout=max(1.0, next_run - time.monotonic())):
+                _readiness_kick.clear()
+                next_run = time.monotonic()
 
     t = threading.Thread(target=_loop, name="ActiveListRefresher", daemon=True)
     t.start()
@@ -1306,6 +1324,23 @@ def start() -> None:
 
     _session.load_quarterly_state()
     _session.load_daily_state()
+    # 2026-09-02: clear a stale (prior-day) guardian flat flag at startup so a
+    # yesterday halt can never bleed into today. Today's flag is left intact --
+    # the 5s poll tick will flatten on it.
+    try:
+        _gf = Path(cfg.GUARDIAN_FLAT_FILE)
+        if _gf.exists():
+            import json as _json
+            today_et = datetime.datetime.now(pytz.timezone("America/New_York")).date().isoformat()
+            try:
+                stale = str(_json.loads(_gf.read_text(encoding="utf-8")).get("date")) != today_et
+            except Exception:
+                stale = True
+            if stale:
+                _gf.unlink(missing_ok=True)
+                log.info("Cleared stale guardian flat flag at startup")
+    except Exception as _e:
+        log.warning(f"startup guardian-flag cleanup failed: {_e}")
     log.info("=" * 70)
     log.info("APEXTRADER - Priority-Based Momentum Trading")
     log.info("=" * 70)
@@ -1325,7 +1360,7 @@ def start() -> None:
         log.error(f"Account info error: {e}")
 
     log.info("=" * 70)
-    log.info("Starting… Press Ctrl+C to stop")
+    log.info("Starting... Press Ctrl+C to stop")
     log.info("=" * 70)
 
     try:
@@ -1335,43 +1370,7 @@ def start() -> None:
 
     # Start the dedicated software-stop monitor thread
     _start_software_stop_thread(ctx)
-    _start_active_list_thread()
-    _start_options_scan_thread(ctx)
-
-    # Block until startup TI capture completes (up to 90s)
-    if cfg.USE_TRADEIDEAS_DISCOVERY:
-        try:
-            log.info("Startup TI capture — refreshing universe before first scan…")
-            _discovery.scan_tradeideas_universe(
-                enabled=cfg.USE_TRADEIDEAS_DISCOVERY,
-                scan_interval_min=cfg.TRADEIDEAS_SCAN_INTERVAL_MIN,
-                headless=cfg.TRADEIDEAS_HEADLESS,
-                chrome_profile=cfg.TRADEIDEAS_CHROME_PROFILE,
-                update_config=cfg.TRADEIDEAS_UPDATE_CONFIG_FILE,
-                priority_1=cfg.PRIORITY_1_MOMENTUM,
-                priority_2=cfg.PRIORITY_2_ESTABLISHED,
-                browser=cfg.TRADEIDEAS_BROWSER,
-                remote_debug_port=9222,
-            )
-            fut = getattr(_discovery, "_ti_future", None)
-            if fut is not None:
-                if cfg.STARTUP_TI_CAPTURE_TIMEOUT_S > 0:
-                    log.info(
-                        f"Waiting up to {cfg.STARTUP_TI_CAPTURE_TIMEOUT_S}s for startup TI capture…"
-                    )
-                    try:
-                        fut.result(timeout=cfg.STARTUP_TI_CAPTURE_TIMEOUT_S)
-                    except concurrent.futures.TimeoutError:
-                        log.warning("Startup TI capture timed out — proceeding with current universe")
-                    except Exception as e:
-                        log.warning(f"Startup TI capture failed: {e}")
-                else:
-                    log.info(
-                        "Startup TI capture is running in background; first scan will use current universe. "
-                        "Use this only if fresh TI tickers are not required at startup."
-                    )
-        except Exception as e:
-            log.warning(f"Startup TI capture error: {e}")
+    _start_active_list_thread(ctx)
 
     try:
         scan_and_trade(ctx)
@@ -1381,12 +1380,16 @@ def start() -> None:
     last_vix_check    = time.time()
     current_interval  = get_adaptive_interval(ctx)
     last_scan         = time.time()
+    entry_open_scan_date = None
+    entry_reopen_scan_date = None
+    readiness_scan_date = None  # 2026-09-02: once-per-day 09:25 ET morning-readiness trigger
     _, last_market_phase = get_market_hours_interval(MarketState.from_now().hour, {})
 
     schedule.every(30).minutes.do(log_status, ctx)
     schedule.every(30).minutes.do(_prune_universe_job)
     schedule.every(1).minutes.do(_guardrail_close_job, ctx)
     schedule.every(1).minutes.do(_eod_close_job, ctx)
+    schedule.every(1).minutes.do(_lunch_flat_job, ctx)
     schedule.every(1).minutes.do(_poller_staleness_job)
     schedule.every(1).minutes.do(_ti_capture_job)
     _schedule_on_clock_grid(cfg.PRICE_DRIFT_CHECK_INTERVAL_MIN, _price_drift_stop_job, ctx)
@@ -1412,18 +1415,80 @@ def start() -> None:
                 if cfg.ADAPTIVE_INTERVALS and (phase_changed or (time.time() - last_vix_check) >= 900):
                     new_interval = get_adaptive_interval(ctx)
                     if new_interval != current_interval:
-                        log.info(f"Scan interval: {current_interval} → {new_interval} min"
-                                 + (f" (phase: {last_market_phase} → {market_phase_now})" if phase_changed else ""))
+                        log.info(f"Scan interval: {current_interval} -> {new_interval} min"
+                                 + (f" (phase: {last_market_phase} -> {market_phase_now})" if phase_changed else ""))
                         current_interval = new_interval
                     last_vix_check = time.time()
                 last_market_phase = market_phase_now
 
-                if (time.time() - last_scan) >= (current_interval * 60):
+                now_et = datetime.datetime.now(pytz.timezone("America/New_York"))
+                entry_start = datetime.datetime.strptime(
+                    cfg.ENTRY_WINDOW_START_ET, "%H:%M"
+                ).time()
+                entry_open_due = (
+                    now_et.time() >= entry_start
+                    and entry_open_scan_date != now_et.date()
+                )
+                # 2026-09-01, two-window schedule: the afternoon entry segment
+                # (14:45-15:50) needs its own once-per-day kick, same shape as
+                # the morning one -- without it the first afternoon cycle waits
+                # out the adaptive interval before it can re-enter at all.
+                entry_reopen = datetime.datetime.strptime(
+                    cfg.ENTRY_WINDOW_BREAK_END_ET, "%H:%M"
+                ).time()
+                entry_reopen_due = (
+                    now_et.time() >= entry_reopen
+                    and entry_reopen_scan_date != now_et.date()
+                )
+                # 2026-09-02, user request ("check all the polling loops start
+                # at 9.25AM ET to avoid delays"): once-per-day 09:25 ET
+                # morning-readiness trigger -- forces a fresh scan cycle and
+                # kicks the ActiveListRefresher (immediate ti_capture + Alpaca
+                # movers + prewarm_entry_ema) so every polling loop has freshly
+                # ticked before the 09:30 open: EMA signals ready by 09:29,
+                # first orders at 09:30. Also covers a LATE boot (this
+                # morning's 09:29:46 restart): on boot after 09:25 this fires
+                # immediately instead of waiting out the adaptive interval.
+                # Scoped to the morning segment (ends at the 11:00 lunch flat);
+                # the afternoon segment has its own entry_reopen at 14:45.
+                readiness_open = datetime.datetime.strptime(
+                    cfg.MORNING_READINESS_ET, "%H:%M"
+                ).time()
+                readiness_close = datetime.datetime.strptime(
+                    cfg.ENTRY_WINDOW_BREAK_START_ET, "%H:%M"
+                ).time()
+                readiness_due = (
+                    now_et.weekday() < 5  # 2026-09-02 red-team: Mon-Fri only -- a Saturday 09:25 boot must not force scans/kicks on a non-trading day
+                    and readiness_open <= now_et.time() < readiness_close
+                    and readiness_scan_date != now_et.date()
+                )
+                # 2026-09-02 deep-dive (timeline sim S5): no scan triggers on
+                # weekends -- the discovery-window check is time-only, so a
+                # Saturday 09:14/adaptive trigger would otherwise run a full
+                # scan against closed markets. Protective + poller jobs on the
+                # schedule are unaffected (self-gated by their own windows).
+                if (now_et.weekday() < 5
+                        and (entry_open_due or entry_reopen_due or readiness_due
+                        or (time.time() - last_scan) >= (current_interval * 60))):
+                    if readiness_due:
+                        readiness_scan_date = now_et.date()
+                        log.info(
+                            "Morning-readiness scan trigger (%s ET): forcing fresh scan + ActiveListRefresher prewarm kick "
+                            "so EMA signals are ready by 09:29 for the 09:30 open",
+                            cfg.MORNING_READINESS_ET,
+                        )
+                        _readiness_kick.set()
+                    if entry_open_due:
+                        entry_open_scan_date = now_et.date()
+                        log.info("Entry-window-open scan trigger: forcing first executable scan")
+                    if entry_reopen_due:
+                        entry_reopen_scan_date = now_et.date()
+                        log.info("Afternoon-entry-open scan trigger: forcing first executable scan")
                     try:
                         ctx.executor.protect_positions()
                     except Exception as e:
                         log.error(f"protect_positions error: {e}", exc_info=True)
-                    # check_software_stops() runs in its dedicated 10s thread — not here
+                    # check_software_stops() runs in its dedicated 10s thread -- not here
 
                     try:
                         ctx.executor.ratchet_confident_winners()
@@ -1447,17 +1512,19 @@ def start() -> None:
 
                     last_scan = time.time()
                     log.info(f"Heartbeat: {datetime.datetime.now().isoformat()}")
-                    try:
-                        # Plain-text, UTC ISO timestamp — read by engine/watchdog.py's
-                        # stall monitor, which runs on the supervising process (no
-                        # heavy deps available there, so it can't just tail this log).
-                        (REPO_ROOT / "heartbeat.txt").write_text(
-                            datetime.datetime.now(datetime.timezone.utc).isoformat(), encoding="utf-8"
-                        )
-                    except Exception as e:
-                        log.warning(f"heartbeat.txt write failed: {e}")
+                    # Completed scan cycle -> unconditional heartbeat refresh
+                    # (bypasses the 60s rate limiter). The EVERY-TICK liveness
+                    # touch below is what keeps the stall watchdog honest
+                    # during long off-hours adaptive sleeps.
+                    _touch_heartbeat(force=True)
 
                 schedule.run_pending()
+                # 2026-09-02 red-team fix: touch the heartbeat EVERY tick
+                # (rate-limited to 60s inside _touch_heartbeat) so the
+                # watchdog's 15-min stall detector measures main-loop
+                # liveness, not time-since-last-scan -- a 20-min off-hours
+                # adaptive sleep must never read as "hung".
+                _touch_heartbeat()
                 time.sleep(5)
 
             except KeyboardInterrupt:
@@ -1473,7 +1540,7 @@ def start() -> None:
         log_status(ctx)
 
 
-# ── Public entry point ────────────────────────────────────────────────────────
+# -- Public entry point --------------------------------------------------------
 
 def run(*, force: bool = False, once: bool = False, top3_only: bool = False) -> None:
     if force:
@@ -1481,7 +1548,7 @@ def run(*, force: bool = False, once: bool = False, top3_only: bool = False) -> 
 
     if top3_only:
         ctx = _build_context()
-        log.info("APEXTRADER — Top3 scan mode")
+        log.info("APEXTRADER -- Top3 scan mode")
         scan_top3_only(ctx)
         log_status(ctx)
         return
@@ -1489,7 +1556,7 @@ def run(*, force: bool = False, once: bool = False, top3_only: bool = False) -> 
     if once:
         ctx = _build_context()
         log.info("=" * 70)
-        log.info("APEXTRADER — Single Scan Cycle")
+        log.info("APEXTRADER -- Single Scan Cycle")
         log.info("=" * 70)
         scan_and_trade(ctx)
         log_status(ctx)
@@ -1546,21 +1613,21 @@ def _demo() -> None:
     finally:
         _last_poller_tick, _poller_stale_alerted, send_email = _orig_tick, _orig_alerted, _orig_email
 
-    # ── _ti_capture_job / _ti_capture_interval_min ──────────────────────────
+    # -- _ti_capture_job / _ti_capture_interval_min --------------------------
     global _last_ti_capture_ts
     _orig_ts = _last_ti_capture_ts
     ET = pytz.timezone("America/New_York")
 
     try:
         # Tier lookup: inside each tier, and the gaps between/around them.
-        assert _ti_capture_interval_min(ET.localize(datetime.datetime(2026, 8, 27, 9, 8))) is None, "before first tier"
-        assert _ti_capture_interval_min(ET.localize(datetime.datetime(2026, 8, 27, 9, 9))) == 3, "tier 1 start (inclusive)"
+        assert _ti_capture_interval_min(ET.localize(datetime.datetime(2026, 8, 27, 8, 54))) is None, "before first tier"
+        assert _ti_capture_interval_min(ET.localize(datetime.datetime(2026, 8, 27, 8, 55))) == 3, "tier 1 start (inclusive)"
         assert _ti_capture_interval_min(ET.localize(datetime.datetime(2026, 8, 27, 10, 29))) == 3, "tier 1 end (exclusive upper)"
         assert _ti_capture_interval_min(ET.localize(datetime.datetime(2026, 8, 27, 10, 30))) == 10, "tier 2 start"
         assert _ti_capture_interval_min(ET.localize(datetime.datetime(2026, 8, 27, 11, 45))) == 10, "mid tier 2"
-        assert _ti_capture_interval_min(ET.localize(datetime.datetime(2026, 8, 27, 12, 30))) == 10, "tier 3 start"
-        assert _ti_capture_interval_min(ET.localize(datetime.datetime(2026, 8, 27, 14, 49))) == 10, "tier 3 end"
-        assert _ti_capture_interval_min(ET.localize(datetime.datetime(2026, 8, 27, 14, 50))) == 3, "tier 4 start"
+        assert _ti_capture_interval_min(ET.localize(datetime.datetime(2026, 8, 27, 12, 30))) == 10, "mid tier 2"
+        assert _ti_capture_interval_min(ET.localize(datetime.datetime(2026, 8, 27, 14, 49))) == 10, "tier 2 end"
+        assert _ti_capture_interval_min(ET.localize(datetime.datetime(2026, 8, 27, 14, 50))) == 3, "tier 3 start"
         assert _ti_capture_interval_min(ET.localize(datetime.datetime(2026, 8, 27, 15, 49))) == 3, "tier 4 end"
         assert _ti_capture_interval_min(ET.localize(datetime.datetime(2026, 8, 27, 15, 50))) is None, "after last tier"
         assert _ti_capture_interval_min(ET.localize(datetime.datetime(2026, 8, 27, 3, 0))) is None, "middle of the night"

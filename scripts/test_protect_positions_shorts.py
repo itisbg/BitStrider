@@ -12,13 +12,19 @@ reserved by another order" on either side.
 Run with:
   python scripts/test_protect_positions_shorts.py
 No network calls -- client is stubbed, submit_order just records what would
-have been submitted.
+have been submitted, and get_bars is monkeypatched (protect_positions ->
+_atr_trail_pct_for fetches 1-min bars per symbol; the stub returns an empty
+frame so ATR falls back to the flat TRAIL_STOP_PCT floor -- the exact
+behavior the assertions below pin -- instead of hitting Yahoo with the
+synthetic symbols).
 """
 import sys
 from pathlib import Path
 from types import SimpleNamespace
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+
+import pandas as pd
 
 import engine.execution.enhanced as enhanced
 from engine.execution.enhanced import EnhancedExecutor
@@ -65,7 +71,16 @@ positions = [
     _pos("THIN_FREE",  qty=50, qty_available=50),     # long, free -- thin_liquidity flag no longer changes the stop
 ]
 ex = _make_executor(positions, entry_log={"THIN_FREE": {"thin_liquidity": True}})
-ex.protect_positions()
+
+# Hermetic: protect_positions -> _atr_trail_pct_for -> get_bars (Yahoo) per
+# symbol. Stub it to an empty frame -- calculate_atr fail-opens to 0.0, which
+# lands on the flat TRAIL_STOP_PCT floor exactly as the assertions expect.
+_orig_get_bars = enhanced.get_bars
+enhanced.get_bars = lambda *args, **kwargs: pd.DataFrame()
+try:
+    ex.protect_positions()
+finally:
+    enhanced.get_bars = _orig_get_bars
 
 assert "LONG_FREE" in ex.client.submitted, "free long should get a trailing stop"
 assert "LONG_RESV" not in ex.client.submitted, "fully-reserved long should be skipped"
