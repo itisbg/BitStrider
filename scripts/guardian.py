@@ -249,7 +249,7 @@ def main() -> int:
     halt_pct = float(env.get("GUARDIAN_HALT_PCT", "1.5"))
     stale_sec = int(env.get("GUARDIAN_STALE_HEARTBEAT_SEC", "300"))
     start_hhmm = env.get("GUARDIAN_POLL_START_ET", "09:35")
-    end_hhmm = env.get("GUARDIAN_POLL_END_ET", "15:45")
+    end_hhmm = env.get("GUARDIAN_POLL_END_ET", "15:44")
 
     if not acquire_lock():
         log("[INFO] another guardian run is in progress -- skipping")

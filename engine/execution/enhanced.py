@@ -4075,9 +4075,14 @@ class EnhancedExecutor:
     def _exchange_close_for_today(self, now_et: datetime.datetime) -> Tuple[datetime.datetime, datetime.datetime, str]:
         """Return (official close ET, EOD close ET, source), cached per day.
 
-        Uses Alpaca's exchange calendar so early-close sessions flatten 10
-        minutes before the actual close, not 15:50 by habit. Falls back to
-        configured MARKET_CLOSE/EOD_CLOSE_TIME if the calendar is unavailable.
+        Uses Alpaca's exchange calendar so early-close sessions flatten in
+        time even when their close is before the configured EOD time. On a
+        regular session the CONFIGURED EOD_CLOSE_TIME governs (2026-09-03
+        (2nd): user set 15:44 -- the old close-10min override was why the
+        log showed eod_exit=15:50 while config said 15:45). We take the
+        EARLIER of the two so both the user's cutoff AND early-close
+        protection always hold. Falls back to configured
+        MARKET_CLOSE/EOD_CLOSE_TIME if the calendar is unavailable.
         """
         import pytz
 
@@ -4111,11 +4116,14 @@ class EnhancedExecutor:
             close_h, close_m = map(int, MARKET_CLOSE.split(":"))
             close_at = now_et.replace(hour=close_h, minute=close_m, second=0, microsecond=0)
 
-        eod_at = close_at - datetime.timedelta(minutes=10)
+        # EARLIER of the configured cutoff and calendar-close-minus-10min:
+        # the user's EOD_CLOSE_TIME governs regular sessions (15:44), while an
+        # early close (e.g. 13:00 holiday session -> 12:50 flatten) still wins
+        # whenever it would land before the configured time.
         configured_h, configured_m = map(int, EOD_CLOSE_TIME.split(":"))
         configured_eod = now_et.replace(hour=configured_h, minute=configured_m, second=0, microsecond=0)
-        if source == "config":
-            eod_at = configured_eod
+        eod_at = min(configured_eod, close_at - datetime.timedelta(minutes=10))
+        source = f"{source}+config-min" if source == "exchange-calendar" else "config"
 
         if not hasattr(self, "_exchange_close_cache"):
             self._exchange_close_cache = {}

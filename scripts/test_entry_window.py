@@ -16,6 +16,10 @@ loop regardless of this window.
      this no new entry positions only keep the existing positions overnight
      if they meet guardrails, and exit only" -- refined again same day,
      15:45 -> 15:50 for both ENTRY_WINDOW_END_ET and EOD_CLOSE_TIME.
+ 3. 2026-09-03, user request: 15:50 -> 15:45, then (2nd) 15:45 -> 15:44 --
+    the 9/3 afternoon entered MARA/MSTX at 15:43-15:44 and flattened at
+    15:50 with ~4 min of runway; 15:44 guarantees the book flat a minute
+    earlier under the same rule.
 
 2026-09-01, user request ("time for entry 9:14AM to 11:00AM and 2:45 PM to
 3:50PM ET"): the entry window is now TWO disjoint segments -- 09:14-11:00 and
@@ -55,8 +59,8 @@ assert DISCOVERY_WINDOW_START_ET == "08:55"
 assert ENTRY_WINDOW_START_ET == "09:14"
 assert ENTRY_WINDOW_BREAK_START_ET == "11:00"
 assert ENTRY_WINDOW_BREAK_END_ET == "14:45"
-assert ENTRY_WINDOW_END_ET   == "15:45"
-assert EOD_CLOSE_TIME        == "15:45"
+assert ENTRY_WINDOW_END_ET   == "15:44"
+assert EOD_CLOSE_TIME        == "15:44"
 assert LUNCH_FLAT_TIME_ET    == ENTRY_WINDOW_BREAK_START_ET, "lunch flat must fire exactly when the morning entry segment ends"
 assert ENTRY_WINDOW_END_ET  <= EOD_CLOSE_TIME, "entries must never still be open once the EOD close sweep starts"
 
@@ -80,10 +84,10 @@ assert _within_entry_window(_at(9, 14)) is True, "exactly at 09:14 open boundary
 assert _within_entry_window(_at(10, 0)) is True
 assert _within_entry_window(_at(11, 0)) is True, "exactly at 11:00 segment-1 close -> inside (inclusive)"
 
-# Inside the afternoon entry segment (14:45-15:45, inclusive both ends).
+# Inside the afternoon entry segment (14:45-15:44, inclusive both ends).
 assert _within_entry_window(_at(14, 45)) is True, "exactly at 14:45 segment-2 open -> inside (inclusive)"
 assert _within_entry_window(_at(15, 0)) is True
-assert _within_entry_window(_at(15, 45)) is True, "exactly at 15:45 close boundary -> inside (inclusive)"
+assert _within_entry_window(_at(15, 44)) is True, "exactly at 15:44 close boundary -> inside (inclusive)"
 
 # The midday break is outside both segments.
 assert _within_entry_window(_at(11, 1)) is False, "one minute into the lunch break -> outside"
@@ -92,7 +96,7 @@ assert _within_entry_window(_at(14, 44)) is False, "one minute before afternoon 
 
 # Outside the window entirely.
 assert _within_entry_window(_at(9, 13)) is False, "one minute before 09:14 open -> outside"
-assert _within_entry_window(_at(15, 46)) is False, "one minute after the 15:45 close -> outside"
+assert _within_entry_window(_at(15, 45)) is False, "one minute after the 15:44 close -> outside"
 assert _within_entry_window(_at(15, 51)) is False, "one minute after the old 15:50 close -> outside"
 assert _within_entry_window(_at(15, 55)) is False, "AXTI incident time -> must stay outside"
 assert _within_entry_window(_at(16, 0)) is False, "old 16:00 boundary -> now outside"
@@ -108,4 +112,4 @@ assert in_lunch_break(_at(14, 44)) is True
 assert in_lunch_break(_at(14, 45)) is False, "break ends at 14:45 (exclusive -- afternoon opens)"
 assert in_lunch_break(_at(15, 0)) is False
 
-print("OK: entry window = [09:14-11:00] + [14:45-15:45] ET, lunch break [11:00-14:45) is fully flat, discovery runs through the break, nothing extends past EOD_CLOSE_TIME")
+print("OK: entry window = [09:14-11:00] + [14:45-15:44] ET, lunch break [11:00-14:45) is fully flat, discovery runs through the break, nothing extends past EOD_CLOSE_TIME")

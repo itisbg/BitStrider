@@ -1,6 +1,6 @@
 """Review the last N calendar days of real Alpaca fills against the new
-two-window trading schedule (2026-09-01): entries 09:14-11:00 + 14:45-15:45 ET,
-lunch-flat at 11:00, EOD exit at 15:45, no overnight holds.
+two-window trading schedule (2026-09-03): entries 09:14-11:00 + 14:45-15:44 ET,
+lunch-flat at 11:00, EOD exit at 15:44, no overnight holds.
 
 Data source: Alpaca account activities (READ-ONLY GETs -- no orders placed).
 Round trips are reconstructed with a POSITION LADDER keyed on Alpaca's signed
@@ -12,7 +12,7 @@ pairing (confirmed: a naive FIFO produced 377 phantom open positions).
 Each reconstructed leg is then checked against the new limits:
   - entry before 09:14 ET -> BLOCKED by ENTRY_WINDOW_START_ET
   - entry in 11:00-14:45    -> BLOCKED (midday break, book flat)
-  - entry after 15:45 ET    -> BLOCKED (EOD close limit)
+  - entry after 15:44 ET    -> BLOCKED (EOD close limit)
   - leg still open at 11:00 -> lunch-flat sweep would close it
   - leg still open past 15:45 / overnight -> EOD close sweep would close it
 
@@ -34,7 +34,7 @@ ET = pytz.timezone("America/New_York")
 
 # New two-window schedule (config.py 2026-09-01).
 W_AM_OPEN, W_AM_CLOSE = 9 * 60 + 14, 11 * 60        # 09:14-11:00 ET (inclusive)
-W_PM_OPEN, W_PM_CLOSE = 14 * 60 + 45, 15 * 60 + 45  # 14:45-15:45 ET (inclusive)
+W_PM_OPEN, W_PM_CLOSE = 14 * 60 + 45, 15 * 60 + 44  # 14:45-15:44 ET (inclusive)
 
 
 def load_env() -> dict:
@@ -265,7 +265,7 @@ def main() -> None:
     for rt in viol["lunch"][:15]:
         print(f"  {rt['date']} {rt['sym']:<6} {rt['kind']:<9} {'short' if rt['dir']<0 else 'long':<5} "
               f"entry {rt['entry_et']} ET ${rt['pnl']:+.2f}")
-    print(f"entries after 15:45 ET (would be blocked): {len(viol['after_pm'])}")
+    print(f"entries after 15:44 ET (would be blocked): {len(viol['after_pm'])}")
     for rt in viol["after_pm"][:15]:
         print(f"  {rt['date']} {rt['sym']:<6} {rt['kind']:<9} {'short' if rt['dir']<0 else 'long':<5} "
               f"entry {rt['entry_et']} ET ${rt['pnl']:+.2f}")
@@ -278,7 +278,7 @@ def main() -> None:
     print(f"positions still open at/after 11:00 (lunch-flat would close): {len(held_lunch)}")
     for e in held_lunch[:10]:
         print(f"  {e['date']} {e['sym']:<6} exit {et_hhmm(e['time'])} ET")
-    print(f"positions still open at/after 15:45 (EOD close would cut): {len(held_eod)}")
+    print(f"positions still open at/after 15:44 (EOD close would cut): {len(held_eod)}")
     for e in held_eod[:10]:
         print(f"  {e['date']} {e['sym']:<6} exit {et_hhmm(e['time'])} ET")
     print(f"positions exited on a different day than entered (overnight): {len(overnight_exits)}")

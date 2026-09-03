@@ -65,6 +65,34 @@ exits blind-cancelled + slept 0.4s + closed and Alpaca rejected the close 9x wit
   NOT the runtime/generated noise (data/*.json, graphify-out, heartbeat).
 
 ---
+## Snapshot — 2026-09-03 ~16:20 ET (afternoon end 15:45 -> 15:44 ET — IMPLEMENTED, TESTED, DEPLOYING)
+
+### Goal
+User: "change afternoon trade ending at 3.44pm ET" — motivated by the 9/3 afternoon
+post-mortem: MARA entered 15:43:42 and MSTX re-entered 15:44:43 were flattened at
+15:50 with ~4 min of runway (-$2.55/-$1.20); afternoon net was -$1.02 vs a +$11.75 day.
+
+### What — all boundaries moved together, same contract as the prior 15:50->15:45 move
+- `engine/config.py`: `ENTRY_WINDOW_END_ET` "15:45"->"15:44", `EOD_CLOSE_TIME`
+  "15:45"->"15:44", `GUARDIAN_POLL_END_ET` default ->"15:44"; import-time EOD-gap
+  assert widened 10-15 -> 10-16 min (15:44 is a 16-min gap to the 16:00 close).
+- `engine/execution/enhanced.py` `_exchange_close_for_today()`: ROOT-CAUSE FIX --
+  previously the exchange-calendar path OVERRODE the configured EOD time
+  (eod_at = close-10min = 15:50, which is why the live log showed eod_exit=15:50
+  while config said 15:45). Now takes the EARLIER of configured EOD_CLOSE_TIME
+  and calendar-close-minus-10min, so the user's 15:44 governs regular sessions
+  AND early-close sessions still flatten in time.
+- `engine/watchdog.py`: flat-deploy window after EOD now 15:45+ ET (was 15:46+).
+- `scripts/guardian.py`: poll-end fallback ->"15:44". `scripts/deploy.py`: doc/messages.
+- Tests updated: entry-window boundaries (15:44 inclusive / 15:45 outside),
+  deploy-window matrix, timeline-sim discovery end, thin-liquidity comment,
+  `_review_30d.py` W_PM_CLOSE + prints.
+
+### Verification — ALL GREEN
+- **54/54 `scripts/test_*.py` exit 0** + compileall OK + `git diff --check` clean.
+
+### Deploy state — see next snapshot (committed dc40b1a lineage continues)
+---
 ## Snapshot — 2026-09-03 ~14:05 ET (MFE give-back stop implemented + deploy)
 
 ### What

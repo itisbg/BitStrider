@@ -1,6 +1,6 @@
 """Self-check for _should_admit_thin_liquidity's EOD cutoff (2026-08-17, at
 the user's request): thin-liquidity admits must stop at EOD_CLOSE_TIME
-(15:45 ET), not just anywhere in regular hours -- close_guardrail_fail_
+(now 15:44 ET), not just anywhere in regular hours -- close_guardrail_fail_
 positions only sweeps once, gated on that same time, so an admit after it
 has no same-day guardrail check left to catch it before an overnight hold
 (confirmed same-day: ASST and NUAI both admitted at 15:57 ET, 12 min after
@@ -37,7 +37,7 @@ if TRADE_THIN_LIQUIDITY_REJECTS:
     assert _should_admit_thin_liquidity("rvol", _state("14:00")) is True
 
     # At/after EOD_CLOSE_TIME, no more admits -- this is the fix. Reads the
-    # live config value (now 15:45, was 15:50) rather than a hardcoded
+    # live config value (now 15:44, was 15:45/15:50) rather than a hardcoded
     # literal so this doesn't silently go stale the next time it moves --
     # see scripts/test_entry_window.py for the incident that taught this.
     assert _should_admit_thin_liquidity("rvol", _state(EOD_CLOSE_TIME)) is False

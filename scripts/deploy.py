@@ -4,7 +4,7 @@ Runs the full offline test gate (every scripts/test_*.py + compileall) and only
 if ALL green writes deploy_requested.flag into the LOCAL state dir
 (%LOCALAPPDATA%\\ApexTrader\\state). The watchdog (engine/watchdog.py) polls
 that flag and restarts main.py on the new code -- but only inside the flat
-deploy windows (lunch 11:00-14:45 ET rule-enforced flat, or after the 15:50 ET
+deploy windows (lunch 11:00-14:45 ET rule-enforced flat, or after the 15:44 ET
 EOD flat until 09:05 ET next prep). Outside those windows the flag stays and
 the watchdog applies it at the next window.
 
@@ -78,7 +78,7 @@ def main() -> int:
     FLAG_FILE.write_text(content, encoding="utf-8")
     print(f"[DEPLOY] flag written -> {FLAG_FILE}")
     print(f"[DEPLOY] watchdog will restart main.py on the new code at the next flat deploy window "
-          f"(11:00-14:45 ET / after 15:50 ET). No PowerShell needed.")
+          f"(11:00-14:45 ET / after 15:44 ET). No PowerShell needed.")
     return 0
 
 

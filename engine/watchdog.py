@@ -35,7 +35,7 @@ PID_FILE = LOG_DIR / "autobot.pid"
 # LOCAL (non-synced) ApexTrader state dir; this watchdog consumes it and
 # restarts main.py on the new code. Restart is deferred to windows when the
 # book is guaranteed flat (lunch 11:00-14:45 ET rule-enforced flat, and after
-# the 15:50 EOD flat until next prep at 09:05 ET). Same LOCALAPPDATA rationale
+# the 15:44 EOD flat until next prep at 09:05 ET). Same LOCALAPPDATA rationale
 # as VENV_DIR: coordination files must never sync via OneDrive.
 STATE_DIR = LOCAL_DIR / "state"
 DEPLOY_FLAG_FILE = STATE_DIR / "deploy_requested.flag"
@@ -366,14 +366,14 @@ class AutoBotWatchdog:
     def _deploy_window_allows(self, now_et: datetime.datetime) -> bool:
         """Restart-on-deploy only when the book is guaranteed flat:
           - lunch break 11:00-14:45 ET (rule-enforced flat, LUNCH_FLAT_TIME_ET),
-          - after the 15:50 ET EOD flat through 09:05 ET next prep scan.
+          - after the 15:44 ET EOD flat through 09:05 ET next prep scan.
         Outside those, a mid-session deploy could race an open position, so the
         flag is left in place and the restart defers until a window opens."""
         hm = now_et.hour * 60 + now_et.minute
         lunch_flat = (11 * 60, 14 * 60 + 45)      # 11:00-14:45 ET
         if lunch_flat[0] <= hm < lunch_flat[1]:
             return True
-        eod_to_prep = (15 * 60 + 45, 9 * 60 + 5)  # after 15:45 ET (EOD close, 2026-09-03: was 15:50) -> 09:05 ET next day
+        eod_to_prep = (15 * 60 + 44, 9 * 60 + 5)  # after 15:44 ET (EOD close, 2026-09-03 (2nd): was 15:45) -> 09:05 ET next day
         if eod_to_prep[0] < hm or hm < eod_to_prep[1]:
             return True
         return False
