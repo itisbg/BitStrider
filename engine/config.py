@@ -996,6 +996,40 @@ MFE_BREAKEVEN_FLOOR_PCT   = 0.1   # floor: an armed trade exits before falling u
 # hours too).
 # -----------------------------------------------------------------
 AFTERHOURS_STOP_CHECK_ENABLED = True
+AFTERHOURS_STOP_CHECK_ENABLED = True
+AFTERHOURS_CHASE_STALE_SECONDS = 45  # re-chase (cancel + resubmit at fresh price) if the close sits unfilled this long
+
+# ---------------------------------------------------------------------------------
+# Close/Protection Order Reconciliation -- 2026-09-03, SNOW post-mortem.
+# Live SNOW (9/3): a 1-share long's GTC trailing stop reserved the only share, so
+# the software-stop close was rejected NINE times with Alpaca 40310000
+# "insufficient qty available ... held_for_orders=1" while the position bled from
+# $380.25 to $365.62 (-3.85%) before the EMA9 exit finally caught it. The exit
+# paths used to cancel-then-blindly-sleep(0.4)-then-close, which races the broker's
+# own cancel processing.
+#
+# Fix: every intentional software close (software SL, EMA9 exit, MFE give-back)
+# goes through _request_reconciled_close(), which
+#   1. dedupes against an already-pending close for the symbol,
+#   2. cancels ONLY valid GTC protective trailing stops (never entry orders),
+#   3. POLLS broker order state until the cancel is confirmed (bounded timeout),
+#   4. re-reads the live position and closes exactly the remaining quantity,
+#   5. re-arms GTC protection on a failed close (existing behavior, centralized).
+# Disable to restore the legacy cancel+sleep+close behavior.
+CLOSE_RECONCILIATION_ENABLED        = True
+CLOSE_CANCEL_CONFIRM_TIMEOUT_SEC    = float(os.getenv("CLOSE_CANCEL_CONFIRM_TIMEOUT_SEC", "2.0"))
+CLOSE_CANCEL_CONFIRM_POLL_SEC       = float(os.getenv("CLOSE_CANCEL_CONFIRM_POLL_SEC", "0.25"))
+PENDING_CLOSE_RETRY_SEC             = float(os.getenv("PENDING_CLOSE_RETRY_SEC", "10"))
+
+# ---------------------------------------------------------------------------------
+# Execution telemetry -- non-blocking JSONL event log under
+# %LOCALAPPDATA%\ApexTrader\analytics\ (machine-local, git-ignored by location,
+# never in the OneDrive repo). Observability only: a telemetry failure must NEVER
+# delay or break a trading decision -- see engine/telemetry.py (bounded queue,
+# daemon writer, drops-on-full).
+EXECUTION_TELEMETRY_ENABLED = True
+TELEMETRY_QUEUE_MAX         = int(os.getenv("TELEMETRY_QUEUE_MAX", "2000"))
+TELEMETRY_FLUSH_INTERVAL_SEC = float(os.getenv("TELEMETRY_FLUSH_INTERVAL_SEC", "2.0"))
 AFTERHOURS_CHASE_STALE_SECONDS = 45  # re-chase (cancel + resubmit at fresh price) if the close sits unfilled this long
 # 2026-08-24, user request: no post-loss re-entry cooldown anymore (was 1440min /
 # 24h here). Protection is the exit stack alone -- trailing stop, per-minute

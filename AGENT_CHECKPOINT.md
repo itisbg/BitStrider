@@ -9,6 +9,62 @@
 > re-asking questions. Update BEFORE starting a risky step, and again after it.
 
 ---
+## Snapshot — 2026-09-03 ~15:20 ET (Release 1: close/protection order reconciliation — IMPLEMENTED, TESTED, NOT YET DEPLOYED)
+
+### Goal
+Fix the 9/3 SNOW exit failure root cause (execution layer only — NO entry/sizing/stop changes):
+the 1-share SNOW long's GTC trailing stop reserved the only share, so software SL / EMA9 / MFE
+exits blind-cancelled + slept 0.4s + closed and Alpaca rejected the close 9x with 40310000
+"insufficient qty available ... held_for_orders" while the position bled $380.25 -> $365.62 (-3.85%).
+
+### What (portfolio policy unchanged: no entry blocks, no size reductions, no stop tightening)
+- `engine/execution/enhanced.py`:
+  - `ActiveOrderView` + `_normalize_order_view()` (enum/stub-tolerant order snapshot) and
+    `classify_symbol_order()` — pure: valid_protection requires GTC + trailing_stop + closing side;
+    entry/staged/reentry ids (apex-*) are NEVER protection; wrong-side never protection; partial
+    protection detected via remaining_qty vs position.
+  - `CloseResult` + `_request_reconciled_close()` — THE one entry point for intentional software
+    closes: refresh position -> dedupe pending close (reconciled vs broker, resubmits only if the
+    close order died and position remains) -> cancel ONLY classified protection -> bounded POLL
+    (CLOSE_CANCEL_CONFIRM_TIMEOUT_SEC / _POLL_SEC) for cancel confirmation -> re-read position
+    (cancelled stop may have filled) -> close exactly remaining qty via `_submit_closing_order`
+    (now returns the accepted order, takes optional client_order_id) -> on close failure re-arm GTC
+    trail (centralized fail-safe; both failing => `critical_unprotected` + telemetry).
+  - Legacy behavior preserved when `CLOSE_RECONCILIATION_ENABLED=False` (same method, legacy branch).
+  - Wired into: `check_software_stops` (stop-watch now cleared only on confirmed flat / PDT-block,
+    not optimistically on submit; position-gone also clears `_pending_closes`), `check_ema9_exit`,
+    `check_mfe_giveback_exit`. Pending-close dedupe guarantees ONE intentional close per symbol.
+  - Self-test stub `_Ema9Stub` updated for the new indirection.
+- `engine/telemetry.py` (NEW): non-blocking JSONL event log to
+  `%LOCALAPPDATA%\ApexTrader\analytics\execution-events-YYYY-MM-DD.jsonl` — bounded queue, daemon
+  writer, drops-on-full (counted), never raises into trading code, no credentials/network.
+  Events: close_submitted / close_rejected / protection_cancel_requested / critical_unprotected.
+- `engine/config.py`: `CLOSE_RECONCILIATION_ENABLED=True`, `CLOSE_CANCEL_CONFIRM_TIMEOUT_SEC=2.0`,
+  `CLOSE_CANCEL_CONFIRM_POLL_SEC=0.25`, `PENDING_CLOSE_RETRY_SEC=10`, `EXECUTION_TELEMETRY_ENABLED=True`,
+  `TELEMETRY_QUEUE_MAX`, `TELEMETRY_FLUSH_INTERVAL_SEC`.
+
+### Tests — ALL GREEN
+- NEW: `scripts/test_order_classification.py`, `scripts/test_reconciled_close.py` (12 scenarios incl.
+  cancel-timeout defer, stop-fills-during-cancel, partial-fill qty re-read, re-arm fail-safe, PDT block),
+  `scripts/test_snow_exit_reconciliation.py` (real 9/3 sequence replayed: FIRST breach closes, 6 poller
+  ticks submit no duplicate, watch clears on confirmed flat), `scripts/test_telemetry.py`.
+- Full suite: **54/54 `scripts/test_*.py` exit 0** + `python -m compileall -q engine scripts` OK +
+  `git diff --check` clean.
+- Note: working-copy AGENT_CHECKPOINT.md was stale (missing the 9/3 14:05/12:00/11:30 snapshots);
+  restored from HEAD before this session's edits (no unique local content was lost).
+
+### Deploy state — NOT DEPLOYED (human-gated)
+- Nothing pushed, no deploy flag written. To deploy after review:
+  `python scripts/deploy.py --reason "reconcile protective and software close orders"`
+  (watchdog applies at the next flat window). Rollback: set `CLOSE_RECONCILIATION_ENABLED=False`
+  (legacy cancel+sleep path restored through the same method) + redeploy.
+- What's next: observe `held_for_orders` / duplicate-close counts + fill-to-protection latency for a
+  session; then Release 2 (shadow high-momentum classification + offline portfolio evaluator) per plan.
+- Commit plan: commit engine/config.py, engine/execution/enhanced.py, engine/telemetry.py,
+  scripts/test_{order_classification,reconciled_close,snow_exit_reconciliation,telemetry}.py —
+  NOT the runtime/generated noise (data/*.json, graphify-out, heartbeat).
+
+---
 ## Snapshot — 2026-09-03 ~14:05 ET (MFE give-back stop implemented + deploy)
 
 ### What

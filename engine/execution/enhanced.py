@@ -15,7 +15,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import deque
 from types import SimpleNamespace
-from typing import Optional, Dict, Tuple, Deque
+from typing import Any, Optional, Dict, Tuple, Deque
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -64,6 +64,7 @@ from engine.config import (
     NO_GAIN_EXIT_ENABLED, NO_GAIN_EXIT_HOURS, NO_GAIN_EXIT_MIN_PCT, NO_GAIN_EXIT_MAX_LOSS_PCT,
     MFE_GIVEBACK_ENABLED, MFE_ARM_PROFIT_PCT, MFE_GIVEBACK_FRACTION, MFE_BREAKEVEN_FLOOR_PCT,
     AFTERHOURS_STOP_CHECK_ENABLED, AFTERHOURS_CHASE_STALE_SECONDS,
+    CLOSE_RECONCILIATION_ENABLED, CLOSE_CANCEL_CONFIRM_TIMEOUT_SEC, CLOSE_CANCEL_CONFIRM_POLL_SEC,
     MAX_POSITION_CONCENTRATION_PCT, CORRELATION_GROUPS, MAX_PORTFOLIO_LEVERAGE,
     POSITION_CAP_GROWTH_FACTOR, POSITION_CAP_ABSOLUTE_MAX_PCT,
     LONG_ONLY_MODE,
@@ -99,6 +100,7 @@ from engine.notifications.notifications import send_email
 # daily-loss halt). Used by _entry_halt_active so re-entry paths honor the
 # daily-loss limit (2026-09-02: previously skipped entirely on re-entries).
 from engine.session import session as _session
+from engine.telemetry import log_event as _telemetry_log
 
 log = logging.getLogger("ApexTrader")
 
@@ -364,6 +366,135 @@ def _live_quote_mid(client, symbol: str, fallback: float) -> float:
     except Exception:
         pass
     return fallback
+
+
+# ----------------------------------------------------------------------------------------------------------------------------
+# Order-state normalization & classification (2026-09-03, SNOW post-mortem).
+# A symbol having "some open order" is NOT proof of protection: SNOW's 1-share
+# long sat behind 9 rejected software-stop closes (Alpaca 40310000
+# "held_for_orders") because a GTC trailing stop reserved the only share, and the
+# exit paths blind-cancelled + slept 0.4s + closed, racing the broker's cancel
+# processing. These helpers let close paths see WHAT each order is before acting.
+# ----------------------------------------------------------------------------------------------------------------------------
+
+# Broker statuses under which an order can still act (fill or block quantity).
+# "pending_cancel" stays in here deliberately: until the broker confirms the
+# cancel, the quantity is still reserved.
+_ACTIVE_ORDER_STATUSES = {
+    "new", "accepted", "pending_new", "pending_replace", "accepted_for_bidding",
+    "partially_filled", "held", "pending_cancel", "done_for_day_pending_cancel",
+}
+
+
+@dataclass(frozen=True)
+class ActiveOrderView:
+    """Normalized, failure-tolerant snapshot of one broker order."""
+    order_id: str
+    symbol: str
+    side: str            # "buy" / "sell" (lowercased, enum-tolerant)
+    order_type: str      # e.g. "trailing_stop", "limit", "market"
+    time_in_force: str   # "gtc" / "day" / ...
+    status: str          # lowercase broker status
+    qty: float
+    filled_qty: float
+    client_order_id: str
+
+    @property
+    def remaining_qty(self) -> float:
+        return max(0.0, self.qty - self.filled_qty)
+
+    @property
+    def is_active(self) -> bool:
+        return self.status in _ACTIVE_ORDER_STATUSES
+
+
+def _normalize_order_view(order: Any) -> Optional[ActiveOrderView]:
+    """Tolerate alpaca models AND the minimal SimpleNamespace stubs used by the
+    test suite: any missing/unparsable field degrades to a safe default rather
+    than raising. Returns None only when there's no usable id/symbol."""
+    def _low(v: Any) -> str:
+        return str(getattr(v, "value", v) or "").lower()
+
+    try:
+        oid = str(getattr(order, "id", "") or "")
+        sym = str(getattr(order, "symbol", "") or "")
+        if not oid or not sym:
+            return None
+        return ActiveOrderView(
+            order_id=oid,
+            symbol=sym,
+            side=_low(getattr(order, "side", "")),
+            order_type=_low(getattr(order, "order_type", "")),
+            time_in_force=_low(getattr(order, "time_in_force", "")),
+            status=_low(getattr(order, "status", "")),
+            qty=float(getattr(order, "qty", 0) or 0),
+            filled_qty=float(getattr(order, "filled_qty", 0) or 0),
+            client_order_id=str(getattr(order, "client_order_id", "") or ""),
+        )
+    except Exception:
+        return None
+
+
+def classify_symbol_order(view: Optional[ActiveOrderView], position_qty: float) -> str:
+    """Pure decision: what is this order FOR, relative to the live position?
+
+    Returns one of: entry | staged_entry | reentry | pending_close |
+    pending_close_legacy | valid_protection | partial_protection | wrong_side |
+    unknown. Client-order-id prefixes (apex-entry-/apex-staged-/apex-reentry-trail-/
+    apex-close-) are authoritative where present -- they survive every code path
+    that creates them. Otherwise protection requires GTC + trailing_stop + the
+    position-closing side; anything else on the closing side is treated as closing
+    intent (legacy limit closes submitted before this scheme existed), and an
+    order on the WRONG side is never, ever protection.
+    """
+    if view is None:
+        return "unknown"
+    coid = view.client_order_id or ""
+    if coid.startswith("apex-close-"):
+        return "pending_close"
+    if coid.startswith("apex-staged-"):
+        return "staged_entry"
+    if coid.startswith("apex-reentry-trail-"):
+        return "reentry"
+    if coid.startswith("apex-entry-"):
+        return "entry"
+    if not view.is_active:
+        return "unknown"
+    if position_qty == 0:
+        return "unknown"  # no position: nothing here is protection or a close
+    closing_side = "sell" if position_qty > 0 else "buy"
+    if view.side == closing_side:
+        if view.order_type == "trailing_stop" and view.time_in_force == "gtc":
+            # Protection -- but a partially-filled stop protecting less than the
+            # full position leaves the rest uncovered.
+            if 0 < view.remaining_qty < abs(position_qty):
+                return "partial_protection"
+            return "valid_protection"
+        return "pending_close_legacy"
+    return "wrong_side"
+
+
+def _pending_close_client_id(symbol: str, reason: str) -> str:
+    """Stable, broker-safe client order id for deliberate closes -- the marker
+    classify_symbol_order() uses to recognise our own closing orders after a
+    restart or across poller ticks. Reason is sanitized to a short token; no
+    free-form exception text goes into an order id."""
+    token = re.sub(r"[^a-z0-9]+", "-", str(reason or "exit").lower()).strip("-")[:20]
+    return f"apex-close-{token}-{symbol}-{int(time.time())}"
+
+
+@dataclass(frozen=True)
+class CloseResult:
+    """Explicit outcome of _request_reconciled_close() -- callers must never have
+    to guess whether a close actually went out."""
+    state: str                 # flat | already_pending | submitted | cancel_pending
+                               # | failed_reprotected | critical_unprotected
+                               # | blocked_pdt | failed
+    symbol: str
+    order_id: Optional[str]
+    requested_qty: int
+    remaining_position_qty: int
+    detail: str
 
 
 def _apply_thin_liquidity_override(risk_info: Dict, signal: Signal, equity: float) -> Dict:
@@ -997,6 +1128,12 @@ def _demo() -> None:
                 self.closed = []
             def _submit_closing_order(self, sym, qty, side, current):
                 self.closed.append(sym)
+            def _request_reconciled_close(self, symbol, reason, current_price, **k):
+                # Stub the reconciliation entry point itself: the EMA9 close path
+                # now routes through it (2026-09-03), so the self-test exercises
+                # the decision logic, not broker reconciliation.
+                self.closed.append(symbol)
+                return CloseResult("submitted", symbol, "stub-close-id", 5, 5, "stub")
             def _maybe_rearm_reentry(self, sym, is_long, qty, tag, was_loss=False):
                 pass
 
@@ -1148,6 +1285,14 @@ class EnhancedExecutor:
         # price (fail-open after a restart: we may miss the pre-restart peak
         # but never invent one). Cleaned up when the position is gone.
         self._mfe_peaks: Dict[str, float] = {}
+        # {symbol: close-state dict} -- deliberate software closes in flight
+        # (software SL / EMA9 / MFE), tracked by _request_reconciled_close().
+        # Guarantees at most ONE intentional close per symbol no matter how many
+        # exit rules fire on the same 5s tick (SNOW 9/3: three exit paths kept
+        # cancelling each other's protection and resubmitting against a GTC-
+        # reserved share -- 9 consecutive 40310000 rejections). Cleared when the
+        # position confirms flat; reconciled from broker state after a restart.
+        self._pending_closes: Dict[str, dict] = {}
         # {symbol: {"order_id": str, "qty": int, "is_long": bool, "chase_count": int}}
         # -- resting entry orders not yet confirmed filled; swept by _sweep_pending_entries
         self._entry_pending: Dict[str, dict] = {}
@@ -2967,8 +3112,8 @@ class EnhancedExecutor:
     def _submit_closing_order(
         self, symbol: str, qty: int, side: OrderSide, current_price: float,
         slip_pct: float = 0.5, force_extended_hours: bool = False,
-        no_extended_hours: bool = False,
-    ) -> None:
+        no_extended_hours: bool = False, client_order_id: Optional[str] = None,
+    ) -> Optional[object]:
         """Submit a position-closing order as a marketable limit crossing the
         spread by slip_pct off the LIVE bid/ask mid (see _live_quote_mid) --
         never a naked MarketOrderRequest during regular hours either
@@ -2994,8 +3139,230 @@ class EnhancedExecutor:
             symbol=symbol, qty=qty, side=side, time_in_force=TimeInForce.DAY,
             limit_price=round(mid * slip, 2),
             extended_hours=extended,
+            **({"client_order_id": client_order_id} if client_order_id else {}),
         )
-        self.client.submit_order(req)
+        # Return the accepted order so close paths can track it by broker id
+        # (previously None -- callers couldn't reconcile an in-flight close).
+        return self.client.submit_order(req)
+
+    def _request_reconciled_close(
+        self, symbol: str, reason: str, current_price: float, *,
+        slip_pct: float = 0.5, force_extended_hours: bool = False,
+        no_extended_hours: bool = False,
+    ) -> CloseResult:
+        """The ONE entry point for intentional software closes (software SL,
+        EMA9 exit, MFE give-back). Replaces the old cancel-all -> sleep(0.4) ->
+        close-with-stale-qty sequence that raced the broker's own cancel
+        processing: SNOW 9/3 took NINE consecutive 40310000 "insufficient qty
+        available ... held_for_orders" rejections while a GTC trailing stop
+        reserved the only share, and the position bled -3.85% before any exit
+        landed.
+
+        Sequence (CLOSE_RECONCILIATION_ENABLED=True):
+          1. refresh the live position -- flat means done, no order at all;
+          2. dedupe: an already-pending close is reconciled against broker
+             state (still working / gone-and-resubmitted), never duplicated;
+          3. cancel ONLY classified protection (GTC trailing stops on the
+             closing side) -- entry/staged orders are never touched;
+          4. POLL broker state until the cancel is confirmed, bounded by
+             CLOSE_CANCEL_CONFIRM_TIMEOUT_SEC -- no blind fixed sleep;
+          5. re-read the position (the cancelled stop may have filled on its
+             way out) and close exactly the remaining quantity;
+          6. on a failed close, re-arm GTC protection (fail-safe centralized
+             here so all exit paths share it).
+
+        CLOSE_RECONCILIATION_ENABLED=False restores the legacy cancel+sleep
+        behavior through this same method, so callers are identical either way.
+        """
+        pending = getattr(self, "_pending_closes", None)
+        if pending is None:
+            pending = self._pending_closes = {}
+
+        # -- 1. live position ------------------------------------------------
+        try:
+            positions = {p.symbol: p for p in (self.client.get_all_positions() or [])}
+        except Exception as e:
+            return CloseResult("failed", symbol, None, 0, 0, f"position fetch failed: {e}")
+        pos = positions.get(symbol)
+        if pos is None:
+            pending.pop(symbol, None)
+            return CloseResult("flat", symbol, None, 0, 0, "no position")
+        try:
+            qty = int(float(pos.qty))
+        except (TypeError, ValueError):
+            return CloseResult("failed", symbol, None, 0, 0, "unparsable position qty")
+        if qty == 0:
+            pending.pop(symbol, None)
+            return CloseResult("flat", symbol, None, 0, 0, "position qty is 0")
+        pos_qty = abs(qty)
+
+        # -- 2. already-pending close: reconcile, never duplicate -------------
+        st = pending.get(symbol)
+        if st and st.get("state") in ("submitting", "pending", "canceling_protection"):
+            close_id = st.get("close_order_id")
+            still_active = False
+            if close_id:
+                try:
+                    still_active = any(
+                        str(getattr(o, "id", "")) == close_id
+                        for o in (self.client.get_orders() or [])
+                    )
+                except Exception:
+                    still_active = True  # unknown -- never risk a duplicate
+            if still_active:
+                return CloseResult("already_pending", symbol, close_id, pos_qty, pos_qty,
+                                   f"close {close_id} still working")
+            log.warning(f"[CLOSE-RECON] {symbol}: pending close {close_id} no longer active "
+                        f"but position ({pos_qty} sh) remains -- resubmitting")
+            pending.pop(symbol, None)
+
+        # -- 3. cancel classified protection (not entries, not our closes) ----
+        canceled_any = False
+        if CLOSE_RECONCILIATION_ENABLED:
+            try:
+                open_orders = self.client.get_orders() or []
+            except Exception as e:
+                return CloseResult("failed", symbol, None, pos_qty, pos_qty, f"order fetch failed: {e}")
+            protective: list = []
+            for o in open_orders:
+                if getattr(o, "symbol", None) != symbol:
+                    continue
+                v = _normalize_order_view(o)
+                if classify_symbol_order(v, qty) in ("valid_protection", "partial_protection"):
+                    protective.append(v)
+            for v in protective:
+                try:
+                    self.client.cancel_order_by_id(v.order_id)
+                    canceled_any = True
+                    _telemetry_log("protection_cancel_requested", symbol=symbol,
+                                   order_id=v.order_id, reason=reason)
+                except Exception as ce:
+                    log.warning(f"[CLOSE-RECON] {symbol}: cancel of protection {v.order_id} failed: {ce}")
+            if protective:
+                # -- 4. bounded cancel-confirmation poll (replaces sleep(0.4)) --
+                deadline = time.monotonic() + max(0.0, CLOSE_CANCEL_CONFIRM_TIMEOUT_SEC)
+                poll_sec = max(0.05, CLOSE_CANCEL_CONFIRM_POLL_SEC)
+                protective_ids = {v.order_id for v in protective}
+                confirmed = False
+                while time.monotonic() < deadline:
+                    time.sleep(poll_sec)
+                    try:
+                        sym_orders = [o for o in (self.client.get_orders() or [])
+                                      if getattr(o, "symbol", None) == symbol]
+                    except Exception:
+                        return CloseResult("failed", symbol, None, pos_qty, pos_qty,
+                                           "order fetch failed during cancel confirmation")
+                    if not any(str(getattr(o, "id", "")) in protective_ids for o in sym_orders):
+                        confirmed = True
+                        break
+                if not confirmed:
+                    # Protection is still resting -- the position is NOT naked.
+                    # Defer the close; the next 5s tick re-runs this method.
+                    log.info(f"[CLOSE-RECON] {symbol}: {reason} -- protection cancel not confirmed "
+                             f"within {CLOSE_CANCEL_CONFIRM_TIMEOUT_SEC:.2f}s, deferring close "
+                             f"(position remains protected by the resting stop)")
+                    return CloseResult("cancel_pending", symbol, None, pos_qty, pos_qty,
+                                       "protection cancel not confirmed")
+                # -- 5. the cancelled stop may have filled on its way out ------
+                try:
+                    positions = {p.symbol: p for p in (self.client.get_all_positions() or [])}
+                except Exception as e:
+                    return CloseResult("failed", symbol, None, pos_qty, pos_qty,
+                                       f"position re-fetch failed: {e}")
+                pos = positions.get(symbol)
+                if pos is None:
+                    pending.pop(symbol, None)
+                    return CloseResult("flat", symbol, None, 0, 0,
+                                       "flat after protection cancel/fill")
+                qty = int(float(pos.qty))
+                if qty == 0:
+                    pending.pop(symbol, None)
+                    return CloseResult("flat", symbol, None, 0, 0,
+                                       "position closed during reconciliation")
+                pos_qty = abs(qty)
+        else:
+            # Legacy behavior: cancel everything on the symbol, sleep, proceed.
+            try:
+                sym_orders = [o for o in (self.client.get_orders() or [])
+                              if getattr(o, "symbol", None) == symbol]
+                for _o in sym_orders:
+                    try:
+                        self.client.cancel_order_by_id(str(_o.id))
+                    except Exception:
+                        pass
+                if sym_orders:
+                    time.sleep(0.4)
+            except Exception as e:
+                log.warning(f"[CLOSE-RECON] {symbol}: legacy cancel failed, deferring: {e}")
+                return CloseResult("cancel_pending", symbol, None, pos_qty, pos_qty,
+                                   f"legacy cancel failed: {e}")
+
+        return self._submit_reconciled_close_order(
+            symbol, reason, qty, pos_qty, current_price, pending, canceled_any,
+            slip_pct=slip_pct, force_extended_hours=force_extended_hours,
+            no_extended_hours=no_extended_hours,
+        )
+
+    def _submit_reconciled_close_order(
+        self, symbol: str, reason: str, qty: int, pos_qty: int,
+        current_price: float, pending: Dict[str, dict], canceled_any: bool, *,
+        slip_pct: float = 0.5, force_extended_hours: bool = False,
+        no_extended_hours: bool = False,
+    ) -> CloseResult:
+        """Submit tail of _request_reconciled_close(): exactly one bounded-limit
+        close for the remaining quantity, pending-state bookkeeping keyed on a
+        stable apex-close-* client order id, and the centralized
+        re-arm-GTC-on-failure fail-safe (previously copy-pasted across three
+        exit paths with slightly diverging behavior)."""
+        side = OrderSide.SELL if qty > 0 else OrderSide.BUY
+        coid = _pending_close_client_id(symbol, reason)
+        pending[symbol] = {"reason": reason, "state": "submitting", "close_order_id": None,
+                           "client_order_id": coid, "requested_qty": pos_qty,
+                           "triggered_at": datetime.datetime.now(datetime.timezone.utc).isoformat()}
+        try:
+            order = self._submit_closing_order(
+                symbol, pos_qty, side, float(current_price), slip_pct=slip_pct,
+                force_extended_hours=force_extended_hours,
+                no_extended_hours=no_extended_hours, client_order_id=coid,
+            )
+        except Exception as e:
+            err = str(e)
+            pending.pop(symbol, None)
+            _telemetry_log("close_rejected", symbol=symbol, reason=reason,
+                           qty=pos_qty, error=err[:300], canceled_protection=canceled_any)
+            if "40310100" in err:
+                # Broker PDT blocks the same-day close itself -- caller decides
+                # whether that means forced-overnight (software SL) or retry.
+                return CloseResult("blocked_pdt", symbol, None, pos_qty, pos_qty, err[:200])
+            # -- 6. close failed: re-arm GTC protection (fail-safe) -----------
+            rearmed = False
+            try:
+                trail_pct, _ = _atr_trail_pct_for(symbol, float(current_price), getattr(self, "_entry_log", {}))
+                self.client.submit_order(TrailingStopOrderRequest(
+                    symbol=symbol, qty=pos_qty, side=side,
+                    type=AlpacaOrderType.TRAILING_STOP, time_in_force=TimeInForce.GTC,
+                    trail_percent=trail_pct,
+                ))
+                rearmed = True
+                log.warning(f"[CLOSE-RECON] {symbol}: {reason} close failed ({err[:120]}) -- "
+                            f"re-armed GTC trailing stop {trail_pct:.2f}%")
+            except Exception as rearm_err:
+                log.error(f"[CLOSE-RECON] {symbol}: {reason} close failed AND GTC re-arm failed "
+                          f"-- position may be UNPROTECTED: {rearm_err}")
+                _telemetry_log("critical_unprotected", symbol=symbol, reason=reason,
+                               qty=pos_qty, error=str(rearm_err)[:300])
+            return CloseResult("failed_reprotected" if rearmed else "critical_unprotected",
+                               symbol, None, pos_qty, pos_qty, err[:200])
+
+        order_id = str(getattr(order, "id", "") or "") or None
+        pending[symbol] = {"reason": reason, "state": "pending", "close_order_id": order_id,
+                           "client_order_id": coid, "requested_qty": pos_qty,
+                           "triggered_at": datetime.datetime.now(datetime.timezone.utc).isoformat()}
+        _telemetry_log("close_submitted", symbol=symbol, reason=reason, qty=pos_qty,
+                       order_id=order_id, canceled_protection=canceled_any)
+        log.warning(f"[CLOSE-RECON] {symbol}: {reason} close submitted ({pos_qty} sh, "
+                    f"order {order_id}) after cancelling {'protection' if canceled_any else 'nothing'}")
+        return CloseResult("submitted", symbol, order_id, pos_qty, pos_qty, "submitted")
 
     def _cover_naked_positions(self) -> None:
         """Fast-thread companion to protect_positions(): the moment a
@@ -3158,8 +3525,11 @@ class EnhancedExecutor:
         for sym, stop_price in list(self._pdt_stop_blocked.items()):
             pos = positions.get(sym)
             if pos is None:
-                # Position already closed (stop filled or manual)
+                # Position already closed (stop filled or manual) -- clear BOTH
+                # the software-stop watch AND any pending close state, so a
+                # dangling close record can never leak onto a future position.
                 self._pdt_stop_blocked.pop(sym, None)
+                getattr(self, "_pending_closes", {}).pop(sym, None)
                 continue
             try:
                 current = float(pos.current_price)
@@ -3167,30 +3537,36 @@ class EnhancedExecutor:
                 is_long = qty > 0
                 hit     = (is_long and current <= stop_price) or (not is_long and current >= stop_price)
                 if hit:
-                    side = OrderSide.SELL if is_long else OrderSide.BUY
-                    try:
-                        self._submit_closing_order(sym, abs(qty), side, current)
-                        self._pdt_stop_blocked.pop(sym, None)
+                    result = self._request_reconciled_close(sym, "software-sl", current)
+                    if result.state == "submitted":
                         log.warning(
                             f"SOFTWARE SL HIT {sym}: price ${current:.2f} crossed stop ${stop_price:.2f} -- "
-                            f"{'SELL' if is_long else 'BUY-TO-COVER'} submitted"
+                            f"close submitted ({result.requested_qty} sh)"
                         )
                         self._maybe_rearm_reentry(
-                            sym, is_long, abs(qty), "SOFTWARE SL",
+                            sym, is_long, result.requested_qty, "SOFTWARE SL",
                             was_loss=(current - float(pos.avg_entry_price)) * qty < 0,
                         )
-                    except Exception as close_err:
-                        if "40310100" in str(close_err):
-                            # Broker PDT also blocks same-day close -- position is a forced
-                            # overnight hold.  Stop retrying; it will carry to next session.
-                            self._pdt_stop_blocked.pop(sym, None)
-                            self._pdt_overnight_forced.add(sym)
-                            log.warning(
-                                f"SOFTWARE SL {sym}: stop breached at ${current:.2f} but PDT blocks "
-                                f"same-day close -- holding overnight (stop was ${stop_price:.2f})"
-                            )
-                        else:
-                            log.error(f"check_software_stops {sym}: {close_err}")
+                        # Deliberately KEEP the _pdt_stop_blocked entry: the next
+                        # 5s tick re-runs this path, sees the close already
+                        # pending (or flat) and clears it then. The old
+                        # optimistic pop is what let an unfilled close sit
+                        # unwatched.
+                    elif result.state == "flat":
+                        self._pdt_stop_blocked.pop(sym, None)
+                    elif result.state == "blocked_pdt":
+                        # Broker PDT blocks the same-day close -- forced
+                        # overnight hold, stop retrying.
+                        self._pdt_stop_blocked.pop(sym, None)
+                        self._pdt_overnight_forced.add(sym)
+                        log.warning(
+                            f"SOFTWARE SL {sym}: stop breached at ${current:.2f} but PDT blocks "
+                            f"same-day close -- holding overnight (stop was ${stop_price:.2f})"
+                        )
+                    elif result.state in ("cancel_pending", "already_pending"):
+                        log.debug(f"SOFTWARE SL {sym}: close {result.state} -- re-checking next tick")
+                    else:
+                        log.error(f"check_software_stops {sym}: {result.state}: {result.detail}")
                 else:
                     log.debug(f"SOFTWARE SL {sym}: current ${current:.2f} | stop ${stop_price:.2f} | margin ${current - stop_price:+.2f}")
             except Exception as e:
@@ -5197,28 +5573,17 @@ class EnhancedExecutor:
                 log.warning(f"check_mfe_giveback_exit {sym}: order fetch/cancel failed, will retry next cycle: {e}")
                 continue
 
-            side = OrderSide.SELL if is_long else OrderSide.BUY
-            try:
-                self._submit_closing_order(sym, abs(qty), side, current)
-                log.warning(f"MFE GIVEBACK STOP {sym}: {abs(qty)} shares | {reason}")
+            result = self._request_reconciled_close(sym, "mfe", current)
+            if result.state == "submitted":
+                log.warning(f"MFE GIVEBACK STOP {sym}: {result.requested_qty} shares | {reason}")
                 self._maybe_rearm_reentry(
-                    sym, is_long, abs(qty), "MFE GIVEBACK STOP",
+                    sym, is_long, result.requested_qty, "MFE GIVEBACK STOP",
                     was_loss=(current - entry) * qty < 0,
                 )
-            except Exception as e:
-                log.error(f"MFE GIVEBACK STOP {sym}: close failed: {e}")
-                # The resting GTC was just cancelled above -- re-arm a fallback
-                # so the position isn't left fully unprotected.
-                try:
-                    trail_pct, _ = _atr_trail_pct_for(sym, current, self._entry_log)
-                    self.client.submit_order(TrailingStopOrderRequest(
-                        symbol=sym, qty=abs(qty), side=side,
-                        type=AlpacaOrderType.TRAILING_STOP, time_in_force=TimeInForce.GTC,
-                        trail_percent=trail_pct,
-                    ))
-                    log.warning(f"check_mfe_giveback_exit {sym}: re-armed GTC trailing stop after failed close")
-                except Exception as rearm_err:
-                    log.error(f"check_mfe_giveback_exit {sym}: close failed AND GTC re-arm failed -- position may be UNPROTECTED: {rearm_err}")
+            elif result.state in ("cancel_pending", "already_pending"):
+                log.debug(f"check_mfe_giveback_exit {sym}: close {result.state} -- re-checking next tick")
+            elif result.state != "flat":
+                log.error(f"MFE GIVEBACK STOP {sym}: close not submitted ({result.state}): {result.detail}")
 
         # Drop peaks for symbols no longer held or no longer in scope
         for sym in [s for s in self._mfe_peaks if s not in live_syms]:
@@ -5668,28 +6033,17 @@ class EnhancedExecutor:
                 log.warning(f"check_ema9_exit {sym}: order fetch/cancel failed, will retry next cycle: {e}")
                 continue
 
-            side = OrderSide.SELL if is_long else OrderSide.BUY
-            try:
-                self._submit_closing_order(sym, abs(qty), side, current)
-                log.warning(f"EMA9 EXIT {sym}: {abs(qty)} shares | {reason}")
+            result = self._request_reconciled_close(sym, "ema9", current)
+            if result.state == "submitted":
+                log.warning(f"EMA9 EXIT {sym}: {result.requested_qty} shares | {reason}")
                 self._maybe_rearm_reentry(
-                    sym, is_long, abs(qty), "EMA9 EXIT",
+                    sym, is_long, result.requested_qty, "EMA9 EXIT",
                     was_loss=(current - entry) * qty < 0,
                 )
-            except Exception as e:
-                log.error(f"EMA9 EXIT {sym}: close failed: {e}")
-                # The resting GTC was just cancelled above -- re-arm a fallback
-                # so the position isn't left fully unprotected.
-                try:
-                    trail_pct, _ = _atr_trail_pct_for(sym, current, self._entry_log)
-                    self.client.submit_order(TrailingStopOrderRequest(
-                        symbol=sym, qty=abs(qty), side=side,
-                        type=AlpacaOrderType.TRAILING_STOP, time_in_force=TimeInForce.GTC,
-                        trail_percent=trail_pct,
-                    ))
-                    log.warning(f"check_ema9_exit {sym}: re-armed GTC trailing stop after failed close")
-                except Exception as rearm_err:
-                    log.error(f"check_ema9_exit {sym}: close failed AND GTC re-arm failed -- position may be UNPROTECTED: {rearm_err}")
+            elif result.state in ("cancel_pending", "already_pending"):
+                log.debug(f"check_ema9_exit {sym}: close {result.state} -- re-checking next tick")
+            elif result.state != "flat":
+                log.error(f"EMA9 EXIT {sym}: close not submitted ({result.state}): {result.detail}")
 
     def check_pending_entries_ema(self) -> None:
         """Every STAGNANT_STOP_CHECK_INTERVAL_MIN (1 min), re-check the
