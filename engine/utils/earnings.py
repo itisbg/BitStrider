@@ -1,12 +1,13 @@
-"""Shared earnings-date lookup, used by both options and equity strategies
-to avoid entering right before an earnings report."""
+"""Shared earnings-date lookup, used by equity strategies to avoid entering
+right before an earnings report (options strategies that also used it were
+removed 2026-09-01)."""
 
 import datetime
 import logging
 
 log = logging.getLogger(__name__)
 
-# Session-level earnings cache — {symbol: next_earnings_date or None}
+# Session-level earnings cache -- {symbol: next_earnings_date or None}
 # Earnings dates are stable intraday so a session cache is sufficient.
 _earnings_cache: dict = {}
 
@@ -14,7 +15,7 @@ _earnings_cache: dict = {}
 def no_earnings_soon(symbol: str, days: int = 15) -> bool:
     """Return True if no earnings are expected within *days* calendar days.
 
-    Data source: yfinance Ticker.calendar — returns the next earnings date
+    Data source: yfinance Ticker.calendar -- returns the next earnings date
     for most US-listed stocks. Falls back to True (allow trade) when:
       - yfinance is not installed
       - the calendar field is absent or unparseable
@@ -24,7 +25,7 @@ def no_earnings_soon(symbol: str, days: int = 15) -> bool:
     if symbol in _earnings_cache:
         next_date = _earnings_cache[symbol]
         if next_date is None:
-            return True   # no date known — allow
+            return True   # no date known -- allow
         return (next_date - datetime.date.today()).days > days
 
     try:
@@ -48,10 +49,10 @@ def no_earnings_soon(symbol: str, days: int = 15) -> bool:
             _earnings_cache[symbol] = next_date
             gap = (next_date - datetime.date.today()).days
             if gap <= days:
-                log.debug(f"{symbol}: earnings in {gap}d — skipping entry")
+                log.debug(f"{symbol}: earnings in {gap}d -- skipping entry")
             return gap > days
     except Exception as e:
-        log.debug(f"no_earnings_soon({symbol}): yfinance failed ({e}) — allowing trade")
+        log.debug(f"no_earnings_soon({symbol}): yfinance failed ({e}) -- allowing trade")
 
-    _earnings_cache[symbol] = None   # cache miss — no date available
+    _earnings_cache[symbol] = None   # cache miss -- no date available
     return True

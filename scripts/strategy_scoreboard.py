@@ -181,7 +181,7 @@ def run(log_to_file: bool = True) -> list:
         log.addHandler(sh)
 
     log.info("=" * 70)
-    log.info(f"STRATEGY SCOREBOARD — {datetime.datetime.now():%Y-%m-%d %H:%M}")
+    log.info(f"STRATEGY SCOREBOARD -- {datetime.datetime.now():%Y-%m-%d %H:%M}")
     log.info("=" * 70)
 
     trades = _pull_matched_trades()
@@ -213,7 +213,7 @@ def run(log_to_file: bool = True) -> list:
         log.info(f"FLAGGED (enabled, n>={MIN_TRADES_TO_JUDGE}, negative Kelly): {', '.join(flagged)}")
         log.info("Consider disabling via the strategy's *_ENABLED flag in config.py.")
     else:
-        log.info("Nothing flagged — every enabled strategy with enough trades has a non-negative Kelly.")
+        log.info("Nothing flagged -- every enabled strategy with enough trades has a non-negative Kelly.")
     log.info("=" * 70)
     return flagged
 

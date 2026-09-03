@@ -23,10 +23,16 @@ sys.path.insert(0, str(ROOT))
 
 from engine.equity.strategies import Signal
 from engine.execution.enhanced import _resolve_freshness_reject
-from engine.config import THIN_LIQUIDITY_EXCLUDED_STRATEGIES, TRADE_STALE_MOMENTUM_REJECTS
+import engine.execution.enhanced as enhanced
+from engine.config import THIN_LIQUIDITY_EXCLUDED_STRATEGIES
 
 assert THIN_LIQUIDITY_EXCLUDED_STRATEGIES == {"ORB", "GapBreakout"}
-assert TRADE_STALE_MOMENTUM_REJECTS is True, "the exclusion is only meaningful test coverage if the toggle is on"
+
+# 2026-08-26: config default flipped to False (hard reject) -- the ORB/GapBreakout
+# exclusion this test covers is only reachable when the toggle is on, so the
+# test sets it explicitly instead of assuming the live default.
+_orig_toggle = enhanced.TRADE_STALE_MOMENTUM_REJECTS
+enhanced.TRADE_STALE_MOMENTUM_REJECTS = True
 
 
 def _sig(strategy):
@@ -60,6 +66,8 @@ sig = _sig("ORB")
 valid, reason = _resolve_freshness_reject(sig, fresh=True, fade_reason=None)
 assert (valid, reason) == (True, None)
 assert sig.thin_liquidity is False
+
+enhanced.TRADE_STALE_MOMENTUM_REJECTS = _orig_toggle
 
 print("OK: ORB/GapBreakout momentum-freshness rejects are hard-blocked (not traded through at reduced "
       "size) regardless of TRADE_STALE_MOMENTUM_REJECTS; every other strategy is unaffected. "

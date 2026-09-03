@@ -48,7 +48,7 @@ guardrail_pass = []
 for pos in positions:
     sym = pos.symbol
     if re.match(r'^[A-Z]+\d{6}[CP]\d{8}$', sym):
-        continue  # options legs — managed separately, out of scope for both checks
+        continue  # options legs -- managed separately, out of scope for both checks
     qty = int(float(pos.qty))
     if qty == 0:
         continue

@@ -1,10 +1,17 @@
-# ApexTrader Task Scheduler launcher
-# Called by Windows Task Scheduler - avoids quoting issues with inline -Command
+# ApexTrader AutoBot Task Scheduler launcher
+# Called by Windows Task Scheduler - avoids quoting issues with inline -Command.
+# Weekly 8:00 AM Mon-Fri + at-logon. Resolves python via py/python, propagates
+# the real exit code to Task Scheduler.
 $ErrorActionPreference = 'Continue'
 
 $BaseDir = Split-Path -Parent $PSScriptRoot
 $Script  = "$BaseDir\autobot.py"
-$Log     = "$BaseDir\autobot_scheduler.log"
+# 2026-09-02: scheduler tee moved OUT of the OneDrive repo (the old
+# autobot_scheduler.log there hit 375MB of logging-error dumps; OneDrive
+# file blocks are the root cause of the morning freeze). Local only now.
+$LogDir  = Join-Path $env:LOCALAPPDATA "ApexTrader\logs"
+if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Force -Path $LogDir | Out-Null }
+$Log     = Join-Path $LogDir "autobot_scheduler.log"
 
 # This folder syncs across multiple machines via OneDrive, so don't hardcode
 # a machine/user-specific python.exe path here (it breaks on every other

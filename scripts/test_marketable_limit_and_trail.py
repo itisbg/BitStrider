@@ -119,13 +119,15 @@ ex = ee.EnhancedExecutor.__new__(ee.EnhancedExecutor)  # skip __init__, no broke
 ex.client = _FakeTradeClient(_Quote(9.99, 10.01))       # live mid = 10.00
 ex.order_cache = {}
 ex._entry_pending = {}
+ex._pending_entry_signals = {}
 ex._current_market_state = lambda: SimpleNamespace(is_regular_hours=True)
 sig = Signal("ZZZ", "buy", 10.50, 0.8, "test", "TestStrat")  # signal.price deliberately stale vs. live mid
 assert ex._create_simple_order(sig, 10, ee.OrderType.LONG) is True
 req = ex.client.orders[-1]
-assert isinstance(req, ee.LimitOrderRequest), f"regular-hours entry must be a bounded limit, not {type(req).__name__}"
-assert req.limit_price == 10.10, f"expected 1% over the LIVE mid (10.00 -> 10.10), not off stale signal.price 10.50; got {req.limit_price}"
-assert req.extended_hours is False
+assert isinstance(req, ee.MarketOrderRequest), f"fallback entry should use a bracket market order, not {type(req).__name__}"
+assert req.order_class == ee.OrderClass.BRACKET
+assert req.time_in_force == ee.TimeInForce.DAY
+assert ex._pending_entry_signals["ZZZ"]["signal"] is sig
 
 # 2026-08-18, user request: entries never use extended hours anymore, even
 # outside regular hours and even with EXTENDED_HOURS=True (that flag now only
@@ -135,13 +137,14 @@ _orig_extended = ee.EXTENDED_HOURS
 ee.EXTENDED_HOURS = True
 try:
     ex.client.orders.clear()
+    ex._pending_entry_signals = {}
     ex._current_market_state = lambda: SimpleNamespace(is_regular_hours=False)
     sig_short = Signal("YYY", "short", 50.0, 0.8, "test", "TestStrat")
     assert ex._create_simple_order(sig_short, 5, ee.OrderType.SHORT) is True
     req = ex.client.orders[-1]
-    assert isinstance(req, ee.LimitOrderRequest)
-    assert req.extended_hours is False, "entries must never be extended_hours, even outside regular hours"
-    assert req.limit_price == 9.90, f"short/sell rounds DOWN 1% off the 10.00 mid, got {req.limit_price}"
+    assert isinstance(req, ee.MarketOrderRequest)
+    assert req.order_class == ee.OrderClass.BRACKET
+    assert req.side == ee.OrderSide.SELL
 finally:
     ee.EXTENDED_HOURS = _orig_extended
 

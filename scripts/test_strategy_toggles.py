@@ -1,5 +1,5 @@
 """Self-check for the strategy enable/disable toggles (2026-08-14, at the
-user's request: "disable all that are below 37% win rate" — then refined
+user's request: "disable all that are below 37% win rate" -- then refined
 same day: "don't disable if the number of trade[s] [is] under 10 ... too
 early to judge"). Same backtest methodology as VWAP_FADE_ENABLED, across
 all 16 strategies:
@@ -17,7 +17,7 @@ Below 37% but n<10 -> left enabled, too small a sample to judge:
 
 2026-08-15: FloatRotation (n=41, 39% win, net -$33.31, second-worst
 dollar loser after VWAPFade) disabled at the user's explicit request
-despite clearing the 37% win-rate line — a fuller loss-attribution pass
+despite clearing the 37% win-rate line -- a fuller loss-attribution pass
 showed its worst trades (DFSC -27%, BNRG -8.6%) were the clearest
 examples of "chasing an already-extended move" across the whole loser
 list.
@@ -38,7 +38,7 @@ from engine.config import (
 )
 from engine.equity.strategies import get_strategy_instances
 
-# Disabled — either n>=10 and below 37% win rate, or (FloatRotation) an
+# Disabled -- either n>=10 and below 37% win rate, or (FloatRotation) an
 # explicit override despite clearing that line.
 DISABLED = {
     "VWAPFadeStrategy":          VWAP_FADE_ENABLED,
@@ -57,7 +57,7 @@ STILL_ENABLED_FLAGS = {
     "TechnicalStrategy":      TECHNICAL_ENABLED,
 }
 for name, enabled in STILL_ENABLED_FLAGS.items():
-    assert enabled is True, f"{name} expected enabled (True) — sample too small (n<10) to judge"
+    assert enabled is True, f"{name} expected enabled (True) -- sample too small (n<10) to judge"
 
 STILL_ENABLED_UNCONDITIONAL = {"GapBreakoutStrategy", "ORBStrategy",
                                 "TrendBreakerStrategy", "VWAPReclaimStrategy"}

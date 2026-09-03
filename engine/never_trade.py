@@ -1,4 +1,4 @@
-"""Permanent ticker exclusion list — data/never_trade.txt.
+"""Permanent ticker exclusion list -- data/never_trade.txt.
 
 Shared by universe filtering, TI scraping, and both execution paths so a
 listed ticker can never be scanned, added to universe.json, or ordered.

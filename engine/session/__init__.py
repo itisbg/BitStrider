@@ -1,5 +1,5 @@
 from .session import (
-    # Mutable state — always access via the module reference (_session.daily_pnl)
+    # Mutable state -- always access via the module reference (_session.daily_pnl)
     # not as a local import, so callers always see the live value.
     # Re-exported here only so `from engine import session as _session` works.
     daily_pnl,

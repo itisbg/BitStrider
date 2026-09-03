@@ -27,6 +27,10 @@ from engine.config import MIN_AVG_DAILY_VOLUME_REGULAR_HOURS, MIN_FLOAT_SHARES, 
 
 ET = pytz.timezone("America/New_York")
 FIXED_NOW = ET.localize(datetime.datetime(2026, 8, 17, 15, 50))  # inside both close windows
+WEEKEND_NOW = ET.localize(datetime.datetime(2026, 8, 22, 15, 50))
+EARLY_BEFORE_EOD = ET.localize(datetime.datetime(2026, 11, 27, 12, 45))
+EARLY_EOD = ET.localize(datetime.datetime(2026, 11, 27, 12, 50))
+EARLY_AFTER_CLOSE = ET.localize(datetime.datetime(2026, 11, 27, 13, 5))
 
 
 class _FixedDateTime(datetime.datetime):
@@ -44,6 +48,8 @@ class FakeClient:
     def __init__(self):
         self.positions = []
         self.submitted = []  # symbols a closing order was submitted for, in order
+        self.calendar_close = None
+        self.calendar_calls = 0
 
     def get_all_positions(self):
         return self.positions
@@ -56,6 +62,12 @@ class FakeClient:
 
     def submit_order(self, req):
         self.submitted.append(req.symbol)
+
+    def get_calendar(self, req):
+        self.calendar_calls += 1
+        if self.calendar_close is None:
+            return []
+        return [type("Cal", (), {"close": self.calendar_close})()]
 
 
 today = datetime.date.today()
@@ -75,9 +87,10 @@ with patch("engine.execution.enhanced.datetime.datetime", _FixedDateTime):
     assert client.submitted == ["FOO"], f"duplicate resubmit: {client.submitted}"
 
     client.positions.append(FakePosition("BAR", 5))
+    client.positions.append(FakePosition("BAZ", 3))  # no entry_log row: still must close at EOD
     ex._entry_log["BAR"] = {"date": today, "strategy": "VWAPReclaim"}
     ex.close_eod_positions()  # a symbol that shows up later must still get caught
-    assert client.submitted == ["FOO", "BAR"], client.submitted
+    assert client.submitted == ["FOO", "BAR", "BAZ"], client.submitted
 
     # ---- close_guardrail_fail_positions: same rerun contract, via the per-symbol _guardrail_eod_closed set ----
     # 2026-08-23, user request: GUARDRAIL_EOD_CLOSE_ENABLED now defaults False
@@ -108,5 +121,51 @@ with patch("engine.execution.enhanced.datetime.datetime", _FixedDateTime):
         client2.positions.append(FakePosition("THIN2", 10))
         ex2.close_guardrail_fail_positions()  # a symbol that shows up later must still get caught
         assert client2.submitted == ["THIN1", "THIN2"], client2.submitted
+
+    class _WeekendDateTime(datetime.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return WEEKEND_NOW
+
+    client3 = FakeClient()
+    ex3 = enhanced.EnhancedExecutor(client3)
+    client3.positions = [FakePosition("WEEKEND", 10)]
+    with patch("engine.execution.enhanced.datetime.datetime", _WeekendDateTime):
+        assert ex3.close_eod_positions() is None
+        assert client3.submitted == [], client3.submitted
+
+    class _EarlyBeforeDateTime(datetime.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return EARLY_BEFORE_EOD
+
+    client4 = FakeClient()
+    client4.calendar_close = datetime.time(13, 0)
+    ex4 = enhanced.EnhancedExecutor(client4)
+    client4.positions = [FakePosition("EARLY", 10)]
+    with patch("engine.execution.enhanced.datetime.datetime", _EarlyBeforeDateTime):
+        assert ex4.close_eod_positions() is None
+        assert client4.submitted == [], client4.submitted
+        assert client4.calendar_calls == 1, client4.calendar_calls
+
+    class _EarlyEodDateTime(datetime.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return EARLY_EOD
+
+    with patch("engine.execution.enhanced.datetime.datetime", _EarlyEodDateTime):
+        ex4.close_eod_positions()
+        assert client4.submitted == ["EARLY"], client4.submitted
+        assert client4.calendar_calls == 1, "exchange close should be cached per day"
+
+    class _EarlyAfterCloseDateTime(datetime.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return EARLY_AFTER_CLOSE
+
+    client4.positions.append(FakePosition("TOO_LATE", 10))
+    with patch("engine.execution.enhanced.datetime.datetime", _EarlyAfterCloseDateTime):
+        assert ex4.close_eod_positions() is None
+        assert client4.submitted == ["EARLY"], client4.submitted
 
 print("OK: both EOD close jobs are safe to rerun every minute -- no duplicate closes, new arrivals still caught")

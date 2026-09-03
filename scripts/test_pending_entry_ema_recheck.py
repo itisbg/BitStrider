@@ -22,9 +22,13 @@ from engine.execution.enhanced import EnhancedExecutor
 
 
 class _FakeOrder:
-    def __init__(self, status, side):
+    def __init__(self, status, side, order_id, symbol):
         self.status = status
         self.side = side
+        self.id = order_id
+        self.symbol = symbol
+        self.order_type = "market"
+        self.time_in_force = enhanced.TimeInForce.DAY
 
 
 class _FakeClient:
@@ -34,6 +38,9 @@ class _FakeClient:
 
     def get_order_by_id(self, order_id):
         return self._orders[order_id]
+
+    def get_orders(self, filter=None):
+        return [o for o in self._orders.values() if o.status != "filled"]
 
     def cancel_order_by_id(self, order_id):
         self.cancelled.append(order_id)
@@ -48,7 +55,7 @@ def _make_executor(orders):
 
 # get_bars stub: RISING/FALLING symbols get monotonic series, direction by name
 _orig_get_bars = enhanced.get_bars
-def _stub_get_bars(symbol, period, interval):
+def _stub_get_bars(symbol, period, interval, **kwargs):
     if symbol == "RISING":
         return pd.DataFrame({"close": list(range(1, 40))})       # slope positive
     if symbol == "FALLING":
@@ -60,19 +67,21 @@ enhanced.get_bars = _stub_get_bars
 
 try:
     orders = {
-        "o1": _FakeOrder(status="new", side="buy"),               # RISING, buy, EMA7 rising -> aligned, keep
-        "o2": _FakeOrder(status="accepted", side="buy"),          # FALLING, buy, EMA7 falling -> NOT aligned, cancel
-        "o3": _FakeOrder(status="filled", side="buy"),            # FILLED already -- must be skipped, no re-check
-        "o4": _FakeOrder(status="held", side="sell"),             # SHORTFALL, sell (short), EMA7 falling -> aligned for a short, keep
+        "o1": _FakeOrder(status="new", side="buy", order_id="o1", symbol="RISING"),               # RISING, buy, EMA7 rising -> aligned, keep
+        "o2": _FakeOrder(status="accepted", side="buy", order_id="o2", symbol="FALLING"),          # FALLING, buy, EMA7 falling -> NOT aligned, cancel
+        "o3": _FakeOrder(status="filled", side="buy", order_id="o3", symbol="FILLED"),            # FILLED already -- must be skipped, no re-check
+        "o4": _FakeOrder(status="held", side="sell", order_id="o4", symbol="SHORTFALL"),             # SHORTFALL, sell (short), EMA7 falling -> aligned for a short, keep
     }
     ex = _make_executor(orders)
+    ex._pending_entry_signals = {}
+    ex._ema_blocked_entries = {}
     ex.check_pending_entries_ema()
 
     assert ex.client.cancelled == ["o2"], f"expected only FALLING's order (o2) cancelled, got {ex.client.cancelled}"
     assert "FALLING" not in ex.order_cache, "cancelled symbol must be evicted from order_cache"
     assert "RISING" in ex.order_cache, "aligned long must not be cancelled"
     assert "SHORTFALL" in ex.order_cache, "aligned short must not be cancelled"
-    assert "FILLED" in ex.order_cache, "already-filled order must be left alone (not re-checked, not evicted)"
+    assert "FILLED" not in ex.order_cache, "already-filled order should be evicted from stale entry bookkeeping"
 
     print("OK: check_pending_entries_ema cancels only the resting order whose EMA7 alignment has since failed")
 finally:

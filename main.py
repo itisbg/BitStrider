@@ -19,8 +19,9 @@ def _is_pid_running(pid: int) -> bool:
         proc = psutil.Process(pid)
         if proc.status() == psutil.STATUS_ZOMBIE:
             return False
-        # Guard against pure PID-number reuse by an unrelated process.
-        return "python" in proc.name().lower()
+        cmdline = " ".join(proc.cmdline()).lower()
+        # Guard against pure PID-number reuse by an unrelated Python process.
+        return "python" in proc.name().lower() and str(Path(__file__).resolve()).lower() in cmdline
     except Exception:
         return False
 

@@ -17,7 +17,7 @@ rejection is genuinely symbol-specific.
 
 Run with:
   python scripts/test_short_rejection_handling.py
-No network calls — get_account() is stubbed.
+No network calls -- get_account() is stubbed.
 """
 import sys
 from pathlib import Path

@@ -1,7 +1,7 @@
 # ApexTrader local runner (Windows PowerShell)
 param(
     [ValidateSet('paper', 'live')]
-    [string]$Mode = 'paper'
+    [string]$Mode
 )
 
 $ErrorActionPreference = 'Stop'
@@ -18,6 +18,18 @@ if (Test-Path $venvActivate) {
     Write-Warning "Virtualenv activation script not found at $venvActivate. Run autobot.py once to create it."
 }
 
+$envFile = Join-Path $PSScriptRoot '.env'
+if (Test-Path $envFile) {
+    Get-Content $envFile | ForEach-Object {
+        if ($_ -match '^\s*([^#=\s]+)\s*=\s*(.*?)\s*$') {
+            Set-Item -Path "Env:$($matches[1])" -Value $matches[2].Trim().Trim('"').Trim("'")
+        }
+    }
+}
+
+if (-not $PSBoundParameters.ContainsKey('Mode')) {
+    $Mode = if ($env:TRADE_MODE -in @('paper', 'live')) { $env:TRADE_MODE } else { 'paper' }
+}
 $env:TRADE_MODE = $Mode
 
 $modeKey = if ($Mode -eq 'paper') { $env:PAPER_ALPACA_API_KEY } else { $env:LIVE_ALPACA_API_KEY }

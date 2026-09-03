@@ -1,17 +1,15 @@
-"""Self-check for the 2026-08-18 fix: _sweep_force_closes no longer chases
-EOD/guardrail force-closes into extended hours. Both reasons that land in
-_force_close_pending (close_eod_positions "eod:...", close_guardrail_fail_positions
-"guardrail:...") are deadline/liquidity driven, not "price moved against the
-position" -- once regular hours end, the sweep gives up and lets the position
-carry overnight under its GTC trailing stop instead of re-chasing at
-escalating slip. check_afterhours_stops remains the only path that can
-actually exit a position outside regular hours.
+"""Self-check for force-close after-hours chasing.
+
+Alpaca equity trailing stops do not execute after-hours, so an EOD close that
+missed the bell must keep chasing with extended-hours limit closes instead of
+assuming a GTC trailing stop is active protection.
 
 Run with:
   python scripts/test_force_close_no_afterhours_chase.py
 No network calls -- broker client is faked.
 """
 import sys
+import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -29,6 +27,7 @@ class FakePosition:
 class FakeOrder:
     def __init__(self, symbol, time_in_force):
         self.symbol, self.time_in_force, self.id = symbol, time_in_force, f"{symbol}-order"
+        self.created_at = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=90)
 
 
 class FakeClient:
@@ -55,7 +54,7 @@ class FakeClient:
         return SimpleNamespace(id="fake-order-id")
 
 
-# ---- No resting GTC: must give up AND re-arm a fresh GTC trailing stop ----
+# ---- No resting GTC: must keep chasing with an extended-hours close ----
 client = FakeClient(resting_orders=[])
 ex = enhanced.EnhancedExecutor(client)
 ex._current_market_state = lambda: SimpleNamespace(is_regular_hours=False)
@@ -64,13 +63,13 @@ ex._force_close_pending["FOO"] = {"reason": "eod:VWAPReclaim", "chase_count": 1}
 
 ex._sweep_force_closes()
 
-assert "FOO" not in ex._force_close_pending, "must give up chasing once regular hours end"
-assert len(client.submitted) == 1, f"expected exactly one re-arm order, got {client.submitted}"
-rearm = client.submitted[0]
-assert isinstance(rearm, enhanced.TrailingStopOrderRequest), f"must re-arm a GTC trailing stop, not {type(rearm).__name__}"
-assert rearm.time_in_force == enhanced.TimeInForce.GTC
+assert "FOO" in ex._force_close_pending, "must keep chasing until confirmed flat"
+assert len(client.submitted) == 1, f"expected exactly one close order, got {client.submitted}"
+req = client.submitted[0]
+assert isinstance(req, enhanced.LimitOrderRequest), f"must submit an extended-hours close limit, not {type(req).__name__}"
+assert req.extended_hours is True
 
-# ---- Resting GTC already present: must give up WITHOUT touching it ----
+# ---- Resting GTC already present: cancel it, then chase with extended-hours close ----
 client2 = FakeClient(resting_orders=[FakeOrder("BAR", enhanced.TimeInForce.GTC)])
 ex2 = enhanced.EnhancedExecutor(client2)
 ex2._current_market_state = lambda: SimpleNamespace(is_regular_hours=False)
@@ -79,9 +78,9 @@ ex2._force_close_pending["BAR"] = {"reason": "guardrail:low_float", "chase_count
 
 ex2._sweep_force_closes()
 
-assert "BAR" not in ex2._force_close_pending
-assert client2.submitted == [], "existing GTC stop must be left alone, not re-armed"
-assert client2.cancelled == [], "existing GTC stop must never be cancelled once giving up"
+assert "BAR" in ex2._force_close_pending
+assert client2.cancelled == ["BAR-order"], client2.cancelled
+assert len(client2.submitted) == 1 and client2.submitted[0].extended_hours is True
 
 # ---- Still regular hours: unaffected, keeps chasing as before ----
 client3 = FakeClient(resting_orders=[])
@@ -96,7 +95,7 @@ assert "BAZ" in ex3._force_close_pending, "regular-hours chase must still be in 
 assert any(isinstance(r, enhanced.LimitOrderRequest) for r in client3.submitted), "must still submit a re-chase limit order during regular hours"
 assert all(getattr(r, "extended_hours", False) is not True for r in client3.submitted), "regular-hours re-chase must never be extended_hours"
 
-# ---- Stale non-GTC order still resting: must be cancelled before the re-arm ----
+# ---- Stale non-GTC order still resting: must be cancelled before the after-hours close ----
 client4 = FakeClient(resting_orders=[FakeOrder("QUX", enhanced.TimeInForce.DAY)])
 ex4 = enhanced.EnhancedExecutor(client4)
 ex4._current_market_state = lambda: SimpleNamespace(is_regular_hours=False)
@@ -105,11 +104,12 @@ ex4._force_close_pending["QUX"] = {"reason": "eod:GapBreakout", "chase_count": 2
 
 ex4._sweep_force_closes()
 
-assert "QUX" not in ex4._force_close_pending
-assert client4.cancelled == ["QUX-order"], "stale DAY order must be cancelled before re-arming, else the GTC submit races it for the same qty"
-assert len(client4.submitted) == 1 and isinstance(client4.submitted[0], enhanced.TrailingStopOrderRequest)
+assert "QUX" in ex4._force_close_pending
+assert client4.cancelled == ["QUX-order"], "stale DAY order must be cancelled before re-chasing"
+assert len(client4.submitted) == 1 and isinstance(client4.submitted[0], enhanced.LimitOrderRequest)
+assert client4.submitted[0].extended_hours is True
 
-# ---- GTC re-arm submission itself fails: must NOT give up -- retry next poll ----
+# ---- After-hours close submission itself fails: must stay pending for retry ----
 client5 = FakeClient(resting_orders=[], fail_submit=True)
 ex5 = enhanced.EnhancedExecutor(client5)
 ex5._current_market_state = lambda: SimpleNamespace(is_regular_hours=False)
@@ -118,6 +118,6 @@ ex5._force_close_pending["ZAP"] = {"reason": "guardrail:low_mcap", "chase_count"
 
 ex5._sweep_force_closes()
 
-assert "ZAP" in ex5._force_close_pending, "a failed re-arm must stay pending for the next poll, not be silently dropped unprotected"
+assert "ZAP" in ex5._force_close_pending, "a failed close must stay pending for the next poll"
 
-print("OK: _sweep_force_closes gives up EOD/guardrail chases the instant regular hours end (re-arming a GTC stop only if none rests, cancelling any stale order first, retrying on a failed re-arm instead of dropping tracking), and still chases normally during regular hours")
+print("OK: _sweep_force_closes keeps EOD/guardrail closes chasing after-hours with extended-hours limits because Alpaca GTC trailing stops are inactive outside regular hours")

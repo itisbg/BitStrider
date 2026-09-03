@@ -71,12 +71,12 @@ def _closed(held_hours, gain_pct, qty=10):
 
 
 cases = [
-    (7.9,  -5.0, False, "under the 8h threshold — never checked, however bad the P&L"),
-    (8.1,   0.0, False, "flat at 8h+ — still in the (-1.5%, 0%] band, keeps holding"),
-    (8.1,  -1.0, False, "small loss at 8h+ — still in the band, keeps holding"),
-    (8.1,  -1.5, True,  "exactly at the -1.5% cutoff — exits"),
-    (8.1,  -2.0, True,  "past the -1.5% cutoff — exits"),
-    (8.1,  +2.0, True,  "positive at 8h+ — exits, doesn't wait for more"),
+    (7.9,  -5.0, False, "under the 8h threshold -- never checked, however bad the P&L"),
+    (8.1,   0.0, False, "flat at 8h+ -- still in the (-1.5%, 0%] band, keeps holding"),
+    (8.1,  -1.0, False, "small loss at 8h+ -- still in the band, keeps holding"),
+    (8.1,  -1.5, True,  "exactly at the -1.5% cutoff -- exits"),
+    (8.1,  -2.0, True,  "past the -1.5% cutoff -- exits"),
+    (8.1,  +2.0, True,  "positive at 8h+ -- exits, doesn't wait for more"),
 ]
 
 for held_hours, gain_pct, expect_closed, label in cases:

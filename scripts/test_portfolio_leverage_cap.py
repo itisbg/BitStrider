@@ -26,13 +26,13 @@ sys.path.insert(0, str(ROOT))
 from engine.execution.enhanced import PositionInfo
 from engine.config import MAX_PORTFOLIO_LEVERAGE
 
-assert MAX_PORTFOLIO_LEVERAGE == 2.0
+assert MAX_PORTFOLIO_LEVERAGE == 1.5
 
 # --- PositionInfo.total_market_value(): sums abs(market_value), skips options ---
 positions = {
     "AAPL": SimpleNamespace(market_value="500.00"),
-    "TSLA": SimpleNamespace(market_value="-300.00"),   # short — magnitude still counts
-    "AAPL260116C00150000": SimpleNamespace(market_value="9999.00"),  # OCC option — excluded
+    "TSLA": SimpleNamespace(market_value="-300.00"),   # short -- magnitude still counts
+    "AAPL260116C00150000": SimpleNamespace(market_value="9999.00"),  # OCC option -- excluded
 }
 info = PositionInfo(positions_dict=positions, total_count=3)
 assert info.total_market_value() == 800.0, f"expected 500+300 (option excluded), got {info.total_market_value()}"

@@ -3,16 +3,16 @@
 Bug: _ratchet_done was symbol-keyed and add-only, so a symbol re-entered
 after an earlier lot had already ratcheted got zero profit-lock protection
 on the new position (ABCL ran +6.3% unrealized on a fresh entry and never
-tightened — enhanced.py:1132).
+tightened -- enhanced.py:1132).
 
-Fix: detect_stopped_out_positions() — the generic "position closed via any
-route" catch-all that already runs every 10s — now discards the symbol from
+Fix: detect_stopped_out_positions() -- the generic "position closed via any
+route" catch-all that already runs every 10s -- now discards the symbol from
 _ratchet_done as soon as it disappears from the open-positions list, freeing
 it up for the next entry.
 
 Run with:
   python scripts/test_ratchet_done_reset.py
-No network calls — get_all_positions() is stubbed.
+No network calls -- get_all_positions() is stubbed.
 """
 import sys
 from pathlib import Path

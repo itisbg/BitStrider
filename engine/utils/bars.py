@@ -12,29 +12,42 @@ from __future__ import annotations
 import datetime
 import logging
 import os
+import socket
 import threading
 import time
 from typing import Dict, Tuple
 
 # Add tenacity for retry logic
-from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type
+from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type, retry_if_not_exception_type
 
 import pandas as pd
 import pytz
 
 ET = pytz.timezone("America/New_York")
 
-# ── Alpaca SDK availability ───────────────────────────────────────────────────
+# -- Global socket-level bound -------------------------------------------------
+# 2026-09-02: several yfinance/Alpaca paths (Ticker.info in guardrails, some
+# SDK batch/premarket calls) can still create sockets with no timeout of their
+# own, black-holing the caller for minutes despite the per-fetch wrapper above.
+# socket.setdefaulttimeout() applies to every socket created without an
+# explicit timeout, so even an unwrapped call cannot wedge the process. This
+# engine is pure REST polling (no websockets/live streams in the codebase),
+# and any future streaming client sets its own timeouts and is unaffected.
+try:
+    socket.setdefaulttimeout(float(os.getenv("SOCKET_TIMEOUT_SEC", "15")))
+except Exception:
+    pass  # never block engine startup over a defensive timeout
+
+# ---- Alpaca SDK availability ------------------------------------------------------------------------------------------------------
 try:
     from alpaca.data.historical import StockHistoricalDataClient
-    from alpaca.data.historical import OptionHistoricalDataClient
     from alpaca.data.requests import StockBarsRequest
     from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
     ALPACA_AVAILABLE = True
 except ImportError:
     ALPACA_AVAILABLE = False
 
-# ── Per-cycle bar cache ───────────────────────────────────────────────────────
+# ---- Per-cycle bar cache --------------------------------------------------------------------------------------------------------------
 # Keyed by (symbol, period, interval). Thread-safe via lock.
 _bar_cache: Dict[Tuple[str, str, str], pd.DataFrame] = {}
 _bar_cache_lock = threading.Lock()
@@ -42,7 +55,7 @@ _bar_cache_lock = threading.Lock()
 # get_daily_volume_bars() keeps its own cache rather than sharing _bar_cache:
 # it's a symbol-only key (no period/interval), and more importantly it must
 # never accidentally read back an Alpaca/IEX-sourced entry that some other
-# caller left in _bar_cache under the same (symbol, "5d", "1d") key — that
+# caller left in _bar_cache under the same (symbol, "5d", "1d") key -- that
 # would silently reintroduce the undercounted-volume bug this function exists
 # to avoid. Kept simple: yfinance data is good enough for all callers, so
 # there's no equivalent risk in the other direction.
@@ -53,7 +66,7 @@ _ALPACA_MIN_INTERVAL = 0.35   # per-symbol throttle to reduce 429s
 _last_alpaca_bar_ts: float = 0.0
 
 # Interval-aware staleness thresholds. Previously only minute bars were checked
-# (`interval.endswith("m")`) — daily-bar fetches (RVOL, dollar-volume, the
+# (`interval.endswith("m")`) -- daily-bar fetches (RVOL, dollar-volume, the
 # avg-daily-volume guardrail) and the batch snapshot path returned data no
 # matter how old it was. A trading decision built on a genuinely dead feed
 # for a symbol should never look identical to one built on fresh data.
@@ -85,26 +98,21 @@ def _staleness_threshold(interval: str) -> float:
     return _STALE_THRESHOLD_SECONDS.get(suffix, _STALE_THRESHOLD_SECONDS["d"])
 
 _data_client = None
-_option_data_client = None
 
-# ── Dead ticker suppression ─────────────────────────────────────────────────
+# ---- Dead ticker suppression --------------------------------------------------------------------------------------------------
 # A symbol that comes back stale/empty this many *consecutive* fetches (across
 # both the Alpaca and yfinance paths, whichever runs) gets suppressed from
 # further scans for a while instead of getting hit every cycle for nothing.
 # Root cause this addresses: names like SAJ get added to the scan universe on
 # a one-off signal (EDGAR 8-K match, sympathy, mover) and, with no data-driven
 # filter, keep getting queried every cycle for the rest of the session even
-# once IEX/yfinance have shown zero fresh prints for an hour+ — pure wasted
+# once IEX/yfinance have shown zero fresh prints for an hour+ -- pure wasted
 # Alpaca calls on structurally thin names (confirmed 2026-08-26: SAJ staleness
 # climbing every cycle with no reset after ~10:50 ET).
-# 2026-08-26, user request ("stale data failure should remove the tickers
-# immediately instead of keep wasting time on them"): 5 -> 1. Was a
-# deliberate buffer against a single transient blip wrongly suppressing a
-# real ticker, but the recovery path (_DEAD_TICKER_RECHECK_SEC below) already
-# un-suppresses the moment a real fetch succeeds again, so the buffer was
-# only ever costing wasted cycles, never preventing a bad suppression for
-# more than one cycle either way.
-_DEAD_TICKER_THRESHOLD = int(os.getenv("DEAD_TICKER_THRESHOLD", "1"))
+# 2026-08-31, user request: suppress only after 10 consecutive stale/empty
+# pulls. This keeps a buffer against transient provider glitches while still
+# dropping symbols that repeatedly return unusable data.
+_DEAD_TICKER_THRESHOLD = int(os.getenv("DEAD_TICKER_THRESHOLD", "10"))
 # Once suppressed, let one real fetch back through every N seconds so a name
 # that starts trading again recovers on its own instead of being dead for the
 # rest of the process's life.
@@ -124,12 +132,12 @@ def _record_empty_bars(symbol: str) -> None:
             _dead_tickers[symbol] = time.time()
     if hits >= _DEAD_TICKER_THRESHOLD and newly:
         logging.getLogger("ApexTrader").warning(
-            f"{symbol}: {hits} consecutive stale/empty bar fetches — suppressing from scans"
+            f"{symbol}: {hits} consecutive stale/empty bar fetches -- suppressing from scans"
         )
 
 
 def _record_ok_bars(symbol: str) -> None:
-    """A usable, fresh bar came back — clear any suppression immediately."""
+    """A usable, fresh bar came back -- clear any suppression immediately."""
     with _dead_ticker_lock:
         _dead_ticker_hits.pop(symbol, None)
         _dead_tickers.pop(symbol, None)
@@ -155,20 +163,19 @@ def clear_bar_cache() -> None:
         _bar_cache = {}
 
 
-# ── Alpaca client singletons ──────────────────────────────────────────────────
+# ---- Alpaca client singletons ----------------------------------------------------------------------------------------------------
 
 def mount_wide_pool(client) -> None:
     """alpaca-py builds its internal requests.Session with the urllib3
     default pool_maxsize=10, no constructor param to raise it. Concurrent
-    scan workers (equity scan: 8; options scan: its own pool) share one
-    client, so simultaneous requests routinely exceed 10 and urllib3 tears
+    scan workers (equity scan: 8 workers) share one client, so simultaneous
+    requests routinely exceed 10 and urllib3 tears
     down + rebuilds connections instead of reusing them (confirmed
     2026-08-07 on the stock data client: "Connection pool is full,
-    discarding connection: data.alpaca.markets" every cycle; confirmed
-    2026-08-11 the same default also applies unpatched on the two option
-    data clients — the options scan hit it moments after a restart) — pure
+    discarding connection: data.alpaca.markets" every cycle) pure
     wasted latency, not a correctness bug. Call once right after
-    constructing any StockHistoricalDataClient/OptionHistoricalDataClient.
+    constructing any StockHistoricalDataClient (the option data client was
+    removed 2026-09-01 with options trading).
     """
     try:
         from requests.adapters import HTTPAdapter
@@ -176,7 +183,7 @@ def mount_wide_pool(client) -> None:
         client._session.mount("https://", adapter)
         client._session.mount("http://", adapter)
     except Exception:
-        pass  # cosmetic perf fix — never block client creation over it
+        pass  # cosmetic perf fix -- never block client creation over it
 
 
 def get_data_client() -> "StockHistoricalDataClient":
@@ -190,18 +197,8 @@ def get_data_client() -> "StockHistoricalDataClient":
     return _data_client
 
 
-def get_option_data_client() -> "OptionHistoricalDataClient":
-    global _option_data_client
-    if _option_data_client is None:
-        from engine.config import API_KEY, API_SECRET
-        if not API_KEY or not API_SECRET:
-            raise ValueError("Alpaca API credentials not found in environment")
-        _option_data_client = OptionHistoricalDataClient(API_KEY, API_SECRET)
-        mount_wide_pool(_option_data_client)
-    return _option_data_client
 
-
-# ── TimeFrame helper ──────────────────────────────────────────────────────────
+# ---- TimeFrame helper --------------------------------------------------------------------------------------------------------------------
 
 def _parse_timeframe(interval: str) -> "TimeFrame":
     if interval.endswith("m"):
@@ -230,10 +227,18 @@ def _normalize_df(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-# ── Core bar fetch ────────────────────────────────────────────────────────────
+# ---- Core bar fetch ------------------------------------------------------------------------------------------------------------------------
+
+# -- Hard wall-clock bound on single-symbol network fetches --------------------
+# 2026-09-02: originally added a daemon-thread wrapper here, but abandoned
+# threads can hold yfinance/Alpaca session locks and deadlock the scan's
+# worker pool -- REMOVED. The socket-level default set at import (below) is
+# the single robust bound: any socket created without an explicit timeout
+# raises socket.timeout after SOCKET_TIMEOUT_SEC, so unwrapped calls fail
+# cleanly in their own thread (no orphan threads, no lock leaks).
 
 @retry(wait=wait_exponential(multiplier=1, min=2, max=10), stop=stop_after_attempt(3),
-       retry=retry_if_exception_type(Exception))
+       retry=(retry_if_exception_type(Exception) & retry_if_not_exception_type(socket.timeout)))
 def _get_bars_alpaca(symbol: str, period: str, interval: str, log) -> pd.DataFrame:
     """Fetch OHLCV bars via Alpaca only, with retry."""
     client = get_data_client()
@@ -266,7 +271,7 @@ def _get_bars_alpaca(symbol: str, period: str, interval: str, log) -> pd.DataFra
             staleness = (datetime.datetime.now(ET) - latest).total_seconds()
             threshold = _staleness_threshold(interval)
             if staleness > threshold:
-                log.warning(f"{symbol}: Alpaca data stale ({staleness:.0f}s > {threshold:.0f}s for {interval}) — skipping")
+                log.warning(f"{symbol}: Alpaca data stale ({staleness:.0f}s > {threshold:.0f}s for {interval}) -- skipping")
             else:
                 _record_ok_bars(symbol)
                 with _bar_cache_lock:
@@ -275,7 +280,7 @@ def _get_bars_alpaca(symbol: str, period: str, interval: str, log) -> pd.DataFra
     return pd.DataFrame()
 
 @retry(wait=wait_exponential(multiplier=1, min=1, max=3), stop=stop_after_attempt(2),
-       retry=retry_if_exception_type(Exception))
+       retry=(retry_if_exception_type(Exception) & retry_if_not_exception_type(socket.timeout)))
 def _get_bars_yfinance(symbol: str, period: str, interval: str, log) -> pd.DataFrame:
     import yfinance as yf
     yf_interval_map = {
@@ -295,8 +300,9 @@ def _get_bars_yfinance(symbol: str, period: str, interval: str, log) -> pd.DataF
         return df
     return pd.DataFrame()
 
+
 def get_bars(symbol: str, period: str = "5d", interval: str = "15m", bypass_cache: bool = False) -> pd.DataFrame:
-    """Fetch OHLCV bars via Alpaca (yfinance fallback).
+    """Fetch OHLCV bars via Alpaca, then Yahoo Finance fallback.
 
     Results are cached per (symbol, period, interval) for the current scan
     cycle. Call clear_bar_cache() to reset at cycle start.
@@ -330,7 +336,7 @@ def get_bars(symbol: str, period: str = "5d", interval: str = "15m", bypass_cach
             if not data.empty:
                 return data
         except ImportError:
-            log.warning("yfinance not installed — cannot use fallback for ^VIX")
+            log.warning("yfinance not installed -- cannot use fallback for ^VIX")
         except Exception as e:
             log.warning(f"^VIX: yfinance fetch failed: {e}")
         _record_empty_bars(symbol)
@@ -345,7 +351,7 @@ def get_bars(symbol: str, period: str = "5d", interval: str = "15m", bypass_cach
                 log.debug(f"{symbol}: bar cache hit ({period}/{interval})")
                 return _bar_cache[cache_key]
 
-    # ── Alpaca path with retry ──
+    # ---- Alpaca path with retry ----
     if ALPACA_AVAILABLE:
         try:
             data = _get_bars_alpaca(symbol, period, interval, log)
@@ -354,14 +360,14 @@ def get_bars(symbol: str, period: str = "5d", interval: str = "15m", bypass_cach
         except Exception as e:
             log.warning(f"{symbol}: Alpaca fetch failed: {e}")
 
-    # ── yfinance fallback with retry ──
+    # ---- yfinance fallback with retry ----
     try:
         data = _get_bars_yfinance(symbol, period, interval, log)
         if not data.empty:
-            # _get_bars_alpaca applies a staleness check before returning —
+            # _get_bars_alpaca applies a staleness check before returning --
             # this fallback path never did, so when Alpaca's feed went stale
             # (routine overnight/thin-liquidity) and fell through to here,
-            # whatever yfinance had — even hours old — was returned as if it
+            # whatever yfinance had -- even hours old -- was returned as if it
             # were live, with no warning. Confirmed 2026-08-05: this let
             # VWAPFade compute an identical signal off frozen SOXS bars for
             # hours, driving repeated same-symbol re-entries. Same guard,
@@ -373,14 +379,15 @@ def get_bars(symbol: str, period: str = "5d", interval: str = "15m", bypass_cach
                 staleness = (datetime.datetime.now(ET) - latest).total_seconds()
                 threshold = _staleness_threshold(interval)
                 if staleness > threshold:
-                    log.warning(f"{symbol}: yfinance data stale ({staleness:.0f}s > {threshold:.0f}s for {interval}) — skipping")
+                    log.warning(f"{symbol}: yfinance data stale ({staleness:.0f}s > {threshold:.0f}s for {interval}) -- skipping")
                     _record_empty_bars(symbol)
                     return pd.DataFrame()
             return data
     except ImportError:
-        log.warning("yfinance not installed — cannot use fallback")
+        log.warning("yfinance not installed -- cannot use fallback")
     except Exception as e:
         log.warning(f"{symbol}: yfinance fetch failed: {e}")
+
 
     _record_empty_bars(symbol)
     return pd.DataFrame()
@@ -390,7 +397,7 @@ def get_daily_volume_bars(symbol: str) -> pd.DataFrame:
     """3-month daily bars via yfinance specifically, for volume-based liquidity
     checks (avg daily volume / dollar volume guardrails).
 
-    Was 5d (2026-08-06: widened per trader request) — a 4-day trailing window
+    Was 5d (2026-08-06: widened per trader request) -- a 4-day trailing window
     (today's still-in-progress bar is dropped by the caller) meant a handful
     of unusually quiet days could block a symbol that normally trades well
     above the threshold, even though nothing about its real liquidity
@@ -398,13 +405,13 @@ def get_daily_volume_bars(symbol: str) -> pd.DataFrame:
     threshold" rather than "was it quiet this specific week."
 
     Confirmed 2026-08-05: this account's Alpaca market data subscription is
-    IEX-only ("subscription does not permit querying recent SIP data") — IEX
+    IEX-only ("subscription does not permit querying recent SIP data") -- IEX
     is a real exchange but typically only a few percent of a liquid stock's
     true total volume (SHOP showed ~700K/day on IEX vs its real tens of
     millions), so Alpaca's volume is unusable against thresholds calibrated
     for real market volume. yfinance reports full consolidated volume for
     free. Price/OHLC elsewhere (ATR tiers, execution) still uses Alpaca/IEX
-    fine — it's specifically volume that's this skewed, not price.
+    fine -- it's specifically volume that's this skewed, not price.
     """
     symbol = symbol.strip().upper().lstrip("$")
     log = logging.getLogger("ApexTrader")
@@ -420,7 +427,7 @@ def get_daily_volume_bars(symbol: str) -> pd.DataFrame:
                 _volume_bar_cache[symbol] = data
             return data
     except ImportError:
-        log.warning("yfinance not installed — volume guardrail checks unavailable")
+        log.warning("yfinance not installed -- volume guardrail checks unavailable")
     except Exception as e:
         log.warning(f"{symbol}: yfinance volume fetch failed: {e}")
     return pd.DataFrame()
@@ -513,7 +520,7 @@ def get_price(symbol: str) -> float:
 def get_premarket_bars(symbol: str) -> pd.DataFrame:
     """Fetch today's 1-min bars from 4:00 AM ET (pre-market included).
 
-    Cached under a '_prepost' period key — invalidated by clear_bar_cache().
+    Cached under a '_prepost' period key -- invalidated by clear_bar_cache().
     """
     log       = logging.getLogger("ApexTrader")
     cache_key = (symbol, "1d_prepost", "1m")
@@ -538,12 +545,17 @@ def get_premarket_bars(symbol: str) -> pd.DataFrame:
         except Exception as e:
             log.debug(f"get_premarket_bars({symbol}): failed: {e}")
 
+    if result.empty:
+        _record_empty_bars(symbol)
+    else:
+        _record_ok_bars(symbol)
+
     with _bar_cache_lock:
         _bar_cache[cache_key] = result
     return result
 
 
-# ── Finnhub bar source ────────────────────────────────────────────────────────
+# ---- Finnhub bar source ----------------------------------------------------------------------------------------------------------------
 
 def get_finnhub_bars(symbol: str, period: str, interval: str) -> pd.DataFrame:
     """Fetch OHLCV bars from Finnhub (alternative data source)."""
@@ -584,7 +596,7 @@ def get_finnhub_bars(symbol: str, period: str, interval: str) -> pd.DataFrame:
     return df
 
 
-# ── Technical indicators ──────────────────────────────────────────────────────
+# ---- Technical indicators ------------------------------------------------------------------------------------------------------------
 
 def calc_rsi(prices: pd.Series, period: int = 14) -> pd.Series:
     delta = prices.diff()

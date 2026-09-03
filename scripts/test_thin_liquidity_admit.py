@@ -44,7 +44,7 @@ from engine.config import (
 )
 
 # NOTE: TRADE_THIN_LIQUIDITY_REJECTS's live value is a deployment decision
-# (started False 2026-08-12, flipped True same day at the user's request) —
+# (started False 2026-08-12, flipped True same day at the user's request) --
 # not asserted here. Both directions are exercised explicitly below via
 # scan.TRADE_THIN_LIQUIDITY_REJECTS regardless of what's currently live.
 assert THIN_LIQUIDITY_POSITION_SIZE_PCT == 4.0
@@ -59,16 +59,17 @@ scan.TRADE_THIN_LIQUIDITY_REJECTS = False
 for reason in ("avg_volume", "low_float", "min_price", "rvol", "dollar_vol", "low_mcap", "gap_chase", "other", None):
     assert scan._should_admit_thin_liquidity(reason, _regular) is False, f"toggle off should never admit ({reason})"
 
-# Toggle on, regular hours -> every real guardrail reason gets admitted
-# EXCEPT min_price (penny stocks stay hard-blocked), avg_volume_hard_floor
-# and low_float_hard_floor (2026-08-14: <200K avg daily volume / <1M float
-# stay hard-blocked too, unlike the rescuable 700K/20M session floors --
-# AEHL, 0.2M float, is exactly the profile these exclude), and 'other'
-# (not a guardrail at all).
+# Toggle on, regular hours -> only the two momentum-shape guardrail reasons
+# (rvol, gap_chase) get admitted. 2026-08-26, user request ("shouldn't meet
+# the non-negotiable limits of volume"): dollar_vol/avg_volume/low_float/
+# low_mcap describe actual tradability, not a momentary reading, so they are
+# hard-blocked regardless of the toggle. Penny stocks (min_price), the
+# absolute hard floors, and 'other' (not a guardrail at all) stay blocked too.
 scan.TRADE_THIN_LIQUIDITY_REJECTS = True
-for reason in ("avg_volume", "low_float", "rvol", "dollar_vol", "low_mcap", "gap_chase"):
+for reason in ("rvol", "gap_chase"):
     assert scan._should_admit_thin_liquidity(reason, _regular) is True, f"{reason} should be rescued intraday"
-for reason in ("min_price", "avg_volume_hard_floor", "low_float_hard_floor", "other", None):
+for reason in ("avg_volume", "low_float", "min_price", "dollar_vol", "low_mcap",
+               "avg_volume_hard_floor", "low_float_hard_floor", "other", None):
     assert scan._should_admit_thin_liquidity(reason, _regular) is False, f"should not rescue {reason} even with the toggle on"
 
 # 2026-08-13: toggle on, but OUTSIDE regular hours -> never admits, even for
@@ -129,7 +130,7 @@ out = _apply_confidence_size_ramp(risk_info, confidence=0.925, equity=2000.0)
 expected_mid = (BASE_PCT + MAX_POSITION_SIZE_PCT) / 2
 assert round(out["allocation_pct"], 6) == expected_mid, f"expected the ramp's midpoint {expected_mid}%, got {out['allocation_pct']}"
 
-# Ramps toward the SAME absolute ceiling regardless of the base % — e.g. a
+# Ramps toward the SAME absolute ceiling regardless of the base % -- e.g. a
 # small-account 5.0% base still reaches the ceiling at 100% confidence,
 # not 5.0 x some fixed multiplier.
 small_risk_info = {"dollar_amount": 50.0, "allocation_pct": 5.0, "tier": "NORMAL"}
@@ -147,24 +148,30 @@ for conf_pct in range(85, 101):
 
 # --- _resolve_freshness_reject(): stale-momentum trades anyway at reduced size ---
 
-assert TRADE_STALE_MOMENTUM_REJECTS is True
-
-# Fresh -> always valid, signal untouched regardless of the toggle.
-sig = _sig(thin=False)
-valid, reason = _resolve_freshness_reject(sig, fresh=True, fade_reason=None)
-assert (valid, reason) == (True, None)
-assert sig.thin_liquidity is False, "fresh signal must not get flagged"
-
-# Not fresh, toggle on -> valid anyway, flagged thin_liquidity for reduced sizing.
-sig = _sig(thin=False)
-valid, reason = _resolve_freshness_reject(sig, fresh=False, fade_reason="XYZ: faded 10.0% off its 30-min high")
-assert valid is True, "toggle on -> trades anyway, not blocked"
-assert reason is None
-assert sig.thin_liquidity is True, "must flag the signal for reduced sizing"
-
-# Not fresh, toggle off -> hard-blocked, signal untouched (old behavior preserved).
+# 2026-08-26: config default flipped to False (hard reject) -- this test
+# exercises BOTH toggle states explicitly, so it sets the toggle itself
+# rather than assuming the live default.
 import engine.execution.enhanced as enhanced
 _orig_toggle = enhanced.TRADE_STALE_MOMENTUM_REJECTS
+try:
+    enhanced.TRADE_STALE_MOMENTUM_REJECTS = True
+
+    # Fresh -> always valid, signal untouched regardless of the toggle.
+    sig = _sig(thin=False)
+    valid, reason = _resolve_freshness_reject(sig, fresh=True, fade_reason=None)
+    assert (valid, reason) == (True, None)
+    assert sig.thin_liquidity is False, "fresh signal must not get flagged"
+
+    # Not fresh, toggle on -> valid anyway, flagged thin_liquidity for reduced sizing.
+    sig = _sig(thin=False)
+    valid, reason = _resolve_freshness_reject(sig, fresh=False, fade_reason="XYZ: faded 10.0% off its 30-min high")
+    assert valid is True, "toggle on -> trades anyway, not blocked"
+    assert reason is None
+    assert sig.thin_liquidity is True, "must flag the signal for reduced sizing"
+finally:
+    enhanced.TRADE_STALE_MOMENTUM_REJECTS = _orig_toggle
+
+# Not fresh, toggle off -> hard-blocked, signal untouched (old behavior preserved).
 enhanced.TRADE_STALE_MOMENTUM_REJECTS = False
 try:
     sig = _sig(thin=False)

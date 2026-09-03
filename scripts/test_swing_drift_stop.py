@@ -46,7 +46,7 @@ assert f(current=9.815, entry=10.00, is_long=True, stop_pct=3.0) is None, \
 assert f(current=10.541, entry=10.00, is_long=False, stop_pct=3.0) is not None
 assert f(current=10.271, entry=10.00, is_long=False, stop_pct=3.0) is None
 
-# --- No entry-price leg vs a "30-min-ago" reference — swing holds don't
+# --- No entry-price leg vs a "30-min-ago" reference -- swing holds don't
 #     have a meaningful intraday reference point, entry alone is the anchor.
 assert f(current=5.00, entry=None, is_long=True, stop_pct=3.0) is None
 assert f(current=5.00, entry=0.0, is_long=True, stop_pct=3.0) is None

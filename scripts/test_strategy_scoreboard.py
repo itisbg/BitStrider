@@ -61,7 +61,7 @@ summary = _summarize(trades)
 assert summary["A"][0] == 3, "n=3 for strategy A"
 assert abs(summary["A"][1] - 2 / 3) < 1e-9, "win_rate = 2 wins / 3 trades"
 assert summary["B"][0] == 1
-assert summary["B"][1] == 0.0, "0% win rate — its only trade lost"
+assert summary["B"][1] == 0.0, "0% win rate -- its only trade lost"
 
 print("OK: strategy scoreboard's Kelly math reproduces the manually-verified GapBreakout/ORB/TrendBreaker "
       "numbers exactly, should_flag() gates on enabled+n+negative-Kelly correctly, _summarize() groups right")

@@ -1,53 +1,81 @@
 """
-Yahoo Finance equity universe — replaces the TI (Trade Ideas) Selenium/Edge
-scraper as the source for data/ti_primary.json.
+Yahoo Finance equity universe -- the source for data/ti_primary.json.
 
 2026-08-28, user request ("stop the webscrapping from Trade ideas. instead
 use yahoo finance trending now, top gainer and top looser list"): TI's
-"Free Use Has Expired" interstitial was firing on every single page load
-that day, plus a real Edge-crash/profile-lock failure mode -- the whole
-Selenium/Edge automation stack (capture_tradeideas.py) is gone as the
-equity-universe source. Options universe (ti_unusual_options.json) is
-explicitly out of scope per the same conversation and is untouched --
-capture_tradeideas.py stays on disk unused rather than deleted, in case
-that's needed again.
+Selenium/Edge scraper was replaced as the equity-universe source.
+2026-09-01: the scraper (capture_tradeideas.py) was deleted outright.
 
 No login, no browser, no session to expire -- three plain JSON GETs
 (yfinance's screener wraps Yahoo's own endpoints; trending is a second
 undocumented-but-stable endpoint yfinance doesn't wrap, called directly).
-Writes data/ti_primary.json in the EXACT same {"updated", "tickers"} shape
-capture_tradeideas.py always wrote, so get_ti_primary() (engine/equity/
-universe.py) and everything downstream (scan.py's staleness/TTL check,
-batch cap, guardrails) needed zero changes -- only the producer changed.
+Writes data/ti_primary.json in the same {"updated", "tickers"} shape the
+scraper used to, so get_ti_primary() (engine/equity/universe.py) and
+everything downstream (scan.py's staleness/TTL check, batch cap, guardrails)
+needed zero changes -- only the producer changed.
 
-Same day, follow-up request ("ensure you have top list for shorts and
-longs separately based on the scanners used and the percentage drop for
-the day"): day_gainers -> long candidates, day_losers -> short candidates,
-each tagged with its live regularMarketChangePercent and written to their
-own universe.json tier -- mirrors exactly what TI's stockracecentral
-leaders/laggards split used to do (PRIORITY_1_MOMENTUM = long,
-PRIORITY_2_ESTABLISHED = short; see capture_tradeideas.py's old
-_scrape_toplists/_extract_race_sides for the precedent this replaces).
-Trending has no inherent direction (it's attention, not movement), so it
-stays in the combined ti_primary.json pool only -- not tier-tagged.
+day_gainers -> long candidates, day_losers -> short candidates, each tagged
+with its live regularMarketChangePercent and written to their own universe.json
+tier (PRIORITY_1_MOMENTUM = long, PRIORITY_2_ESTABLISHED = short). Trending has
+no inherent direction (it's attention, not movement), so it stays in the
+combined ti_primary.json pool only -- not tier-tagged.
 """
 from __future__ import annotations
 
 import datetime
 import json
 import logging
+import os
+import threading
 from pathlib import Path
 from typing import List, Tuple
 
 import requests
 import yfinance as yf
 
-from engine.ti.capture_tradeideas import _is_valid_ti_ticker  # reuse the same ticker-sanity filter
-
 log = logging.getLogger("ApexTrader")
 
 DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data"
 TI_PRIMARY_FILE = DATA_DIR / "ti_primary.json"
+
+
+# -- Hard wall-clock bound on yfinance's screener ------------------------------
+# Confirmed 2026-09-02: yf.screen() (day_gainers/day_losers) carries no HTTP
+# timeout and black-holed for ~7 minutes, wedging the whole main-loop cycle
+# (heartbeat not written, watchdog crash logic never fired). Run it on a
+# daemon thread and abandon it after _YF_SCREEN_TIMEOUT_SEC; an empty result
+# for that cycle is fail-open (the tier TTL / staleness checks downstream
+# handle a missed refresh), exactly like the existing exception path.
+_YF_SCREEN_TIMEOUT_SEC = float(os.getenv("YF_SCREEN_TIMEOUT_SEC", "30"))
+
+
+def _screen_with_timeout(query: str, count: int) -> dict:
+    box: dict = {}
+
+    def _runner() -> None:
+        try:
+            box["r"] = yf.screen(query, count=count)
+        except BaseException as exc:  # noqa: BLE001 -- surfaced to caller
+            box["e"] = exc
+
+    th = threading.Thread(target=_runner, daemon=True, name=f"yahoo-screen-{query}")
+    th.start()
+    th.join(_YF_SCREEN_TIMEOUT_SEC)
+    if th.is_alive():
+        log.warning(f"[YAHOO] {query} screener exceeded {_YF_SCREEN_TIMEOUT_SEC:.0f}s wall-clock bound -- empty this cycle")
+        return {}
+    if "e" in box:
+        raise box["e"]  # type: ignore[misc]
+    return box["r"]
+
+
+def _is_valid_ti_ticker(symbol: str) -> bool:
+    """Same ticker-sanity filter the TI scraper used (1-5 alpha chars)."""
+    if not symbol or not isinstance(symbol, str):
+        return False
+    symbol = symbol.strip().upper()
+    return 1 <= len(symbol) <= 5 and symbol.isalpha()
+
 
 _TRENDING_URL = "https://query1.finance.yahoo.com/v1/finance/trending/US"
 _HEADERS = {"User-Agent": "Mozilla/5.0"}
@@ -58,7 +86,7 @@ def _screener_quotes(query: str, count: int = _SCREENER_COUNT) -> List[Tuple[str
     """Return [(symbol, pct_change), ...], filtered to valid tickers, deduped,
     sorted by |pct_change| descending (biggest movers first)."""
     try:
-        result = yf.screen(query, count=count)
+        result = _screen_with_timeout(query, count)
     except Exception as e:
         log.warning(f"[YAHOO] {query} screener failed: {e}")
         return []
@@ -157,7 +185,7 @@ def write_ti_primary() -> int:
         tickers.append(s)
 
     if not tickers:
-        log.warning("[YAHOO] fetch returned 0 tickers — leaving ti_primary.json untouched")
+        log.warning("[YAHOO] fetch returned 0 tickers -- leaving ti_primary.json untouched")
         return 0
     data = {
         "updated": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -165,7 +193,7 @@ def write_ti_primary() -> int:
     }
     TI_PRIMARY_FILE.parent.mkdir(parents=True, exist_ok=True)
     TI_PRIMARY_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    log.info(f"[YAHOO] ti_primary.json updated: {len(tickers)} tickers — {tickers[:10]}{'…' if len(tickers) > 10 else ''}")
+    log.info(f"[YAHOO] ti_primary.json updated: {len(tickers)} tickers -- {tickers[:10]}{'...' if len(tickers) > 10 else ''}")
     return len(tickers)
 
 
@@ -179,10 +207,10 @@ def demo() -> None:
     # but the bulk of each list should point the labeled direction.
     if gainers:
         up = sum(1 for _, p in gainers if p >= 0)
-        assert up / len(gainers) > 0.7, f"day_gainers mostly non-positive ({up}/{len(gainers)}) — screener query wrong?"
+        assert up / len(gainers) > 0.7, f"day_gainers mostly non-positive ({up}/{len(gainers)}) -- screener query wrong?"
     if losers:
         down = sum(1 for _, p in losers if p <= 0)
-        assert down / len(losers) > 0.7, f"day_losers mostly non-negative ({down}/{len(losers)}) — screener query wrong?"
+        assert down / len(losers) > 0.7, f"day_losers mostly non-negative ({down}/{len(losers)}) -- screener query wrong?"
     print(f"[demo] LONG candidates ({len(gainers)}): {gainers[:10]}")
     print(f"[demo] SHORT candidates ({len(losers)}): {losers[:10]}")
 
