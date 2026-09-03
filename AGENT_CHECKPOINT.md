@@ -26,6 +26,12 @@
 - `scripts/deploy.py` gate passed (all tests + compileall) -> flag written -> watchdog consumed it within ~2s -> main.py restarted 13:05:37 during the lunch flat window, 0 open positions. `.mainbot.lock` recreated 13:05:38; heartbeat fresh; guardian polling clean (+0.60% day, positions=0).
 - MFE give-back is active for all same-day entries from the 14:45 ET PM window onward. NOTE: OneDrive made local `origin/*` refs stale twice today -- after any push, confirm with `git ls-remote origin` before trusting "Everything up-to-date".
 
+### Deployed LIVE (13:19:47 local / 14:19:47 ET) -- commit `e82b3b6`
+- Afternoon session ends **15:45 ET** (was 15:50): `ENTRY_WINDOW_END_ET`, `EOD_CLOSE_TIME`, `GUARDIAN_POLL_END_ET` (config default + guardian.py fallback), watchdog flat-deploy window now 15:46+ ET. `GUARDRAIL_EOD_CLOSE_TIME` follows `EOD_CLOSE_TIME` automatically.
+- config.py import-time assert widened: EOD close must be 10-15 min before the 16:00 close.
+- Tests updated (entry-window boundaries, deploy-window checks, timeline sim, thin-liquidity comment); ALL TESTS EXIT 0; gate passed; main.py restarted 13:19:47 during lunch flat, 0 positions, heartbeat fresh.
+
+
 
 ---
 
