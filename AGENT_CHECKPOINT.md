@@ -14,6 +14,74 @@
 > re-asking questions. Update BEFORE starting a risky step, and again after it.
 
 ---
+## Snapshot — 2026-09-04 ~17:55 ET (CURRENT STATE — 2.0x release LIVE + AGENT_CONTEXT.md created; audit found doc fixes pending)
+
+### Goal
+Run the trading bot live with a 2.0× portfolio leverage ceiling, a 14:15–15:44 ET
+afternoon session, and corrected boundary/order handling; leave the repo with a
+quick-reload context file so any future session is immediately current.
+
+### Done (verified live and committed)
+- **Deployed:** commit `8afbfb2` was consumed by the watchdog 2026-09-04 15:25:22
+  (log clock; = 16:25 ET wall clock, logs run ET−1h) and main.py relaunched in
+  LIVE mode. Deploy flag absent; heartbeat fresh; book flat (0 positions).
+  Day P&L +$7.53 (+0.371%). "ti_primary.json is empty!" errors after ~17:53 ET
+  are the known TTL expiry fail-open (non-issue, §8 of AGENT_CONTEXT.md).
+- **Live behavior:** gross stock exposure ceiling 2.0× with PRE-TRADE
+  pending-notional headroom (`_size_with_buying_power`) + post-fill
+  `enforce_portfolio_leverage`; entry windows second-precise/end-exclusive
+  `[09:14,11:00)` + `[14:15,15:44)`; boundary cancellation of pending DAY
+  entries at 11:00:00/15:44:00; NFLX-style race-fill re-close; reconciled
+  closes (`dc40b1a`) via `_request_reconciled_close()`.
+- **Repo/docs:** `AGENT_CONTEXT.md` created (commit `1a6f66b`, pushed, remote
+  hash verified via `git ls-remote`) — the always-current quick-reload file,
+  read FIRST in every session. `AGENT_CHECKPOINT.md` header now points to it.
+- Tests at deploy time: 55/55 suites + compileall green.
+
+### Important distinction (read before claiming deploy state)
+- **Repository HEAD = `1a6f66b`** (docs-only commit on top of the release).
+- **Live runtime baseline = `8afbfb2`** (what main.py was restarted on).
+- The difference is documentation-only; no restart needed or wanted for it.
+
+### Known issue: this checkpoint's archive is NOT strictly date-sorted
+The historical snapshots below are not in strict newest-first order (the
+9/4 16:10 snapshot sits between two 9/3 ones). Always scan the snapshot
+headings rather than trusting "first heading = latest".
+
+### Next (audit findings on AGENT_CONTEXT.md — apply in a docs pass)
+1. Fix the Windows test command in §3: `python scripts\test_*.py` does NOT
+   expand the wildcard (verified: exit 2, "Invalid argument"). Document either
+   a PowerShell loop over `Get-ChildItem scripts\test_*.py` running the venv
+   python, or the deploy-gate path `scripts/deploy.py --reason "..."`.
+2. Clarify §3/§4 wording so repository HEAD is never conflated with the
+   deployed runtime commit (see distinction above).
+3. Fix the wrong cross-reference at §2 line 25 ("see §4" → coordination-file
+   rationale lives in §2/state-dir bullet, not §4).
+4. Add guardian's action band to §3: polls every minute but only ACTS
+   09:35–15:44 ET (env `GUARDIAN_POLL_START_ET`/`GUARDIAN_POLL_END_ET`,
+   defaults 09:35/15:44); `--force` overrides; weekend no-op.
+5. Note in §2 that process-path-based `Get-Process` discovery of the bot is
+   unreliable on Windows — heartbeat.txt freshness + log tails are the
+   authoritative liveness checks.
+6. Source still carries stale operator-facing times ("11:00-14:45", "after
+   15:50") in `scripts/deploy.py` docstring/prints and `engine/watchdog.py`
+   comments/log line ~453, even though the actual windows are 11:00–14:15 and
+   after 15:44 (watchdog `_in_flat_deploy_window` logic is correct). Fix the
+   strings; do NOT touch the window logic.
+7. Optionally add a minimal root `AGENTS.md` that just says: read
+   `AGENT_CONTEXT.md` first, then the newest snapshot in `AGENT_CHECKPOINT.md`.
+8. Run compileall + watchdog/deploy-related tests, commit, push, verify with
+   `git ls-remote`. No bot restart required (docs/strings only).
+
+### Files
+- `AGENT_CONTEXT.md` (new, `1a6f66b`), `AGENT_CHECKPOINT.md` (this update),
+  plus the `8afbfb2` release files: `engine/config.py`,
+  `engine/execution/enhanced.py`, `engine/utils/market.py`,
+  `engine/orchestrator.py`, `engine/watchdog.py`, `engine/telemetry.py`,
+  `scripts/deploy.py`, `scripts/guardian.py`, `scripts/_review_30d.py`,
+  related tests.
+
+
 ## Snapshot — 2026-09-03 ~15:20 ET (Release 1: close/protection order reconciliation — IMPLEMENTED, TESTED, NOT YET DEPLOYED)
 
 ### Goal
