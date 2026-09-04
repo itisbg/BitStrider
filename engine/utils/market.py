@@ -144,9 +144,15 @@ def is_open_window() -> bool:
 
 def within_entry_window(now_et: datetime.datetime) -> bool:
     """True if now_et (ET, tz-aware) falls within either entry segment:
-    [ENTRY_WINDOW_START_ET, ENTRY_WINDOW_BREAK_START_ET] (09:14-11:00) or
-    [ENTRY_WINDOW_BREAK_END_ET, ENTRY_WINDOW_END_ET] (14:45-15:50). Both
-    bounds inclusive -- same string-time convention as MarketState.from_now().
+    [ENTRY_WINDOW_START_ET, ENTRY_WINDOW_BREAK_START_ET) (09:14-11:00) or
+    [ENTRY_WINDOW_BREAK_END_ET, ENTRY_WINDOW_END_ET) (14:15-15:44).
+
+    2026-09-04: SECOND-PRECISE and END-EXCLUSIVE. The old minute-string
+    inclusive comparison let the whole final minute count as "inside" -- a
+    trailing-buy resting through 15:44:59 filled at 15:44:37 (NFLX, 9/4)
+    AFTER the EOD flatten had begun. Now the segment START minute is
+    inclusive (09:14:00 / 14:15:00 open trading) and the END minute
+    (11:00:00 / 15:44:00) belongs to the flatten, not to entries.
     """
     from engine.config import (
         ENTRY_WINDOW_START_ET,
@@ -154,23 +160,33 @@ def within_entry_window(now_et: datetime.datetime) -> bool:
         ENTRY_WINDOW_BREAK_END_ET,
         ENTRY_WINDOW_END_ET,
     )
-    t = now_et.strftime("%H:%M")
+
+    def _t(hhmm: str) -> datetime.time:
+        h, m = map(int, hhmm.split(":"))
+        return datetime.time(h, m)
+
+    t = now_et.time()
     return (
-        ENTRY_WINDOW_START_ET <= t <= ENTRY_WINDOW_BREAK_START_ET
-        or ENTRY_WINDOW_BREAK_END_ET <= t <= ENTRY_WINDOW_END_ET
+        _t(ENTRY_WINDOW_START_ET) <= t < _t(ENTRY_WINDOW_BREAK_START_ET)
+        or _t(ENTRY_WINDOW_BREAK_END_ET) <= t < _t(ENTRY_WINDOW_END_ET)
     )
 
 
 def in_lunch_break(now_et: datetime.datetime) -> bool:
     """True if now_et falls inside the midday break
-    [ENTRY_WINDOW_BREAK_START_ET, ENTRY_WINDOW_BREAK_END_ET) (11:00-14:45 ET)
+    [ENTRY_WINDOW_BREAK_START_ET, ENTRY_WINDOW_BREAK_END_ET) (11:00-14:15 ET)
     when the book is hard-flatted and no new entry/re-entry order may be
     placed. Start inclusive (the flat sweep begins the minute the morning
     segment ends), end exclusive (the afternoon segment opens at
-    ENTRY_WINDOW_BREAK_END_ET)."""
+    ENTRY_WINDOW_BREAK_END_ET -- 14:15 since 2026-09-04)."""
     from engine.config import ENTRY_WINDOW_BREAK_START_ET, ENTRY_WINDOW_BREAK_END_ET
-    t = now_et.strftime("%H:%M")
-    return ENTRY_WINDOW_BREAK_START_ET <= t < ENTRY_WINDOW_BREAK_END_ET
+
+    def _t(hhmm: str) -> datetime.time:
+        h, m = map(int, hhmm.split(":"))
+        return datetime.time(h, m)
+
+    t = now_et.time()
+    return _t(ENTRY_WINDOW_BREAK_START_ET) <= t < _t(ENTRY_WINDOW_BREAK_END_ET)
 
 
 # -- VIX -----------------------------------------------------------------------

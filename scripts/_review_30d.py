@@ -34,7 +34,7 @@ ET = pytz.timezone("America/New_York")
 
 # New two-window schedule (config.py 2026-09-01).
 W_AM_OPEN, W_AM_CLOSE = 9 * 60 + 14, 11 * 60        # 09:14-11:00 ET (inclusive)
-W_PM_OPEN, W_PM_CLOSE = 14 * 60 + 45, 15 * 60 + 44  # 14:45-15:44 ET (inclusive)
+W_PM_OPEN, W_PM_CLOSE = 14 * 60 + 15, 15 * 60 + 44  # 14:15-15:44 ET (inclusive; reopen moved 14:45->14:15, 2026-09-04)
 
 
 def load_env() -> dict:

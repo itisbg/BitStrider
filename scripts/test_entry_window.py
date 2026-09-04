@@ -58,7 +58,7 @@ from engine.config import (
 assert DISCOVERY_WINDOW_START_ET == "08:55"
 assert ENTRY_WINDOW_START_ET == "09:14"
 assert ENTRY_WINDOW_BREAK_START_ET == "11:00"
-assert ENTRY_WINDOW_BREAK_END_ET == "14:45"
+assert ENTRY_WINDOW_BREAK_END_ET == "14:15"
 assert ENTRY_WINDOW_END_ET   == "15:44"
 assert EOD_CLOSE_TIME        == "15:44"
 assert LUNCH_FLAT_TIME_ET    == ENTRY_WINDOW_BREAK_START_ET, "lunch flat must fire exactly when the morning entry segment ends"
@@ -77,39 +77,44 @@ assert _within_discovery_window(_at(8, 54)) is False, "one minute before discove
 assert _within_discovery_window(_at(8, 55)) is True, "exactly at discovery boundary -> inside"
 assert _within_discovery_window(_at(9, 24)) is True, "discovery runs before entry window"
 assert _within_discovery_window(_at(12, 0)) is True, "discovery keeps running through the lunch break"
-assert _within_discovery_window(_at(14, 45)) is True, "discovery still active when the afternoon segment opens"
+assert _within_discovery_window(_at(14, 15)) is True, "discovery still active when the afternoon segment opens"
 
-# Inside the morning entry segment (09:14-11:00, inclusive both ends).
+# Inside the morning entry segment (09:14-11:00). 2026-09-04: the segment END
+# minute (11:00) now belongs to the lunch flatten, not to entries --
+# second-precise, END-EXCLUSIVE (the NFLX 15:44:37 race-fill lesson).
 assert _within_entry_window(_at(9, 14)) is True, "exactly at 09:14 open boundary -> inside (inclusive)"
 assert _within_entry_window(_at(10, 0)) is True
-assert _within_entry_window(_at(11, 0)) is True, "exactly at 11:00 segment-1 close -> inside (inclusive)"
+assert _within_entry_window(_at(10, 59)) is True, "one minute before lunch -> still inside"
+assert _within_entry_window(_at(11, 0)) is False, "11:00:00 belongs to the lunch flatten -> entries closed"
 
-# Inside the afternoon entry segment (14:45-15:44, inclusive both ends).
-assert _within_entry_window(_at(14, 45)) is True, "exactly at 14:45 segment-2 open -> inside (inclusive)"
-assert _within_entry_window(_at(15, 0)) is True
-assert _within_entry_window(_at(15, 44)) is True, "exactly at 15:44 close boundary -> inside (inclusive)"
+# Inside the afternoon entry segment (14:15-15:44, start-inclusive, end-exclusive).
+assert _within_entry_window(_at(14, 15)) is True, "exactly at 14:15 reopen -> inside (inclusive)"
+assert _within_entry_window(_at(14, 45)) is True
+assert _within_entry_window(_at(15, 43)) is True
+assert _within_entry_window(_at(15, 44)) is False, "15:44:00 belongs to the EOD flatten -> entries closed"
 
-# The midday break is outside both segments.
+# The midday break is outside both segments (now 11:00-14:15).
 assert _within_entry_window(_at(11, 1)) is False, "one minute into the lunch break -> outside"
 assert _within_entry_window(_at(12, 0)) is False
-assert _within_entry_window(_at(14, 44)) is False, "one minute before afternoon open -> outside"
+assert _within_entry_window(_at(14, 14)) is False, "one minute before the 14:15 reopen -> outside"
 
 # Outside the window entirely.
 assert _within_entry_window(_at(9, 13)) is False, "one minute before 09:14 open -> outside"
-assert _within_entry_window(_at(15, 45)) is False, "one minute after the 15:44 close -> outside"
-assert _within_entry_window(_at(15, 51)) is False, "one minute after the old 15:50 close -> outside"
+assert _within_entry_window(_at(15, 45)) is False, "after the 15:44 close -> outside"
+assert _within_entry_window(_at(15, 51)) is False, "after the old 15:50 close -> outside"
 assert _within_entry_window(_at(15, 55)) is False, "AXTI incident time -> must stay outside"
 assert _within_entry_window(_at(16, 0)) is False, "old 16:00 boundary -> now outside"
 assert _within_entry_window(_at(7, 30)) is False, "pre-market -> outside"
 assert _within_entry_window(_at(3, 0)) is False, "overnight -> outside"
 assert _within_entry_window(_at(23, 59)) is False, "late night -> outside"
 
-# Lunch-break membership mirrors the gap exactly.
+# Lunch-break membership mirrors the gap exactly (11:00-14:15).
 assert in_lunch_break(_at(10, 59)) is False, "one minute before lunch -> not in break"
 assert in_lunch_break(_at(11, 0)) is True, "break starts at 11:00 (inclusive)"
 assert in_lunch_break(_at(12, 0)) is True
-assert in_lunch_break(_at(14, 44)) is True
-assert in_lunch_break(_at(14, 45)) is False, "break ends at 14:45 (exclusive -- afternoon opens)"
+assert in_lunch_break(_at(14, 14)) is True, "last minute of the break"
+assert in_lunch_break(_at(14, 15)) is False, "break ends at 14:15 (exclusive -- afternoon opens)"
+assert in_lunch_break(_at(14, 44)) is False, "mid-afternoon is NOT lunch anymore"
 assert in_lunch_break(_at(15, 0)) is False
 
-print("OK: entry window = [09:14-11:00] + [14:45-15:44] ET, lunch break [11:00-14:45) is fully flat, discovery runs through the break, nothing extends past EOD_CLOSE_TIME")
+print("OK: entry window = [09:14-11:00) + [14:15-15:44) ET (second-precise, end-exclusive -- the 11:00 and 15:44 minutes belong to the flatten), lunch break [11:00-14:15) is fully flat, discovery runs through the break")

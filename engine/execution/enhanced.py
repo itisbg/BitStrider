@@ -2160,8 +2160,15 @@ class EnhancedExecutor:
             else POSITION_SIZE_PCT
         )
         _pos_size_dollars = max(MIN_POSITION_DOLLARS, acct.equity * _pos_size_pct / 100.0)
-        # Strategic max: how many positions our equity allocation strategy supports
-        equity_capacity = max(1, int(acct.equity * 0.95 / _pos_size_dollars))
+        # Strategic max: how many positions our equity allocation strategy supports.
+        # 2026-09-04: leverage-aware -- the deployable gross budget is
+        # equity x MAX_PORTFOLIO_LEVERAGE (with a 5% gross reserve), not just
+        # 95% of unleveraged equity. At the 2.0x cap and the 10% base size
+        # this yields ~19 slots (the SMALL_ACCOUNT_MAX_POSITIONS=24 count cap
+        # still applies on top), instead of ~9 that silently kept the book
+        # near 0.9x even when the leverage ceiling allowed 2x.
+        _gross_budget = acct.equity * MAX_PORTFOLIO_LEVERAGE * 0.95
+        equity_capacity = max(1, int(_gross_budget / _pos_size_dollars))
         _max_positions_cap = (
             SMALL_ACCOUNT_MAX_POSITIONS
             if acct.equity < SMALL_ACCOUNT_EQUITY_THRESHOLD
@@ -2244,15 +2251,49 @@ class EnhancedExecutor:
         margin  = 2.0 if order_type == OrderType.SHORT else 1.0
         usable  = buying_power * (1.0 - MIN_BUYING_POWER_PCT / 100.0)
         account_snapshot = self._account_cache or self._get_account()  # use cached if available
-        # New orders use broker buying power. The 1.5x portfolio cap is
-        # enforced only after fills by enforce_portfolio_leverage().
+        # New orders use broker buying power. The portfolio leverage cap is
+        # ALSO enforced pre-trade in this function (gross-headroom bound
+        # below, 2026-09-04) and after fills by enforce_portfolio_leverage().
         desired = round(risk_info["dollar_amount"] / signal.price)
         max_bp  = int(usable / (signal.price * margin))
         max_concentration = int(account_snapshot.equity * MAX_POSITION_CONCENTRATION_PCT / 100.0 / signal.price)
 
-        # Broker buying power and the single-symbol concentration cap limit
-        # placement; total portfolio leverage is checked after fills.
-        shares  = min(desired, max_bp, max_concentration)
+        # 2026-09-04, user request ("increase alpaca margin total utilization
+        # to 2X the portfolio value"): pre-trade gross-exposure headroom.
+        # Previously this cap was enforced ONLY after fills by
+        # enforce_portfolio_leverage()'s 10-minute grid -- the book could sit
+        # over the cap for up to 10 minutes and then get trimmed (pure
+        # turnover + spread cost). Bound the NEW order here so projected
+        # gross exposure can never exceed equity x MAX_PORTFOLIO_LEVERAGE at
+        # submission time:
+        #   filled positions (abs market value, options excluded)
+        # + resting entry orders' notional (fresh/re-entry/staged)
+        # + this order's notional
+        #   <= equity x MAX_PORTFOLIO_LEVERAGE
+        try:
+            gross_now = self._get_positions().total_market_value()
+        except Exception:
+            gross_now = 0.0  # fail open to the other caps, never crash sizing
+        pending_notional = 0.0
+        for p_sym, p_info in getattr(self, "_pending_entry_signals", {}).items():
+            if p_sym == signal.symbol:
+                continue  # this symbol's own resting order is being replaced/rechecked
+            try:
+                p_price = float(getattr(p_info.get("signal"), "price", 0.0) or 0.0)
+                p_qty = float((getattr(self, "_entry_pending", {}).get(p_sym, {}) or {}).get("qty", 0) or 0)
+                if p_price > 0 and p_qty > 0:
+                    pending_notional += p_price * p_qty
+            except Exception:
+                continue
+        cap_value = account_snapshot.equity * MAX_PORTFOLIO_LEVERAGE
+        gross_headroom = max(0.0, cap_value - gross_now - pending_notional)
+        max_leverage = int(gross_headroom / (signal.price * margin))
+
+        # Broker buying power, the single-symbol concentration cap, and the
+        # whole-book leverage cap (pre-trade) all limit placement; the
+        # post-fill enforce_portfolio_leverage() grid remains a backstop for
+        # price appreciation.
+        shares  = min(desired, max_bp, max_concentration, max_leverage)
 
         min_position = SMALL_ACCOUNT_MIN_POSITION_DOLLARS if account_snapshot.equity < SMALL_ACCOUNT_EQUITY_THRESHOLD else MIN_POSITION_DOLLARS
 
@@ -3987,6 +4028,22 @@ class EnhancedExecutor:
 
         total_value = sum(abs(float(p.market_value)) for p in equity_positions)
         cap_value = acct.equity * MAX_PORTFOLIO_LEVERAGE
+        # 2026-09-04: utilization telemetry -- required to judge whether the
+        # 2.0x ceiling actually improves portfolio returns (P&L per dollar of
+        # average exposure) or just magnifies churn. One event per 10-min grid
+        # tick, machine-local JSONL, never blocks trading.
+        try:
+            _telemetry_log(
+                "leverage_snapshot",
+                equity=round(float(acct.equity), 2),
+                gross_exposure=round(total_value, 2),
+                gross_leverage=round(total_value / float(acct.equity), 3),
+                cap=MAX_PORTFOLIO_LEVERAGE,
+                positions=len(equity_positions),
+                over_cap=total_value > cap_value,
+            )
+        except Exception:
+            pass
         if total_value <= cap_value:
             return
 
@@ -4077,12 +4134,12 @@ class EnhancedExecutor:
 
         Uses Alpaca's exchange calendar so early-close sessions flatten in
         time even when their close is before the configured EOD time. On a
-        regular session the CONFIGURED EOD_CLOSE_TIME governs (2026-09-03
-        (2nd): user set 15:44 -- the old close-10min override was why the
-        log showed eod_exit=15:50 while config said 15:45). We take the
-        EARLIER of the two so both the user's cutoff AND early-close
-        protection always hold. Falls back to configured
-        MARKET_CLOSE/EOD_CLOSE_TIME if the calendar is unavailable.
+        regular session the CONFIGURED EOD_CLOSE_TIME governs (2026-09-03:
+        user set 15:44 -- the old close-10min override was why the log showed
+        eod_exit=15:50 while config said 15:45). We take the EARLIER of the
+        two so both the user's cutoff AND early-close protection always hold.
+        Falls back to configured MARKET_CLOSE/EOD_CLOSE_TIME if the calendar
+        is unavailable.
         """
         import pytz
 
@@ -4133,6 +4190,60 @@ class EnhancedExecutor:
             f"eod_exit={eod_at.strftime('%H:%M')} ET ({source})"
         )
         return close_at, eod_at, source
+
+    def _cancel_pending_entry_orders(self, reason: str) -> None:
+        """Cancel every still-resting DAY ENTRY order (fresh / re-entry /
+        staged add) and clear the local pending-entry bookkeeping that
+        described them.
+
+        2026-09-04 (NFLX): the EOD sweep only cancelled orders belonging to
+        symbols it was CLOSING -- a trailing-buy resting for a symbol with no
+        position kept sitting at the broker and filled at 15:44:37, after the
+        flatten had begun (and the earlier NFLX chain's done-set entry then
+        blocked the rerun sweep from closing the new fill). Called at the
+        lunch (11:00) and EOD (15:44) boundaries so NOTHING new can fill past
+        a session boundary.
+
+        GTC trailing stops are NEVER touched: they are protective exits on
+        held positions, not entries (classify_symbol_order is the authority).
+        Idempotent -- every minute's rerun finds nothing to cancel and just
+        keeps local state clean.
+        """
+        cancelled = 0
+        try:
+            positions = {p.symbol: p for p in (self.client.get_all_positions() or [])}
+        except Exception:
+            positions = {}
+        try:
+            open_orders = self.client.get_orders() or []
+        except Exception as e:
+            log.warning(f"_cancel_pending_entry_orders ({reason}): order fetch failed: {e}")
+            return
+        for order in open_orders:
+            sym = getattr(order, "symbol", None)
+            view = _normalize_order_view(order)
+            kind = classify_symbol_order(view, int(float(positions.get(sym, SimpleNamespace(qty=0)).qty) or 0))
+            # Entry-side orders only. On a symbol with NO position,
+            # position_qty is 0 so classify returns id-based kinds
+            # (entry/staged_entry/reentry) from the client_order_id alone.
+            if kind not in ("entry", "staged_entry", "reentry"):
+                continue
+            try:
+                self.client.cancel_order_by_id(str(order.id))
+                cancelled += 1
+            except Exception:
+                pass
+        if cancelled:
+            log.warning(f"[BOUNDARY] {reason}: cancelled {cancelled} pending entry order(s) -- nothing may fill past the boundary")
+            _telemetry_log("boundary_pending_entries_cancelled", reason=reason, cancelled=cancelled)
+        # Local bookkeeping for the dead orders must go too -- a stale
+        # _entry_pending/_pending_entry_signals entry makes the 5s sweeps
+        # treat a cancelled order as live (and _staged_allocation would keep
+        # trying to add tranches for it).
+        self.order_cache.clear()
+        self._entry_pending.clear()
+        self._pending_entry_signals.clear()
+        self._staged_allocation.clear()
 
     def close_eod_positions(self) -> Optional[dict]:
         """Close every same-day position at EOD_CLOSE_TIME, regardless of
@@ -4186,6 +4297,16 @@ class EnhancedExecutor:
             log.error(f"close_eod_positions: fetch failed: {e}")
             return None
 
+        # 2026-09-04 (NFLX): cancel every still-resting DAY ENTRY order the
+        # moment the EOD window opens -- not just per-position. The EOD sweep
+        # used to only cancel orders belonging to symbols it was closing, so
+        # a trailing-buy resting for a symbol with NO position kept sitting
+        # at the broker and could fill at 15:44:37 -- after the flatten had
+        # begun. GTC protective stops are not touched here (they belong to
+        # the per-position close path below); DAY entry/re-entry/staged
+        # orders all die so nothing new can fill past the boundary.
+        self._cancel_pending_entry_orders("EOD close window open")
+
         today = now_et.date()
         already_closed = getattr(self, "_eod_closed", {}).setdefault(today, set())
         self._eod_closed = {today: already_closed}
@@ -4198,7 +4319,23 @@ class EnhancedExecutor:
             if qty == 0:
                 continue
             if sym in already_closed:
-                continue
+                # 2026-09-04 (NFLX): a symbol whose EARLIER chain was closed
+                # today can REAPPEAR when a race-fill lands after this sweep
+                # first ran (NFLX refilled at 15:44:37; its done-set entry
+                # from the morning close silently blocked the rerun). If no
+                # active close order is resting for it, clear the done mark
+                # so this pass re-closes it; if one IS resting, keep waiting.
+                try:
+                    active_close = any(
+                        getattr(o, "symbol", None) == sym
+                        for o in (self.client.get_orders() or [])
+                    )
+                except Exception:
+                    active_close = True  # unknown -- don't double-submit
+                if active_close:
+                    continue
+                already_closed.discard(sym)
+                log.warning(f"EOD CLOSE {sym}: reappeared after an earlier close (race-fill) -- re-closing")
 
             entry_info = self._entry_log.get(sym) or {}
             strategy = entry_info.get("strategy", "unknown")
@@ -4458,6 +4595,18 @@ class EnhancedExecutor:
                     pass
         except Exception as e:
             log.warning(f"lunch_flat_positions: open-order cancel pass failed: {e}")
+
+        # 2026-09-04: the broker-side sweep above kills every resting order,
+        # but the LOCAL pending-entry bookkeeping (_entry_pending /
+        # _pending_entry_signals / order_cache / staged-add state) still
+        # described those dead orders. Clear it so the 14:15 reopen starts
+        # from fresh state instead of "reviving" morning orders whose broker
+        # legs were just cancelled (a stale _entry_pending entry made the
+        # pending-entry sweep treat a dead order as live through the break).
+        self.order_cache.clear()
+        self._entry_pending.clear()
+        self._pending_entry_signals.clear()
+        self._staged_allocation.clear()
 
         try:
             positions = self.client.get_all_positions()
@@ -5821,7 +5970,7 @@ class EnhancedExecutor:
                 # afternoon segment opens, via a fresh scan/re-arm.
                 log.info(f"{tag} {sym}: midday break ({ENTRY_WINDOW_BREAK_START_ET}-{ENTRY_WINDOW_BREAK_END_ET} ET) -- not re-arming a re-entry until the afternoon segment opens")
                 return
-            if _now_et.strftime("%H:%M") > ENTRY_WINDOW_END_ET:
+            if _now_et.strftime("%H:%M") >= ENTRY_WINDOW_END_ET:
                 log.info(f"{tag} {sym}: past entry window ({ENTRY_WINDOW_END_ET} ET) -- not re-arming a re-entry")
                 return
             # 2026-08-26, user request ("reentry should happen for the top 30
@@ -6285,7 +6434,7 @@ class EnhancedExecutor:
         check runs concurrently."""
         import pytz as _pytz
         _now_et = datetime.datetime.now(_pytz.timezone("America/New_York"))
-        past_window = _now_et.strftime("%H:%M") > ENTRY_WINDOW_END_ET
+        past_window = _now_et.strftime("%H:%M") >= ENTRY_WINDOW_END_ET
         # 2026-09-01, two-window schedule: during the midday break the queued
         # entries neither fire nor expire -- they WAIT (intact) for the 14:45
         # afternoon segment, per "reenter only at 2:45PM". The past_window

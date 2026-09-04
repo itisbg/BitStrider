@@ -1434,9 +1434,10 @@ def start() -> None:
                     and entry_open_scan_date != now_et.date()
                 )
                 # 2026-09-01, two-window schedule: the afternoon entry segment
-                # (14:45-15:50) needs its own once-per-day kick, same shape as
-                # the morning one -- without it the first afternoon cycle waits
-                # out the adaptive interval before it can re-enter at all.
+                # (now 14:15-15:44, 2026-09-04) needs its own once-per-day
+                # kick, same shape as the morning one -- without it the first
+                # afternoon cycle waits out the adaptive interval before it
+                # can re-enter at all.
                 entry_reopen = datetime.datetime.strptime(
                     cfg.ENTRY_WINDOW_BREAK_END_ET, "%H:%M"
                 ).time()
@@ -1454,7 +1455,7 @@ def start() -> None:
                 # morning's 09:29:46 restart): on boot after 09:25 this fires
                 # immediately instead of waiting out the adaptive interval.
                 # Scoped to the morning segment (ends at the 11:00 lunch flat);
-                # the afternoon segment has its own entry_reopen at 14:45.
+                # the afternoon segment has its own entry_reopen (14:15).
                 readiness_open = datetime.datetime.strptime(
                     cfg.MORNING_READINESS_ET, "%H:%M"
                 ).time()

@@ -65,6 +65,46 @@ exits blind-cancelled + slept 0.4s + closed and Alpaca rejected the close 9x wit
   NOT the runtime/generated noise (data/*.json, graphify-out, heartbeat).
 
 ---
+## Snapshot — 2026-09-04 ~16:10 ET (2.0x leverage cap + 14:15 afternoon reopen + boundary fixes — IMPLEMENTED, TESTED)
+
+### Implemented (all verified by tests)
+- `engine/config.py`: `MAX_PORTFOLIO_LEVERAGE` env-overridable, default **2.0**, import assert
+  [1.0, 2.0]; `ENTRY_WINDOW_BREAK_END_ET` **"14:15"** (afternoon reopen 30 min earlier; end stays 15:44).
+- `engine/utils/market.py`: `within_entry_window`/`in_lunch_break` now SECOND-PRECISE and
+  END-EXCLUSIVE — [09:14,11:00) + [14:15,15:44); the 11:00 and 15:44 minutes belong to the flatten
+  (NFLX 15:44:37 race-fill lesson).
+- `engine/execution/enhanced.py`:
+  - `_size_with_buying_power`: PRE-TRADE gross-exposure headroom — filled exposure (abs, options
+    excluded) + resting entry notional (`_pending_entry_signals` x `_entry_pending` qty) + this order
+    <= equity x 2.0; downsizes to headroom, skips at 0 (no more fill-then-trim churn).
+  - `_validate_trade`: equity_capacity now leverage-aware (equity x 2.0 x 0.95 / pos size = ~19
+    slots at 10% base, was ~9 silently).
+  - NEW `_cancel_pending_entry_orders(reason)`: cancels every resting DAY entry/re-entry/staged
+    order (classify-based, GTC stops untouched), clears order_cache/_entry_pending/
+    _pending_entry_signals/_staged_allocation. Called at EOD window open.
+  - `close_eod_positions` reappearance fix: a symbol in `_eod_closed` whose position is STILL open
+    with no active close order gets its done-mark cleared and is re-closed (NFLX race-fill).
+  - `lunch_flat_positions`: clears local pending state after the sweep-wide cancel (no reviving
+    dead morning orders at the 14:15 reopen).
+  - `_maybe_rearm_reentry`/`check_blocked_entries_ema`: `>=` ENTRY_WINDOW_END_ET (past window at
+    15:44:00, not 15:45).
+  - `enforce_portfolio_leverage`: `leverage_snapshot` telemetry every grid tick.
+- `engine/watchdog.py`: flat-deploy lunch window 11:00-**14:15**.
+- `scripts/deploy.py`/`guardian.py`/`_review_30d.py`: 14:15/15:44 wording.
+
+### Tests — ALL GREEN (55/55)
+- Updated: test_entry_window (new matrix incl. end-exclusive 11:00/15:44), test_guardian_and_deploy
+  (14:14 allowed/14:15 blocked), test_lunch_flat (14:15 wording), test_eod_close_rerun (resting-order
+  contract + race-fill re-close), test_portfolio_leverage_cap (2.0).
+- NEW: `scripts/test_pretrade_leverage_headroom.py` (8 cases: desired pass-through, headroom clip,
+  at-cap skip, over-cap clamp, pending reservation, own-symbol exclusion, options exclusion, short
+  abs-value).
+- compileall engine+scripts OK. Deferred to a later release: daily portfolio analyzer script,
+  per-symbol chain ledger (telemetry-only), late-morning 10:55 cutoff — per plan promotion criteria.
+
+### Deploy state — commit + deploy gate next (human-gated flag write via scripts/deploy.py)
+
+---
 ## Snapshot — 2026-09-03 ~16:20 ET (afternoon end 15:45 -> 15:44 ET — IMPLEMENTED, TESTED, DEPLOYING)
 
 ### Goal

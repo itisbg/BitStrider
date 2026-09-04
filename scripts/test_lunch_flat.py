@@ -163,7 +163,7 @@ with patch("engine.execution.enhanced.datetime.datetime", _FixedDateTime):
         ex6._get_account = lambda *a, **k: type("A", (), {"equity": 10000, "buying_power": 10000})()
 
         ex6._sweep_pending_entries()
-        assert ex6._entry_pending, "pending entry must survive the break, waiting for 14:45"
+        assert ex6._entry_pending, "pending entry must survive the break, waiting for the 14:15 reopen"
         assert ex6.client.cancelled == [], "no entry re-chase (cancel+resubmit) during the break"
 
         ex6._no_rearm.add("FOO")

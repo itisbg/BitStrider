@@ -26,7 +26,7 @@ sys.path.insert(0, str(ROOT))
 from engine.execution.enhanced import PositionInfo
 from engine.config import MAX_PORTFOLIO_LEVERAGE
 
-assert MAX_PORTFOLIO_LEVERAGE == 1.5
+assert MAX_PORTFOLIO_LEVERAGE == 2.0
 
 # --- PositionInfo.total_market_value(): sums abs(market_value), skips options ---
 positions = {

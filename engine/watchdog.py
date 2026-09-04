@@ -370,7 +370,7 @@ class AutoBotWatchdog:
         Outside those, a mid-session deploy could race an open position, so the
         flag is left in place and the restart defers until a window opens."""
         hm = now_et.hour * 60 + now_et.minute
-        lunch_flat = (11 * 60, 14 * 60 + 45)      # 11:00-14:45 ET
+        lunch_flat = (11 * 60, 14 * 60 + 15)      # 11:00-14:15 ET (afternoon reopen moved 14:45->14:15, 2026-09-04)
         if lunch_flat[0] <= hm < lunch_flat[1]:
             return True
         eod_to_prep = (15 * 60 + 44, 9 * 60 + 5)  # after 15:44 ET (EOD close, 2026-09-03 (2nd): was 15:45) -> 09:05 ET next day

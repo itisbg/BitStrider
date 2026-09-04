@@ -304,8 +304,9 @@ def test_watchdog_deploy_window_and_flag() -> None:
 
     check("deploy window 10:59 ET blocked", w._deploy_window_allows(at(10, 59)) is False)
     check("deploy window 11:00 ET allowed (lunch flat)", w._deploy_window_allows(at(11, 0)) is True)
-    check("deploy window 14:44 ET allowed", w._deploy_window_allows(at(14, 44)) is True)
-    check("deploy window 14:45 ET blocked", w._deploy_window_allows(at(14, 45)) is False)
+    check("deploy window 14:14 ET allowed (last lunch-flat minute)", w._deploy_window_allows(at(14, 14)) is True)
+    check("deploy window 14:15 ET blocked (afternoon reopen, 2026-09-04)", w._deploy_window_allows(at(14, 15)) is False)
+    check("deploy window 14:44 ET blocked (afternoon session)", w._deploy_window_allows(at(14, 44)) is False)
     check("deploy window 15:43 ET blocked (still inside session)", w._deploy_window_allows(at(15, 43)) is False)
     check("deploy window 15:44 ET blocked (EOD close firing at 15:44)", w._deploy_window_allows(at(15, 44)) is False)
     check("deploy window 15:45 ET allowed (after 15:44 EOD)", w._deploy_window_allows(at(15, 45)) is True)

@@ -4,8 +4,10 @@ window (schedule.every(1).minutes) instead of once per day, so a position
 opened AFTER the first post-close-time tick (ASST/NUAI, opened 15:57 ET,
 12 min after both jobs had already run-and-parked for the day) still gets
 caught. This checks the idempotency side of that change: a rerun must not
-resubmit a close for a symbol it already closed, but must still catch a
-symbol that shows up later.
+resubmit while the close order still rests at the broker, but must still
+catch a symbol that shows up later -- and, 2026-09-04 (NFLX race-fill), must
+RE-close a position that reappears after its earlier chain was closed and no
+working close order remains.
 
 Run with:
   python scripts/test_eod_close_rerun.py
@@ -48,6 +50,7 @@ class FakeClient:
     def __init__(self):
         self.positions = []
         self.submitted = []  # symbols a closing order was submitted for, in order
+        self.orders = []     # orders resting at the broker (get_orders reflects these)
         self.calendar_close = None
         self.calendar_calls = 0
 
@@ -55,7 +58,7 @@ class FakeClient:
         return self.positions
 
     def get_orders(self, *args, **kwargs):
-        return []
+        return self.orders
 
     def cancel_order_by_id(self, order_id):
         pass
@@ -83,14 +86,27 @@ with patch("engine.execution.enhanced.datetime.datetime", _FixedDateTime):
     assert client.submitted == ["FOO"], client.submitted
     assert "FOO" not in ex._entry_log  # popped on close, same as before this change
 
-    s2 = ex.close_eod_positions()  # FOO still "open" (fake fill never happened) -- must not resubmit
+    # 2026-09-04 (NFLX): the rerun contract is now "must not resubmit while a
+    # close order still rests at the broker; MUST re-close a position that is
+    # still open with NO working close order" -- a race-fill can reappear
+    # after the first pass (NFLX refilled 15:44:37 and its done-set entry
+    # from the earlier chain blocked the rerun, leaving it open overnight-
+    # risk). Model the resting close order for the no-resubmit case:
+    client.orders = [type("O", (), {"id": "close-1", "symbol": "FOO"})()]
+    s2 = ex.close_eod_positions()  # FOO still open, close order resting -- must not resubmit
     assert client.submitted == ["FOO"], f"duplicate resubmit: {client.submitted}"
+
+    client.orders = []  # the resting close is gone (cancelled/expired) but FOO is still open
+    ex.close_eod_positions()  # reappeared with no working close -> MUST re-close
+    assert client.submitted == ["FOO", "FOO"], client.submitted
+    # The re-close now rests at the broker too -- pass 3 must not triple-submit.
+    client.orders = [type("O", (), {"id": "close-2", "symbol": "FOO"})()]
 
     client.positions.append(FakePosition("BAR", 5))
     client.positions.append(FakePosition("BAZ", 3))  # no entry_log row: still must close at EOD
     ex._entry_log["BAR"] = {"date": today, "strategy": "VWAPReclaim"}
     ex.close_eod_positions()  # a symbol that shows up later must still get caught
-    assert client.submitted == ["FOO", "BAR", "BAZ"], client.submitted
+    assert client.submitted == ["FOO", "FOO", "BAR", "BAZ"], client.submitted
 
     # ---- close_guardrail_fail_positions: same rerun contract, via the per-symbol _guardrail_eod_closed set ----
     # 2026-08-23, user request: GUARDRAIL_EOD_CLOSE_ENABLED now defaults False

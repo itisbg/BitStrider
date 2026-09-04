@@ -198,15 +198,26 @@ CONCENTRATION_CHECK_INTERVAL_MIN = 10
 # already reflects margin (roughly 2x-4x equity depending on account type/
 # PDT status); this is a SEPARATE, stricter ceiling on TOTAL exposure
 # across every open position combined, independent of whatever margin the
-# broker would otherwise extend. MAX_POSITION_CONCENTRATION_PCT (20%) caps
-# one symbol; CORRELATION_GROUPS (25%) caps one correlated basket; this
-# caps the WHOLE book at once. It is enforced after fills by
-# enforce_portfolio_leverage (same fixed clock-grid schedule as the other
-# concentration checks -- see _concentration_check_job in orchestrator.py).
-# Entry sizing uses broker buying power and the per-symbol cap; it does not
-# pre-throttle orders against this total-exposure limit.
+# broker would otherwise extend. MAX_POSITION_CONCENTRATION_PCT (26.7%)
+# caps one symbol; CORRELATION_GROUPS (33.3%) caps one correlated basket;
+# this caps the WHOLE book at once. It is enforced BOTH before submission
+# (2026-09-04: _size_with_buying_power bounds every new order to the
+# remaining gross headroom -- filled positions + resting entry notional
+# + this order <= equity x cap) AND after fills by
+# enforce_portfolio_leverage (10-min grid backstop for price appreciation).
+# 2026-09-04, user request: raise the ceiling to 2.0x portfolio value.
+# A ceiling, NOT a target -- utilization still requires qualified signals;
+# nothing sizes up to "use" the extra room.
 # -----------------------------------------------------------------
-MAX_PORTFOLIO_LEVERAGE = 1.5   # total open-position market value <= this x equity (2026-08-28, user request: 1.5x actual-position cap, independent of Alpaca's 4x order-placement margin)
+MAX_PORTFOLIO_LEVERAGE = float(os.getenv("MAX_PORTFOLIO_LEVERAGE", "2.0"))
+# Import-time guard: a typo'd .env value must never let the book run at
+# Alpaca's full 4x order-placement margin. 1.0 floor = no leverage below
+# cash-equivalent makes sense for this strategy; 2.0 is the user's ceiling.
+assert 1.0 <= MAX_PORTFOLIO_LEVERAGE <= 2.0, (
+    f"MAX_PORTFOLIO_LEVERAGE ({MAX_PORTFOLIO_LEVERAGE}) must be within [1.0, 2.0] "
+    f"(2026-09-04: user ceiling 2.0x portfolio value; Alpaca's ~4x buying_power "
+    f"is order-placement capacity, not a target)"
+)
 
 # Same-underlying leveraged-ETF pairs (bull+bear on one commodity/index, e.g.
 # BOIL/KOLD both on nat gas -- arbitrary product names, no ticker pattern to
@@ -566,7 +577,7 @@ DISCOVERY_WINDOW_START_ET = "08:55"
 # literals are the midday break between them -- the morning segment runs
 # [ENTRY_WINDOW_START_ET, ENTRY_WINDOW_BREAK_START_ET] (09:14-11:00) and the
 # afternoon segment runs [ENTRY_WINDOW_BREAK_END_ET, ENTRY_WINDOW_END_ET]
-# (14:45-15:44). During the break (11:00-14:45) order submission is fully
+# (14:15-15:44). During the break (11:00-14:15) order submission is fully
 # blocked AND the book is hard-flatted (LUNCH_FLAT_TIME_ET below): every
 # position closed and every open order cancelled, per the user's "at 11AM
 # close all positions and open orders, and reenter only at 2:45PM" request.
@@ -574,7 +585,10 @@ DISCOVERY_WINDOW_START_ET = "08:55"
 # through the break so the afternoon segment trades on a warm universe.
 # Ordering is enforced at import time (see the asserts near EOD_CLOSE_TIME).
 ENTRY_WINDOW_BREAK_START_ET = "11:00"   # morning entry segment ends / lunch flat begins
-ENTRY_WINDOW_BREAK_END_ET   = "14:45"   # afternoon entry segment opens
+# 2026-09-04, user request: afternoon reopen 2:15PM ET (was 2:45PM) -- 30
+# more minutes of runway before the 15:44 EOD flat, so afternoon trades can
+# arm MFE and develop instead of entering in the final hour. End stays 15:44.
+ENTRY_WINDOW_BREAK_END_ET   = "14:15"   # afternoon entry segment opens
 # 2026-08-18, user request ("no new buys after 2:45" -- 2:45 PM CDT = 15:45
 # ET -- then same day, refined to "change the eod close time and no trades
 # time to 3:50pm ET... after this no new entry positions only keep the
