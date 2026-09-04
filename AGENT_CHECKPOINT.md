@@ -39,9 +39,18 @@ quick-reload context file so any future session is immediately current.
 - Tests at deploy time: 55/55 suites + compileall green.
 
 ### Important distinction (read before claiming deploy state)
-- **Repository HEAD = `1a6f66b`** (docs-only commit on top of the release).
-- **Live runtime baseline = `8afbfb2`** (what main.py was restarted on).
-- The difference is documentation-only; no restart needed or wanted for it.
+- **Live runtime baseline = `8afbfb2`** (what main.py was restarted on 9/4 —
+  the last commit containing trading code).
+- **Repo HEAD at this snapshot's creation = `1a6f66b`** (docs-only commit on
+  top of the release). Later docs-only commits (`5ccd85d`, `842fea7`,
+  `dd786fc`) resolved the audit findings below — see the RESOLVED banner in
+  the Next section — so the documentation HEAD can always sit AHEAD of the
+  runtime baseline. Run `git --no-pager log --oneline 8afbfb2..HEAD` to see
+  exactly how far ahead, and confirm every commit in that range is
+  docs/tests-only before claiming the live bot is stale (a code commit in
+  that range means the runtime IS behind and a deploy is due).
+- The difference so far is documentation-only; no restart needed or wanted
+  for docs commits.
 
 ### Known issue: this checkpoint's archive is NOT strictly date-sorted
 The historical snapshots below are not in strict newest-first order (the
