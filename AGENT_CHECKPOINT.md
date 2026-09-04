@@ -49,6 +49,14 @@ The historical snapshots below are not in strict newest-first order (the
 headings rather than trusting "first heading = latest".
 
 ### Next (audit findings on AGENT_CONTEXT.md — apply in a docs pass)
+> **RESOLVED 2026-09-04 ~18:15 ET in commit `842fea7` (pushed, remote-verified):**
+> items 1–7 below are done — Windows test loop fixed in §3, HEAD-vs-runtime
+> distinction added to the footer, cross-ref fixed, guardian 09:35–15:44 ET band
+> documented, liveness guidance (heartbeat over Get-Process) added, stale
+> 14:45/15:50 strings corrected in `scripts/deploy.py` + `engine/watchdog.py`
+> (logic untouched; 63-check watchdog/deploy suite + compileall green), and a
+> root `AGENTS.md` now routes new agents to these files. No restart needed —
+> live runtime remains on `8afbfb2`. Historical record of the findings:
 1. Fix the Windows test command in §3: `python scripts\test_*.py` does NOT
    expand the wildcard (verified: exit 2, "Invalid argument"). Document either
    a PowerShell loop over `Get-ChildItem scripts\test_*.py` running the venv
