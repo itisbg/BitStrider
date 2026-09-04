@@ -1,5 +1,10 @@
 # AGENT_CHECKPOINT — coding-agent resume point (keep updated)
 
+> **READ `AGENT_CONTEXT.md` FIRST** — it is the always-current quick-reload
+> file (environment, live behavior, architecture map, conventions, deferred
+> work). This file below is append-only SESSION HISTORY (newest snapshot at
+> top). Reload protocol: AGENT_CONTEXT.md → newest snapshot here → work.
+
 > **Purpose:** the 2026-09-02 16:50 ET session was killed mid-run by an
 > upstream stream timeout (`BodyTimeoutError: UND_ERR_BODY_TIMEOUT` — Node/undici
 > inside the coding CLI, NOT this repo's code; bot was unaffected). To make any
