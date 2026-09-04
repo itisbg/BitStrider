@@ -198,7 +198,7 @@ test-gated auto-deploy. Account ~$2,000 equity, small-account rules apply
 
 ---
 
-*Last verified: 2026-09-04 ~18:05 ET — live runtime baseline `8afbfb2` deployed
+*Last verified: 2026-09-04 ~19:00 ET — live runtime baseline `8afbfb2` deployed
 (2.0x gross ceiling with pre-trade headroom, 14:15–15:44 afternoon, boundary
 pending-entry cancels, reconciled closes); day P&L +$7.53 (+0.371%), book flat.
 The repository HEAD can sit AHEAD of the runtime baseline by docs-only commits

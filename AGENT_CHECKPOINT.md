@@ -14,6 +14,62 @@
 > re-asking questions. Update BEFORE starting a risky step, and again after it.
 
 ---
+## Snapshot — 2026-09-04 ~19:00 ET (AUDIT VERIFIED + follow-up checkpoint fix — all 8 audit items confirmed in place)
+
+### Goal
+Verify every audit fix from `842fea7` was actually applied, close the one
+remaining freshness gap, and leave the checkpoint consistent.
+
+### Done (verified this session)
+- **All 8 audit items verified in place** by direct file inspection +
+  greps + test re-run:
+  1. Working Windows test loop in §3 ✅
+  2. HEAD-vs-runtime distinction present ✅
+  3. Cross-ref fixed (state-dir bullet) ✅
+  4. Guardian 09:35–15:44 ET band documented ✅
+  5. Heartbeat-over-Get-Process liveness guidance ✅
+  6. Stale `11:00-14:45` / `after 15:50` strings: ZERO remaining in
+     `scripts/deploy.py` / `engine/watchdog.py` (grep clean); correct
+     `11:00-14:15` / `after 15:44` text present; window LOGIC untouched ✅
+  7. Root `AGENTS.md` routes to these files ✅
+  8. Commit/push/verify chain intact ✅
+- **Validation re-run this session:** `scripts/test_guardian_and_deploy.py`
+  → **63 checks passed** (deploy-window assertions: 10:59 blocked, 11:00
+  allowed, 14:14 allowed, 14:15 blocked, 15:44 blocked, 15:45 allowed,
+  09:05 blocked); `compileall engine scripts` → exit 0.
+- **Follow-up commit `f6989ee` (pushed, remote-verified):** the snapshot
+  below hard-coded "Repository HEAD = 1a6f66b", which went stale as soon
+  as the audit commits landed. Replaced with a durable mapping: live
+  runtime baseline `8afbfb2` = last trading-code commit; check
+  `git --no-pager log --oneline 8afbfb2..HEAD` — all-docs range = no
+  deploy needed, any code commit = runtime behind, deploy due.
+- Working tree dirty files are ALL runtime noise (`data/*.json`,
+  `graphify-out/*`, `heartbeat.txt`, `.daily_state.json`, `day_picks.json`)
+  — correctly never committed per convention #5.
+
+### Current mapping (restate — do not re-derive)
+- **Live runtime baseline = `8afbfb2`** (last commit with trading code).
+- **Repo HEAD at this snapshot's writing = `f6989ee`** — docs-only commits
+  on top of it (`5ccd85d`, `842fea7`, `dd786fc`, `f6989ee`), plus this
+  checkpoint-update commit itself landing above. No restart needed; bot
+  unaffected by docs commits.
+
+### Next (unchanged — carries over from the 8afbfb2 snapshot)
+1. Observe one session: `held_for_orders`/duplicate-close counts,
+   `[CLOSE-RECON]`/`[BOUNDARY]` lines, `leverage_snapshot` events.
+2. Build `scripts/analyze_daily_portfolio.py` (per-chain MAE/MFE +
+   counterfactuals: leverage bands, churn caps, runway cutoffs).
+3. Per-symbol daily chain ledger (telemetry → enforced loss budget).
+4. Late-morning ~10:55 pending-entry cutoff (multi-day replay first).
+5. Shadow high-momentum classification (Release 2; never blanket-reject
+   big movers).
+6. Whole-share risk-overshoot policy after analyzer data.
+
+### Files
+- This session: `AGENT_CHECKPOINT.md` (this snapshot + the `f6989ee`
+  distinction rewrite in the snapshot below). No source changes.
+
+---
 ## Snapshot — 2026-09-04 ~17:55 ET (CURRENT STATE — 2.0x release LIVE + AGENT_CONTEXT.md created; audit found doc fixes pending)
 
 ### Goal
