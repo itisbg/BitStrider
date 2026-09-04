@@ -34,7 +34,7 @@ PID_FILE = LOG_DIR / "autobot.pid"
 # 2026-09-02: agentic auto-deploy. The agent/user writes a flag file into the
 # LOCAL (non-synced) ApexTrader state dir; this watchdog consumes it and
 # restarts main.py on the new code. Restart is deferred to windows when the
-# book is guaranteed flat (lunch 11:00-14:45 ET rule-enforced flat, and after
+# book is guaranteed flat (lunch 11:00-14:15 ET rule-enforced flat, and after
 # the 15:44 EOD flat until next prep at 09:05 ET). Same LOCALAPPDATA rationale
 # as VENV_DIR: coordination files must never sync via OneDrive.
 STATE_DIR = LOCAL_DIR / "state"
@@ -61,7 +61,7 @@ HEARTBEAT_CHECK_INTERVAL = 300   # poll every 5 min -- no need for tighter granu
 # Alpaca bar fetch with no HTTP timeout black-holed the main loop ~20s into
 # pre-market prewarm; log frozen, CPU 0, heartbeat never written, nothing
 # auto-recovered. If the heartbeat stalls past STALL_RESTART_SECONDS AND the
-# current time is in a guaranteed-flat window (11:00-14:45 / after 15:50 ET),
+# current time is in a guaranteed-flat window (11:00-14:15 / after 15:44 ET),
 # the watchdog now terminates and relaunches main.py itself. Outside flat
 # windows it deliberately does NOT restart (open positions may be mid-cycle)
 # and the existing 1h stall alert carries the signal instead.
@@ -365,7 +365,7 @@ class AutoBotWatchdog:
 
     def _deploy_window_allows(self, now_et: datetime.datetime) -> bool:
         """Restart-on-deploy only when the book is guaranteed flat:
-          - lunch break 11:00-14:45 ET (rule-enforced flat, LUNCH_FLAT_TIME_ET),
+          - lunch break 11:00-14:15 ET (rule-enforced flat, LUNCH_FLAT_TIME_ET),
           - after the 15:44 ET EOD flat through 09:05 ET next prep scan.
         Outside those, a mid-session deploy could race an open position, so the
         flag is left in place and the restart defers until a window opens."""
@@ -450,7 +450,7 @@ class AutoBotWatchdog:
         now_et = self._now_et()
         if not self._deploy_window_allows(now_et):
             self.logger.info(
-                "[DEPLOY] flag present at %s ET -- outside flat deploy windows (11:00-14:45 / after 15:50 ET); deferring",
+                "[DEPLOY] flag present at %s ET -- outside flat deploy windows (11:00-14:15 / after 15:44 ET); deferring",
                 now_et.strftime("%H:%M"),
             )
             return False

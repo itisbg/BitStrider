@@ -22,7 +22,8 @@ test-gated auto-deploy. Account ~$2,000 equity, small-account rules apply
 ## 2. Environment quick facts
 
 - **Repo:** `C:\Users\BG\OneDrive\Returns-LSTM\StockPricePrediction\BitStrider-main`
-  (OneDrive-synced — coordination files must NEVER live here; see §4).
+  (OneDrive-synced — coordination files must NEVER live here; they live in the
+  machine-local state dir, see the State-dir bullet below).
 - **Branch:** `fix/ti-scraper-devtools-and-gtc-order-bug` (working branch; pushed to origin).
 - **Python (bot + tests):** `C:\Users\BG\AppData\Local\ApexTrader\venv\Scripts\python.exe`.
   Repo-root `apextrader\` venv is LEGACY/OneDrive-broken — do not use.
@@ -33,6 +34,12 @@ test-gated auto-deploy. Account ~$2,000 equity, small-account rules apply
   comparing log lines to fills.
 - **State dir (flags, machine-local):** `%LOCALAPPDATA%\ApexTrader\state\`
   — `deploy_requested.flag`, `flat_request.flag`, `guardian_state.json`, locks.
+- **Liveness checks (authoritative):** `heartbeat.txt` freshness in the repo
+  root (orchestrator rewrites it every completed main-loop tick) + tails of
+  the live logs. Do NOT rely on `Get-Process`/process-path discovery to prove
+  the bot is down — command-line/path matching is unreliable under Windows
+  permissions and has produced false "bot not running" reads; a fresh
+  heartbeat outranks a missing process listing.
 - **Analytics/telemetry:** `%LOCALAPPDATA%\ApexTrader\analytics\execution-events-*.jsonl`
   (non-blocking JSONL via `engine/telemetry.py`).
 - **OneDrive gotchas:** local `origin/*` refs go stale after pushes — verify with
@@ -41,10 +48,20 @@ test-gated auto-deploy. Account ~$2,000 equity, small-account rules apply
 
 ## 3. Run / test / deploy
 
-- **Run all tests (script-style, no pytest):** from repo root,
-  `%LOCALAPPDATA%\ApexTrader\venv\Scripts\python.exe scripts\test_*.py` —
-  every one must exit 0 (~55 suites). Plus `python -m compileall -q engine scripts`.
-  `git diff --check` (CRLF warnings are cosmetic).
+- **Run all tests (script-style, no pytest):** Windows does NOT expand
+  `scripts\test_*.py` when passed to python (verified: exit 2 "Invalid
+  argument"). Run the ~55 suites via a PowerShell loop from the repo root:
+  ```powershell
+  $py = "$env:LOCALAPPDATA\ApexTrader\venv\Scripts\python.exe"
+  Get-ChildItem scripts\test_*.py | ForEach-Object {
+      & $py $_.FullName
+      if ($LASTEXITCODE -ne 0) { throw "$($_.Name) failed" }
+  }
+  & $py -m compileall -q engine scripts
+  ```
+  Every suite must exit 0. (The deploy gate in `scripts/deploy.py` runs the
+  same loop internally; use deploy.py only when you also want the restart
+  flag written.) `git diff --check` (CRLF warnings are cosmetic).
 - **Deploy (zero PowerShell, test-gated):**
   `%LOCALAPPDATA%\ApexTrader\venv\Scripts\python.exe scripts\deploy.py --reason "..."`
   → runs the full test gate → writes `deploy_requested.flag` → watchdog restarts
@@ -53,8 +70,11 @@ test-gated auto-deploy. Account ~$2,000 equity, small-account rules apply
   "[DEPLOY] deploy flag consumed" in autobot.log + fresh heartbeat.
 - **Rollback:** per-feature config toggles (§6) or `git revert` + redeploy.
 - **Never** edit `.env` to deploy; never bypass the test gate (`--skip-tests`).
-- **Guardian (independent, 1/min):** alert −0.75% / hard halt −1.5% →
-  `flat_request.flag` → bot flattens ≤5s; direct flat-sell if heartbeat stale.
+- **Guardian (independent, scheduled 1/min):** alert −0.75% / hard halt −1.5% →
+  `flat_request.flag` → bot flattens ≤5s; direct flat-sell if heartbeat stale
+  (>300s). It only ACTS inside its band **09:35–15:44 ET** weekdays
+  (`GUARDIAN_POLL_START_ET`/`GUARDIAN_POLL_END_ET` in .env; `--force` overrides
+  for manual tests); outside the band it logs a no-op.
 
 ## 4. Current live behavior (verify against config.py if in doubt)
 
@@ -178,6 +198,10 @@ test-gated auto-deploy. Account ~$2,000 equity, small-account rules apply
 
 ---
 
-*Last verified: 2026-09-04 ~17:10 ET — HEAD `8afbfb2` deployed live (2.0x gross
-ceiling with pre-trade headroom, 14:15–15:44 afternoon, boundary pending-entry
-cancels, reconciled closes). Day P&L +$7.53 (+0.371%), book flat.*
+*Last verified: 2026-09-04 ~18:05 ET — live runtime baseline `8afbfb2` deployed
+(2.0x gross ceiling with pre-trade headroom, 14:15–15:44 afternoon, boundary
+pending-entry cancels, reconciled closes); day P&L +$7.53 (+0.371%), book flat.
+The repository HEAD can sit AHEAD of the runtime baseline by docs-only commits
+(such as AGENT_CONTEXT.md/AGENT_CHECKPOINT.md updates) — check the newest
+AGENT_CHECKPOINT.md snapshot for the exact current mapping before claiming
+deploy state.*
