@@ -68,6 +68,23 @@ test-gated auto-deploy. Account ~$2,000 equity, small-account rules apply
   main.py ONLY in flat windows: **11:00–14:15 ET** (lunch flat) or **after 15:44 ET**
   (post-EOD) until 09:05 next prep. Outside windows the flag waits. Verify:
   "[DEPLOY] deploy flag consumed" in autobot.log + fresh heartbeat.
+- **Daily improvement loop (2026-09-08, observe-only until opted in):**
+  `scripts/daily_automation.py` runs 12:05–14:00 ET weekdays (ET enforced in-script
+  via pytz; the `ApexTraderDailyImprovement` task fires a 15-min cadence through the
+  local midday as a carrier). Flow: observe (`scripts/analyze_daily_portfolio.py`,
+  read-only Alpaca fills → ladder round trips, churn chains, runtime health) →
+  PLAN (Cline CLI `--plan`, bounded; writes `candidate.json`) → objective evidence
+  gates (`evaluate_candidate`: ≥5 days/≥20 trades, min effect + relative improvement,
+  drawdown tail, allowed_files inside repo and never `.env`, prohibited changes +
+  acceptance tests declared, heartbeat/guardian/flat/deploy-flag healthy, market open)
+  → ACT (bounded, allowed_files only) → full test gate → VERIFY (independent agent +
+  controller diff check) → deploy ONLY via `scripts/deploy.py` (never `--skip-tests`)
+  and only with `--allow-deploy` or `AUTOMATION_ALLOW_DEPLOY=1`; default is
+  OBSERVE_ONLY (Cline CLI missing / gates fail / saturation → recorded, no code
+  change). Artifacts machine-local: `%LOCALAPPDATA%\ApexTrader\automation\<date>\`
+  (`observation.*`, `candidate.json`, `test-results.json`, `run-state.json`,
+  `compact-handoff.md`, `daily-run.log`). Lock:
+  `%LOCALAPPDATA%\ApexTrader\state\daily_automation.lock` (stale-recovering).
 - **Rollback:** per-feature config toggles (§6) or `git revert` + redeploy.
 - **Never** edit `.env` to deploy; never bypass the test gate (`--skip-tests`).
 - **Guardian (independent, scheduled 1/min):** alert −0.75% / hard halt −1.5% →
@@ -131,6 +148,11 @@ test-gated auto-deploy. Account ~$2,000 equity, small-account rules apply
 - `scripts/guardian.py` — independent loss backstop (self-contained env parsing).
 - `scripts/deploy.py` — test gate + flag writer.
 - `engine/session/session.py` — daily equity baseline/P&L (`.daily_state.json`).
+- `scripts/analyze_daily_portfolio.py` — daily observation (fills → position-ladder
+  round trips, per-symbol/churn/entry-band stats, runtime health). READ-ONLY.
+- `scripts/daily_automation.py` — daily improvement controller (observe → plan →
+  act → verify → deploy, all evidence-gated, fail-closed, deadline-aware;
+  `scripts/test_daily_automation.py` covers it offline).
 - `scripts/_review_30d.py` — reliable Alpaca fill→position-ladder reconstruction
   (use this for trade analysis; `_audit_trades.py` naive sums are misleading).
 - `graphify-out/` — codebase knowledge graph (see AGENT_CHECKPOINT "Persistent

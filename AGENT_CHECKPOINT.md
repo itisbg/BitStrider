@@ -14,6 +14,67 @@
 > re-asking questions. Update BEFORE starting a risky step, and again after it.
 
 ---
+## Snapshot — 2026-09-08 (DAILY AUTOMATION LOOP BUILT — observe-only; task NOT yet registered; no trading-code changes)
+
+### Goal
+Implement the user's daily automation request (weekday 12:05–14:00 ET:
+observe P&L/code → plan → implement → test → deploy, with saturation days
+recorded) WITHOUT violating the live-money safety design (Agenticdeploy.md
+non-goal: no unattended LLM fast path). Result: a deterministic,
+evidence-gated controller around bounded Cline CLI sessions.
+
+### Done (all verified by tests + live smoke)
+- `scripts/analyze_daily_portfolio.py` — READ-ONLY daily observation: Alpaca
+  fills → position-ladder round trips (same method as `_review_30d.py`),
+  per-symbol stats, churn chains (≥3 RT/day net-neg), entry-band violations,
+  max daily-cumulative drawdown, runtime health (heartbeat/guardian/flags).
+  Writes machine-local artifacts only.
+- `scripts/daily_automation.py` — controller: ET window [12:05,14:00) + phase
+  deadlines; machine-local stale-recovering lock; PLAN (Cline CLI `--plan`,
+  bounded timeouts, `CLINE_COMMAND_PERMISSIONS` allow/deny policy) →
+  `evaluate_candidate` gates (≥5 days/≥20 trades, min effect $5 + ≥5% relative,
+  drawdown tail, allowed_files inside repo and never `.env`, prohibited changes
+  + acceptance tests declared, heartbeat/flat/guardian/deploy-flag healthy,
+  market open) → ACT (allowed_files only, act-report.json required) → FULL
+  test gate (all `scripts/test_*.py` + compileall; `--skip-tests` impossible)
+  → VERIFY (controller diff-vs-allowed_files + independent agent report) →
+  deploy ONLY via `scripts/deploy.py` and only with `--allow-deploy` /
+  `AUTOMATION_ALLOW_DEPLOY=1`. OBSERVE_ONLY on: no Cline CLI, invalid plan
+  artifact, gate failure, saturation flag, dry-run, skip-agent.
+- `scripts/test_daily_automation.py` — 63 offline checks (window/deadline/
+  redaction/lock/gates/ladder-reconstruction/test-gate/deploy-guard/
+  unexpected-change filter/5 end-to-end main() paths). ALL PASS.
+- `scripts/run_daily_automation_task.ps1` (launcher, mirrors
+  run_autobot_task.ps1 incl. real-exit-code propagation) +
+  `scripts/windows_schedule_daily_automation.ps1` (registers
+  `ApexTraderDailyImprovement`: 15-min cadence, local 11:00–14:30 weekdays;
+  the SCRIPT is the ET-window authority). Both parse-checked; launcher
+  pattern matches repo convention.
+- AGENT_CONTEXT.md §3/§5 updated with the loop's facts.
+- Validation: new suite 63/63; full existing loop 55/55 suites exit 0
+  (test_notifications.py excluded — sends real email outside deploy gate);
+  compileall exit 0; `git diff --check` clean; live smoke run
+  (`--force --offline`) → decision OBSERVE_ONLY, reason
+  `cline_cli_unavailable`, no deploy, lock released, artifacts complete.
+
+### Current mapping
+- Live runtime baseline UNCHANGED = `8afbfb2` (no trading-code edits this
+  session; bot untouched). New files are automation tooling only.
+
+### Next (exact steps to activate)
+1. Install Cline CLI (`npm i -g @cline/cli` or official installer) + `cline auth`.
+2. Register the task: elevated PowerShell →
+   `scripts\windows_schedule_daily_automation.ps1`.
+3. Run one supervised dry run:
+   `powershell -File scripts\run_daily_automation_task.ps1 -Force -Offline`
+   then a live one (`--force`) after market data is available.
+4. After a clean observe-week, opt into the gated deploy:
+   set `AUTOMATION_ALLOW_DEPLOY=1` (machine env) — deploy still requires all
+   evidence gates + full test suite + verify session + `deploy.py` gate.
+5. Deferred: MAE/MFE per chain (needs intraday bars), per-strategy Kelly via
+   scoreboard import, saturation streak counters across days.
+
+---
 ## Snapshot — 2026-09-04 ~19:00 ET (AUDIT VERIFIED + follow-up checkpoint fix — all 8 audit items confirmed in place)
 
 ### Goal
