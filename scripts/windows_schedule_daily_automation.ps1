@@ -1,47 +1,106 @@
-# Windows Scheduled Task Install for the Daily Improvement loop (2026-09-08)
-# Run in PowerShell as Administrator.
+# Windows Scheduled Task Install for the Daily Improvement loop (2026-09-08,
+# fixed 2026-09-08 later: XML registration + NO elevation requirement).
 #
 # Registers 'ApexTraderDailyImprovement': a repeated 15-min cadence through
 # the LOCAL midday (11:00-14:30) on weekdays. daily_automation.py itself is
 # the authority on the ET window (12:05-14:00 ET, pytz) and on the market-day
 # check, so DST drift / clock skew cannot push the work into an active
-# trading window. MultipleInstances=IgnoreNew + the machine-local lock file
-# prevent overlapping runs.
+# trading window. MultipleInstancesPolicy=IgnoreNew + the machine-local lock
+# file prevent overlapping runs.
+#
+# WHY XML (fix_autorun_task.ps1 pattern): New-ScheduledTaskTrigger silently
+# rounds -RepetitionDuration to whole hours (3.5h became PT4H when tested
+# live), and its Repetition object assignment is fragile across builds.
+# Hand-built XML registers exactly what we specify, and registers fine
+# WITHOUT elevation for a current-user, LeastPrivilege, InteractiveToken
+# task (verified: non-admin Register/Unregister OK on this machine).
 #
 # SAFETY: the task runs WITHOUT AUTOMATION_ALLOW_DEPLOY set, so runs are
 # observe/plan-only until you explicitly opt in to the test-gated deploy
-# (set AUTOMATION_ALLOW_DEPLOY=1 machine-wide, or pass --allow-deploy).
+# (set AUTOMATION_ALLOW_DEPLOY=1 machine-wide).
+
+$ErrorActionPreference = 'Stop'
 
 $taskName = 'ApexTraderDailyImprovement'
-$taskDescription = 'ApexTrader daily observation + evidence-gated improvement loop (ET window enforced inside the script).'
-$BaseDir = $PSScriptRoot
+$BaseDir  = Split-Path -Parent $PSScriptRoot
+$launcher = Join-Path $BaseDir 'scripts\run_daily_automation_task.ps1'
+if (-not (Test-Path $launcher)) { throw "launcher not found: $launcher" }
 
-$action = New-ScheduledTaskAction -Execute 'powershell.exe' `
-    -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$BaseDir\scripts\run_daily_automation_task.ps1`""
+# Resolve the SID (plain account names like "BG" must be translated first --
+# same handling as fix_autorun_task.ps1).
+$sid = (New-Object System.Security.Principal.NTAccount("$env:USERDOMAIN\$env:UserName")).Translate(
+    [System.Security.Principal.SecurityIdentifier]).Value
 
-$weekly = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday,Tuesday,Wednesday,Thursday,Friday -At 11:00
-$repeat = New-ScheduledTaskTrigger -Once -At 11:00 `
-    -RepetitionInterval (New-TimeSpan -Minutes 15) `
-    -RepetitionDuration (New-TimeSpan -Hours 3.5)
-$weekly.Repetition = $repeat.Repetition
+# Local-timezone offset for StartBoundary (e.g. "-05:00").
+$offset = (Get-Date -Format 'zzz')
+$start  = "{0:yyyy-MM-dd}T11:00:00{1}" -f (Get-Date), $offset
 
-$principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:UserName" `
-    -LogonType Interactive -RunLevel Limited
+$xml = @"
+<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.3" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <URI>\$taskName</URI>
+    <Description>ApexTrader daily observation + evidence-gated improvement loop (12:05-14:00 ET enforced inside the script; runs are observe-only until AUTOMATION_ALLOW_DEPLOY=1).</Description>
+  </RegistrationInfo>
+  <Principals>
+    <Principal id="Author">
+      <UserId>$sid</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <Hidden>true</Hidden>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <WakeToRun>true</WakeToRun>
+    <ExecutionTimeLimit>PT2H</ExecutionTimeLimit>
+    <UseUnifiedSchedulingEngine>true</UseUnifiedSchedulingEngine>
+  </Settings>
+  <Triggers>
+    <CalendarTrigger>
+      <StartBoundary>$start</StartBoundary>
+      <Repetition>
+        <Interval>PT15M</Interval>
+        <Duration>PT3H30M</Duration>
+        <StopAtDurationEnd>true</StopAtDurationEnd>
+      </Repetition>
+      <ScheduleByWeek>
+        <WeeksInterval>1</WeeksInterval>
+        <DaysOfWeek>
+          <Monday />
+          <Tuesday />
+          <Wednesday />
+          <Thursday />
+          <Friday />
+        </DaysOfWeek>
+      </ScheduleByWeek>
+    </CalendarTrigger>
+  </Triggers>
+  <Actions Context="Author">
+    <Exec>
+      <Command>powershell.exe</Command>
+      <Arguments>-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "$launcher"</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+"@
 
-$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -StartWhenAvailable `
-    -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -WakeToRun `
-    -ExecutionTimeLimit (New-TimeSpan -Hours 2)
+Register-ScheduledTask -TaskName $taskName -Xml $xml -Force | Out-Null
 
-$task = New-ScheduledTask -Action $action -Trigger $weekly -Principal $principal `
-    -Settings $settings -Description $taskDescription
-
-if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)) {
-    throw "Not running as Administrator. Right-click PowerShell and 'Run as administrator', then re-run this script."
+# ---- self-verification -------------------------------------------------
+$task = Get-ScheduledTask -TaskName $taskName
+$info = Get-ScheduledTaskInfo -TaskName $taskName
+Write-Host "Scheduled task '$taskName' registered (user-level, no elevation needed)." -ForegroundColor Green
+Write-Host "State: $($task.State) | LastRun: $($info.LastRunTime) | NextRun: $($info.NextRunTime)"
+$t = $task.Triggers[0]
+Write-Host ("Trigger: weekly 11:00 local, every {0} for {1} (StopAtDurationEnd={2})" -f $t.Repetition.Interval, $t.Repetition.Duration, $t.Repetition.StopAtDurationEnd)
+Write-Host "Manual one-shot run now:  Start-ScheduledTask -TaskName '$taskName'"
+Write-Host "Manual foreground run:    powershell -File `"$launcher`" -Force -Offline"
+Write-Host "Deploy opt-in (test-gated): set AUTOMATION_ALLOW_DEPLOY=1 machine-wide."
+if ($t.Repetition.Interval -ne 'PT15M' -or $t.Repetition.Duration -ne 'PT3H30M') {
+    throw "Registered repetition is $($t.Repetition.Interval)/$($t.Repetition.Duration) -- expected PT15M/PT3H30M"
 }
 
-Register-ScheduledTask -TaskName $taskName -InputObject $task -Force -ErrorAction Stop
-Write-Host "Scheduled task '$taskName' installed successfully."
-Write-Host "Runs (15-min cadence, local 11:00-14:30 weekdays); script enforces 12:05-14:00 ET + market day."
-Write-Host "Manual one-shot run:  Start-ScheduledTask -TaskName '$taskName'"
-Write-Host "Manual foreground run: powershell -File $BaseDir\scripts\run_daily_automation_task.ps1 -Force -Offline"
-Write-Host "Deploy opt-in (test-gated): set AUTOMATION_ALLOW_DEPLOY=1 (machine env) before enabling."

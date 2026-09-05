@@ -14,6 +14,43 @@
 > re-asking questions. Update BEFORE starting a risky step, and again after it.
 
 ---
+## Snapshot — 2026-09-08 ~22:45 ET (FIX + REGISTERED: ApexTraderDailyImprovement task is LIVE, observe-only)
+
+### Goal
+Fix the task-registration failure the user hit ("Register the schedule" step).
+
+### Root cause + fix
+1. `windows_schedule_daily_automation.ps1` threw "Not running as
+   Administrator" — unnecessary: a current-user, LeastPrivilege,
+   InteractiveToken task registers fine WITHOUT elevation (verified live:
+   Register/Unregister of a probe task succeeded non-elevated).
+2. Latent bug found while reproing: New-ScheduledTaskTrigger silently
+   rounded -RepetitionDuration 3.5h -> PT4H. Rewrote the registration to
+   the repo's PROVEN XML pattern (fix_autorun_task.ps1) with exact
+   PT15M / PT3H30M / StopAtDurationEnd, plus post-register self-verification
+   that throws if the repetition differs.
+
+### Done (verified live)
+- Task `ApexTraderDailyImprovement` REGISTERED: State=Ready, weekly
+  Mon-Fri 11:00 local, every PT15M for PT3H30M, NextRun 2026-09-07 11:00.
+- End-to-end trigger test: Start-ScheduledTask -> launcher ->
+  daily_automation.py exited 0, LastTaskResult=0, run-state decision
+  OUTSIDE_WINDOW (22:43 ET, correctly outside 12:05-14:00), scheduler log
+  clean, lock released.
+- Script committed with the fix; runs remain OBSERVE_ONLY until
+  AUTOMATION_ALLOW_DEPLOY=1 and Cline CLI is installed.
+
+### Next (remaining activation steps)
+1. Install Cline CLI + `cline auth` (until then: observation-only days).
+2. After market data exists, do one supervised in-window check:
+   `powershell -File scripts\run_daily_automation_task.ps1 -Force`
+   (verify artifacts under %LOCALAPPDATA%\ApexTrader\automation\<date>\).
+3. After a clean observe-week, opt into the gated deploy:
+   set AUTOMATION_ALLOW_DEPLOY=1 machine-wide.
+4. Deferred: MAE/MFE per chain, per-strategy Kelly via scoreboard import,
+   saturation streak counters across days.
+
+---
 ## Snapshot — 2026-09-08 (DAILY AUTOMATION LOOP BUILT — observe-only; task NOT yet registered; no trading-code changes)
 
 ### Goal
