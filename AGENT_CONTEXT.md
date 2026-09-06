@@ -128,6 +128,11 @@ test-gated auto-deploy. Account ~$2,000 equity, small-account rules apply
 
 ## 5. Architecture map (single sources of truth)
 
+- **TRADING_SYSTEM.md — full trading-system specification** (strategy
+  selection, guardrails, sizing, exits, time windows, safeguards; values
+  verified 2026-09-06; config.py still authoritative). Read this before
+  tracing any trading behavior.
+
 - `engine/config.py` — ALL constants + import-time validation (`_require_hhmm`,
   window ordering asserts, leverage guard). Time constants are zero-padded
   "HH:MM" strings, also compared as raw strings — keep padding.

@@ -14,6 +14,31 @@
 > re-asking questions. Update BEFORE starting a risky step, and again after it.
 
 ---
+## Snapshot — 2026-09-06c (TRADING_SYSTEM.md — full trading-system reference doc created)
+
+### Done
+- Created `TRADING_SYSTEM.md` (23 sections): daily ET timeline, discovery
+  sources (TI + Alpaca movers + static fallback), active/disabled strategy
+  matrix per get_strategy_instances(), guardrail thresholds (price/RVOL/
+  dollar-vol/float/mcap/gap-chase), signal ranking, final entry validation
+  (EMA7/15, freshness, PDT, VIX ROC), sizing pipeline (10% base -> caps),
+  2.0x gross ceiling (pre+post trade), 0.25% DAY trailing entries, staged
+  4x25%, ATR GTC protection (1.5-4%), 11-layer exit hierarchy, reconciled
+  close, re-entry/loss blocks, guardian (-0.75%/-1.5%), kill mode, watchdog,
+  daily AI loop, config matrix, known risks, ops checklists.
+- Values verified against source 2026-09-06; config.py declared authoritative.
+- Validation: test_strategy_toggles / test_strategy_scoreboard /
+  test_entry_window all exit 0; compileall exit 0; git diff --check clean;
+  all 23 sections present, no leftover build markers.
+- AGENT_CONTEXT.md §5 now points to TRADING_SYSTEM.md as the trading-behavior
+  reference.
+
+### Next
+1. Monday 9/7: first scheduled runs (Labor Day — market closed, observe-only).
+2. Deferred: MAE/MFE per chain, Kelly via scoreboard, saturation counters;
+   legacy task health audit (2147946720).
+
+---
 ## Snapshot — 2026-09-06b (PROVIDER FALLBACK CHAIN: default -> deepseek -> moonshot, commit 414aee2)
 
 ### Done (verified live)
