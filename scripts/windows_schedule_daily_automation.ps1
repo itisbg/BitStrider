@@ -32,8 +32,11 @@ $sid = (New-Object System.Security.Principal.NTAccount("$env:USERDOMAIN\$env:Use
     [System.Security.Principal.SecurityIdentifier]).Value
 
 # Local-timezone offset for StartBoundary (e.g. "-05:00").
+# Start 11:50 so the 15-min cadence lands exactly on the 12:05 ET window
+# open: 11:50, 12:05, 12:20, ... (fires before 12:05 no-op; duration PT2H25M
+# covers through the 14:00 ET window close with margin).
 $offset = (Get-Date -Format 'zzz')
-$start  = "{0:yyyy-MM-dd}T11:00:00{1}" -f (Get-Date), $offset
+$start  = "{0:yyyy-MM-dd}T11:50:00{1}" -f (Get-Date), $offset
 
 $xml = @"
 <?xml version="1.0" encoding="UTF-16"?>
@@ -64,7 +67,7 @@ $xml = @"
       <StartBoundary>$start</StartBoundary>
       <Repetition>
         <Interval>PT15M</Interval>
-        <Duration>PT3H30M</Duration>
+        <Duration>PT2H25M</Duration>
         <StopAtDurationEnd>true</StopAtDurationEnd>
       </Repetition>
       <ScheduleByWeek>
@@ -96,11 +99,11 @@ $info = Get-ScheduledTaskInfo -TaskName $taskName
 Write-Host "Scheduled task '$taskName' registered (user-level, no elevation needed)." -ForegroundColor Green
 Write-Host "State: $($task.State) | LastRun: $($info.LastRunTime) | NextRun: $($info.NextRunTime)"
 $t = $task.Triggers[0]
-Write-Host ("Trigger: weekly 11:00 local, every {0} for {1} (StopAtDurationEnd={2})" -f $t.Repetition.Interval, $t.Repetition.Duration, $t.Repetition.StopAtDurationEnd)
+Write-Host ("Trigger: weekly 11:50 local, every {0} for {1} (StopAtDurationEnd={2})" -f $t.Repetition.Interval, $t.Repetition.Duration, $t.Repetition.StopAtDurationEnd)
 Write-Host "Manual one-shot run now:  Start-ScheduledTask -TaskName '$taskName'"
 Write-Host "Manual foreground run:    powershell -File `"$launcher`" -Force -Offline"
 Write-Host "Deploy opt-in (test-gated): set AUTOMATION_ALLOW_DEPLOY=1 machine-wide."
-if ($t.Repetition.Interval -ne 'PT15M' -or $t.Repetition.Duration -ne 'PT3H30M') {
-    throw "Registered repetition is $($t.Repetition.Interval)/$($t.Repetition.Duration) -- expected PT15M/PT3H30M"
+if ($t.Repetition.Interval -ne 'PT15M' -or $t.Repetition.Duration -ne 'PT2H25M') {
+    throw "Registered repetition is $($t.Repetition.Interval)/$($t.Repetition.Duration) -- expected PT15M/PT2H25M"
 }
 
