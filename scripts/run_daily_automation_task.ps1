@@ -32,6 +32,18 @@ Set-Location $BaseDir
 
 "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [TASK] DailyImprovement triggered" | Tee-Object -FilePath $Log -Append
 
-& $Python $Script @args 2>&1 | Tee-Object -FilePath $Log -Append
+# Translate PowerShell-style flags to argparse style (-Force -> --force,
+# -DryRun -> --dry-run): the documented invocation is
+# `run_daily_automation_task.ps1 -Force -Offline`, and argparse would
+# otherwise exit 2 on the single-dash form (2026-09-05 scheduler-log bug:
+# "unrecognized arguments: -Force" -> exit 2). Anything not starting with a
+# single dash (paths, values) passes through untouched.
+$pyArgs = foreach ($a in $args) {
+    if ($a -match '^-[A-Za-z]') {
+        '--' + (($a.Substring(1) -creplace '(?<!^)(?=[A-Z])', '-').ToLower())
+    } else { $a }
+}
+
+& $Python $Script @pyArgs 2>&1 | Tee-Object -FilePath $Log -Append
 "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [TASK] python exited with code $LASTEXITCODE" | Tee-Object -FilePath $Log -Append
 exit $LASTEXITCODE

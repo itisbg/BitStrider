@@ -580,15 +580,15 @@ def write_run_state(out_dir: Path, run_state: dict) -> Path:
 def main(argv: list | None = None) -> int:
     ap = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     ap.add_argument("--days", type=int, default=30)
-    ap.add_argument("--force", action="store_true",
+    ap.add_argument("--force", "-Force", action="store_true",
                     help="run even outside the ET window (manual/testing runs)")
-    ap.add_argument("--offline", action="store_true",
+    ap.add_argument("--offline", "-Offline", action="store_true",
                     help="observation without network (Alpaca unreachable)")
-    ap.add_argument("--dry-run", action="store_true",
+    ap.add_argument("--dry-run", "-DryRun", action="store_true",
                     help="observe + plan only; never implement, test-gate or deploy")
-    ap.add_argument("--skip-agent", action="store_true",
+    ap.add_argument("--skip-agent", "-SkipAgent", action="store_true",
                     help="skip Cline sessions (pure observation + artifacts)")
-    ap.add_argument("--allow-deploy", action="store_true",
+    ap.add_argument("--allow-deploy", "-AllowDeploy", action="store_true",
                     help="permit the test-gated deploy flag write (also "
                          "AUTOMATION_ALLOW_DEPLOY=1); default is observe-only")
     ap.add_argument("--out", default="", help="override artifact directory")
