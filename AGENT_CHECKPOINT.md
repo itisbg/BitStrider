@@ -14,6 +14,32 @@
 > re-asking questions. Update BEFORE starting a risky step, and again after it.
 
 ---
+## Snapshot — 2026-09-06 (DEPLOY ARMED by user; launcher -Force bug found+fixed; 63/63 green)
+
+### Done (verified live)
+- User set AUTOMATION_ALLOW_DEPLOY=1 (User env). Full gated pipeline
+  including auto-deploy is ARMED for Monday 2026-09-07 runs.
+- Cline CLI installed (v3.0.61, node v24) and ALREADY AUTHENTICATED (probe
+  session returned OK from deepseek/deepseek-v4-flash; no `cline auth`
+  needed). Real plan session validated: 2026-09-05 forced run produced a
+  grounded schema-valid candidate.json -> OBSERVE_ONLY (Saturday, market
+  closed), gate rejected, lock released, full artifact set written.
+- BUG fixed (commit 54933fa): launcher passed `-Force` straight to
+  daily_automation.py -> "unrecognized arguments: -Force" exit 2 (scheduler
+  log 2026-09-04 22:52, StartWhenAvailable catch-up fire). Fixed BOTH sides:
+  argparse aliases (-Force/-Offline/-DryRun/-SkipAgent/-AllowDeploy) in
+  daily_automation.py AND generic -Flag -> --flag translation in
+  run_daily_automation_task.ps1. Verified: launcher `-Force -Offline
+  -DryRun -SkipAgent` exits 0; 63/63 tests; compileall clean.
+
+### Next
+1. Monday: watch the scheduled runs produce full observe->plan artifacts;
+   deploy only happens if gates + tests + verify pass (live money!).
+2. Deferred: MAE/MFE per chain, per-strategy Kelly via scoreboard import,
+   saturation streak counters across days; health audit of legacy
+   ApexTraderAutoRun/ApexTraderGuardian tasks (2147946720).
+
+---
 ## Snapshot — 2026-09-08 ~22:45 ET (FIX + REGISTERED: ApexTraderDailyImprovement task is LIVE, observe-only)
 
 ### Goal
