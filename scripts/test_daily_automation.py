@@ -369,6 +369,106 @@ with tempfile.TemporaryDirectory() as tmp:
     st = json.loads((o / "run-state.json").read_text(encoding="utf-8"))
     check("skip-agent observe-only run", rc == 0 and st["decision"] == "OBSERVE_ONLY")
 
+print("== provider fallback chain (default -> deepseek -> moonshot) ==")
+_saved_env_fb = da.os.environ.get("CLINE_PROVIDER_FALLBACKS")
+_saved_subprocess_run = da.subprocess.run
+try:
+    with tempfile.TemporaryDirectory() as tmp:
+        # Chain parsed from the module default: default + 2 fallbacks.
+        da.os.environ.pop("CLINE_PROVIDER_FALLBACKS", None)
+        chain = [None] + da._provider_fallbacks()
+        check("default chain = default+2 fallbacks", len(chain) == 3
+              and chain[1][0] == "deepseek" and chain[2][0] == "moonshot"
+              and bool(chain[1][1]) and bool(chain[2][1]))
+        # Env override parsed correctly (provider without model is allowed).
+        da.os.environ["CLINE_PROVIDER_FALLBACKS"] = "openrouter:x-ai/grok"
+        chain2 = [None] + da._provider_fallbacks()
+        check("env override parsed", chain2 == [None, ("openrouter", "x-ai/grok")])
+        # "off" / empty disables fallbacks entirely.
+        da.os.environ["CLINE_PROVIDER_FALLBACKS"] = "off"
+        check("'off' disables chain", da._provider_fallbacks() == [])
+        da.os.environ["CLINE_PROVIDER_FALLBACKS"] = ""
+        check("empty disables chain", da._provider_fallbacks() == [])
+        # Restore the default chain for the subprocess simulations below.
+        da.os.environ.pop("CLINE_PROVIDER_FALLBACKS", None)
+
+        # Live-subprocess double: default fails, deepseek fails, moonshot ok.
+        class _R:
+            def __init__(self, code):
+                self.returncode = code
+                self.stdout = '{"type":"done"}'
+                self.stderr = ""
+
+        calls = []
+
+        def fake_run(args, **kw):
+            calls.append(args)
+            return _R(3 if len(calls) < 3 else 0)
+
+        da.subprocess.run = fake_run
+        ok, tail = da.run_cline("probe", Path(tmp) / "p1", "probe", False, 30, "cline")
+        check(f"fallback lands on 3rd provider (ok={ok}, calls={len(calls)})",
+              ok and len(calls) == 3)
+        check("fallback flags passed per attempt",
+              "-P" in calls[1] and "deepseek" in calls[1]
+              and "-P" in calls[2] and "moonshot" in calls[2])
+        check("attempt 1 has no -P (uses CLI default)",
+              "-P" not in calls[0] and "--plan" not in calls[0])
+
+        # Provider error can surface INSIDE the JSON stream with exit 0
+        # (e.g. credits exhausted) -> must still trigger the fallback.
+        calls.clear()
+
+        def fake_exit0_error(args, **kw):
+            calls.append(args)
+            r0 = _R(0)
+            if len(calls) == 1:
+                r0.stdout = ('{"type":"run_result","finishReason":"error",'
+                             '"text":"credits exhausted"}')
+            return r0
+
+        da.subprocess.run = fake_exit0_error
+        ok4, tail4 = da.run_cline("probe", Path(tmp) / "p4", "probe", False, 30, "cline")
+        check(f"exit-0 error-output still falls back (ok={ok4}, calls={len(calls)})",
+              ok4 and len(calls) == 2
+              and "-P" in calls[1] and "deepseek" in calls[1])
+        check("error-output audited", "error-output" in tail4)
+
+        da.subprocess.run = fake_run
+        check("attempts audited in tail", "provider=default" in tail
+              and "provider=deepseek" in tail and "provider=moonshot" in tail)
+
+        # First attempt succeeds -> single call, no fallback attempted.
+        calls.clear()
+
+        def fake_ok(args, **kw):
+            calls.append(args)
+            return _R(0)
+
+        da.subprocess.run = fake_ok
+        ok2, tail2 = da.run_cline("probe", Path(tmp) / "p2", "probe", True, 30, "cline")
+        check("healthy default stops the chain", ok2 and len(calls) == 1)
+        check("plan mode flag preserved", "--plan" in calls[0])
+        check("success note in tail", "provider=default -> ok" in tail2)
+
+        # Every attempt fails -> (False, audited tail) -> fail-closed downstream.
+        calls.clear()
+
+        def fake_all_fail(args, **kw):
+            calls.append(args)
+            return _R(1)
+
+        da.subprocess.run = fake_all_fail
+        ok3, tail3 = da.run_cline("probe", Path(tmp) / "p3", "probe", False, 30, "cline")
+        check("all-fail returns not-ok", not ok3 and len(calls) == 3)
+        check("all-fail tail audited", "exit 1" in tail3 and "provider=moonshot" in tail3)
+finally:
+    da.subprocess.run = _saved_subprocess_run
+    if _saved_env_fb is None:
+        da.os.environ.pop("CLINE_PROVIDER_FALLBACKS", None)
+    else:
+        da.os.environ["CLINE_PROVIDER_FALLBACKS"] = _saved_env_fb
+
 print(f"\nTOTAL: {_PASS} passed, {_FAIL} failed")
 if _FAIL:
     print("FAILURES PRESENT")

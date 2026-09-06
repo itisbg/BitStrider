@@ -58,6 +58,11 @@ PHASE_DEADLINES_ET = {"plan": "12:35", "act": "13:30", "test": "13:50", "deploy"
 STALE_LOCK_SECONDS = 3 * 3600
 CLINE_PLAN_TIMEOUT_S = 1200
 CLINE_ACT_TIMEOUT_S = 2400
+# Provider fallback chain after the CLI default (default -> deepseek ->
+# moonshot). Override/disable via env CLINE_PROVIDER_FALLBACKS (see
+# _provider_fallbacks below). Models verified live 2026-09-06 against each
+# provider's /models endpoint with the keys stored in Cline.
+DEFAULT_PROVIDER_FALLBACKS = "deepseek:deepseek-v4-flash,moonshot:kimi-k2.7-code"
 HANDOFF_MAX_LINES = 160
 
 GATES = {
@@ -272,10 +277,35 @@ def find_cline() -> str | None:
     return None
 
 
+def _provider_fallbacks() -> list[tuple[str | None, str | None]]:
+    """Cline provider fallback chain (after the CLI default provider).
+    Default: default -> deepseek -> moonshot (verified live 2026-09-06:
+    both stored API keys valid; models deepseek-v4-flash and kimi-k2.7-code
+    confirmed via each provider's /models endpoint). Override with env
+    CLINE_PROVIDER_FALLBACKS="provider:model,provider2:model2"; set it to
+    "off" (or empty) to disable fallbacks entirely."""
+    raw = os.environ.get("CLINE_PROVIDER_FALLBACKS",
+                         DEFAULT_PROVIDER_FALLBACKS).strip()
+    if not raw or raw.lower() == "off":
+        return []
+    chain: list[tuple[str | None, str | None]] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        provider, _, model = part.partition(":")
+        chain.append((provider.strip() or None, model.strip() or None))
+    return chain
+
+
 def run_cline(prompt: str, out_dir: Path, name: str, plan_mode: bool,
               timeout_s: int, cline_path: str) -> tuple[bool, str]:
-    """One bounded Cline CLI session. Returns (ok, combined_output_tail).
-    Command permissions are always enforced via CLINE_COMMAND_PERMISSIONS."""
+    """One bounded Cline CLI session with provider fallback. Returns
+    (ok, combined_output_tail). If the CLI default provider fails (e.g.
+    credits exhausted), each entry of _provider_fallbacks() is tried in
+    order via -P/-m until one succeeds; every attempt is logged into the
+    returned tail (which lands in run-state.json for audit). Command
+    permissions are always enforced via CLINE_COMMAND_PERMISSIONS."""
     try:
         prompts_dir = out_dir / "prompts"
         prompts_dir.mkdir(parents=True, exist_ok=True)
@@ -284,18 +314,45 @@ def run_cline(prompt: str, out_dir: Path, name: str, plan_mode: bool,
         pass
     env = os.environ.copy()
     env["CLINE_COMMAND_PERMISSIONS"] = CLINE_COMMAND_PERMISSIONS
-    args = [cline_path]
-    if plan_mode:
-        args.append("--plan")
-    args += ["--auto-approve", "true", "--json", "--timeout", str(timeout_s),
-             "--cwd", str(ROOT), prompt]
-    try:
-        r = subprocess.run(args, env=env, cwd=str(ROOT), capture_output=True,
-                           text=True, timeout=timeout_s)
-        out = (r.stdout or "") + (r.stderr or "")
-        return r.returncode == 0, redact_text(out[-4000:])
-    except Exception as exc:
-        return False, redact_text(f"{type(exc).__name__}: {exc}")
+    attempts: list[tuple[str | None, str | None]] = [(None, None)]
+    attempts += _provider_fallbacks()
+    tails: list[str] = []
+    for idx, (provider, model) in enumerate(attempts):
+        tag = provider or "default"
+        args = [cline_path]
+        if plan_mode:
+            args.append("--plan")
+        if provider:
+            args += ["-P", provider]
+        if model:
+            args += ["-m", model]
+        args += ["--auto-approve", "true", "--json", "--timeout", str(timeout_s),
+                 "--cwd", str(ROOT), prompt]
+        try:
+            r = subprocess.run(args, env=env, cwd=str(ROOT), capture_output=True,
+                               text=True, timeout=timeout_s)
+            out = (r.stdout or "") + (r.stderr or "")
+            tail = redact_text(out[-4000:])
+            # Some provider failures (bogus provider, exhausted credits,
+            # auth errors) surface as an error run_result inside the JSON
+            # stream -- sometimes even with exit code 0. Both shapes count
+            # as failure so the fallback chain actually engages.
+            errored = ('"finishReason":"error"' in out
+                       or '"finishReason": "error"' in out
+                       or '"reason":"error"' in out or '"reason": "error"' in out)
+            if r.returncode == 0 and not errored:
+                note = (f"[provider-fallback] attempt {idx + 1}/{len(attempts)} "
+                        f"provider={tag} -> ok")
+                prefix = ("\n".join(tails) + "\n") if tails else ""
+                return True, prefix + tail + "\n" + note
+            reason = "error-output" if (r.returncode == 0 and errored) else f"exit {r.returncode}"
+            tails.append(f"[provider-fallback] attempt {idx + 1}/{len(attempts)} "
+                         f"provider={tag} -> {reason}: {tail[-500:]}")
+        except Exception as exc:
+            tails.append(f"[provider-fallback] attempt {idx + 1}/{len(attempts)} "
+                         f"provider={tag} -> {type(exc).__name__}: "
+                         f"{redact_text(str(exc))[:300]}")
+    return False, "\n".join(tails)
 
 
 PLAN_PROMPT = """You are the PLAN phase of the ApexTrader daily improvement loop \
