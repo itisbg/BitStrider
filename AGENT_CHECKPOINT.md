@@ -14,6 +14,32 @@
 > re-asking questions. Update BEFORE starting a risky step, and again after it.
 
 ---
+## Snapshot — 2026-09-06b (PROVIDER FALLBACK CHAIN: default -> deepseek -> moonshot, commit 414aee2)
+
+### Done (verified live)
+- Both DeepSeek and Moonshot API keys were ALREADY stored in
+  ~/.cline/data/settings/providers.json (deepseek: deepseek-v4-flash,
+  moonshot model field was wrong). Verified BOTH keys live against each
+  provider's /models endpoint. Valid Moonshot models: kimi-k2.6, kimi-k3,
+  kimi-k2.7-code, kimi-k2.7-code-highspeed.
+- daily_automation.run_cline now tries: CLI default provider first, then
+  CLINE_PROVIDER_FALLBACKS chain (default "deepseek:deepseek-v4-flash,
+  moonshot:kimi-k2.7-code"). Failure = non-zero exit OR error run_result
+  inside the JSON stream even on exit 0 (verified live: bogus provider
+  exits 1 with "finishReason":"error"). Every attempt audited in the
+  output tail that lands in run-state.json.
+- Override: setx CLINE_PROVIDER_FALLBACKS "provider:model,..."; "off" or
+  empty disables fallbacks. Worst case adds 2 extra session timeouts
+  before fail-closed OBSERVE_ONLY.
+- Tests: 78/78 (13 new fallback checks incl. exit-0-error case).
+  compileall clean.
+
+### Next
+1. Monday: watch scheduled runs; deploy only if gates+tests+verify pass.
+2. Deferred: MAE/MFE per chain, per-strategy Kelly via scoreboard import,
+   saturation streak counters; legacy task health audit (2147946720).
+
+---
 ## Snapshot — 2026-09-06 (DEPLOY ARMED by user; launcher -Force bug found+fixed; 63/63 green)
 
 ### Done (verified live)
